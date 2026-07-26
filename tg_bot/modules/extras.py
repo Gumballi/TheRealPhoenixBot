@@ -225,14 +225,14 @@ def pat(bot: Bot, update: Update):
     msg_id = update.effective_message.reply_to_message.message_id if update.effective_message.reply_to_message else update.effective_message.message_id
     pats = []
     pats = json.loads(urllib.request.urlopen(urllib.request.Request(
-    '[http://headp.at/js/pats.json](http://headp.at/js/pats.json)',
+    'http://headp.at/js/pats.json',
     headers={'User-Agent': 'Mozilla/5.0 (X11; U; Linux i686) '
          'Gecko/20071127 Firefox/2.0.0.11'}
     )).read().decode('utf-8'))
     if "@" in msg and len(msg) > 5:
-        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', caption=msg)
+        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', caption=msg)
     else:
-        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
+        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
 
 
 @run_async
@@ -253,8 +253,8 @@ def spank(bot: Bot, update: Update):
 
     try:
         req = urllib.request.Request(
-            '[https://nekos.best/api/v2/slap](https://nekos.best/api/v2/slap)',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0 ([https://github.com/Gumballi/TheRealPhoenixBot-Restored](https://github.com/Gumballi/TheRealPhoenixBot-Restored))'}
+            'https://nekos.best/api/v2/slap',
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -302,8 +302,8 @@ def cuddle(bot: Bot, update: Update):
     # Call Nekos.best API to fetch a random cuddle GIF
     try:
         req = urllib.request.Request(
-            '[https://nekos.best/api/v2/cuddle](https://nekos.best/api/v2/cuddle)',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0 ([https://github.com/Gumballi/TheRealPhoenixBot-Restored](https://github.com/Gumballi/TheRealPhoenixBot-Restored))'}
+            'https://nekos.best/api/v2/cuddle',
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -375,7 +375,7 @@ def wiki(bot: Bot, update: Update):
     if res:
         result = f"<b>{search.title()}</b>\n\n"
         result += f"<i>{res}</i>\n\n"
-        result += f"""<a href="[https://en.wikipedia.org/wiki/](https://en.wikipedia.org/wiki/){urllib.parse.quote(search)}">Read more...</a>"""
+        result += f"""<a href="https://en.wikipedia.org/wiki/{urllib.parse.quote(search)}">Read more...</a>"""
         
         if len(result) > 4000:
             with open("result.txt", 'w', encoding='utf-8') as f:
