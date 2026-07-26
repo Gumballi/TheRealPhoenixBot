@@ -251,9 +251,6 @@ def spank(bot: Bot, update: Update):
         if len(args) > 1:
             target = args[1].strip()
 
-    # Call Nekos.best API to fetch a random reaction GIF.
-    # NOTE: nekos.best does not have a "spank" category (checked their full endpoint
-    # list) - using "slap" as the closest equivalent that actually exists.
     try:
         req = urllib.request.Request(
             '[https://nekos.best/api/v2/slap](https://nekos.best/api/v2/slap)',
@@ -393,6 +390,7 @@ def wiki(bot: Bot, update: Update):
         else:
             update.effective_message.reply_text(result, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
+
 @run_async
 def judge(bot: Bot, update: Update):
     judger = ["<b>is lying!</b>", "<b>is telling the truth!</b>"]
@@ -440,8 +438,8 @@ def night_api_nsfw(bot: Bot, update: Update, args):
     # Default to 'hentai' if the user doesn't provide a specific argument
     category = args[0].lower() if args else "hentai"
     
-    # Common categories for Night API
-    valid_categories = ["hentai", "boobs", "pussy", "ass", "thighs", "feet"]
+    # Common categories for Night API (Removed unsupported 'thighs')
+    valid_categories = ["hentai", "boobs", "pussy", "ass", "feet"]
     
     if category not in valid_categories:
         msg.reply_text(f"⚠️ Invalid category! Available options:\n`{', '.join(valid_categories)}`", parse_mode=ParseMode.MARKDOWN)
@@ -457,11 +455,27 @@ def night_api_nsfw(bot: Bot, update: Update, args):
     try:
         response = requests.get(f"{NIGHT_API_URL}/{category}", headers=headers, timeout=10)
         
+        # Check HTTP network status
         if response.status_code == 200:
             data = response.json()
             
-            # Extract the image URL.
-            image_url = data.get("content", {}).get("url") or data.get("url") or data.get("message")
+            # Check internal API status (Night-API sometimes returns HTTP 200 for internal 400 errors)
+            api_status = data.get("status")
+            if api_status == 400:
+                error_msg = data.get("content", "Invalid request")
+                msg.reply_text(f"❌ API Error: {error_msg}")
+                return
+            
+            # Safely extract the image URL based on the data type
+            image_url = None
+            content = data.get("content")
+            
+            if isinstance(content, dict):
+                image_url = content.get("url")
+            elif isinstance(content, str) and content.startswith("http"):
+                image_url = content
+            else:
+                image_url = data.get("url") or data.get("message")
             
             if image_url:
                 msg.reply_photo(photo=image_url)
@@ -473,7 +487,7 @@ def night_api_nsfw(bot: Bot, update: Update, args):
         elif response.status_code == 404:
             msg.reply_text("❌ Endpoint not found. Night API may have renamed this category.")
         else:
-            msg.reply_text(f"❌ API Error: {response.status_code}")
+            msg.reply_text(f"❌ HTTP Error: {response.status_code}")
             
     except requests.exceptions.RequestException as e:
         LOGGER.error(f"[Night-API] Request failed: {e}")
@@ -492,7 +506,7 @@ __help__ = """
  - /wiki <term>: do a search on Wikipedia.
  - /judge: as a reply to someone, checks if they're lying or not!
  - /weebify: as a reply to a message, "weebifies" the message.
- - /nsfw <category>: Fetch a random NSFW image (defaults to hentai). Categories: hentai, boobs, pussy, ass, thighs, feet.
+ - /nsfw <category>: Fetch a random NSFW image (defaults to hentai). Categories: hentai, boobs, pussy, ass, feet.
 """
 
 __mod_name__ = "Extras"
