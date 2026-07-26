@@ -1,17 +1,25 @@
+import os
 import random
 import re
 import json
 import urllib.request
 import urllib.parse
 import wikipedia
+import requests
+import logging
 from wikipedia.exceptions import DisambiguationError, PageError
-
 
 from telegram import Message, Chat, Update, Bot, ParseMode
 from telegram.ext import run_async
 
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
+
+LOGGER = logging.getLogger(__name__)
+
+# Fetch API key securely from environment variables
+NIGHT_API_KEY = os.environ.get("NIGHT_API_KEY")
+NIGHT_API_URL = "https://api.night-api.com/images/nsfw"
 
 SHRUGS = (
     "┐(´д｀)┌",
@@ -168,26 +176,26 @@ weebyfont = ['卂','乃','匚','刀','乇','下','厶','卄','工','丁','长','
 def shrug(bot: Bot, update: Update):
     # reply to correct message 
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
-    reply_text = reply_text(random.choice(SHRUGS))
+    reply_text(random.choice(SHRUGS))
 
 
 @run_async
 def hug(bot: Bot, update: Update):
     # reply to correct message 
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
-    reply_text = reply_text(random.choice(HUGS))
+    reply_text(random.choice(HUGS))
     
     
 @run_async
 def toss(bot: Bot, update: Update):
- 	update.effective_message.reply_text(random.choice(TOSS))
+     update.effective_message.reply_text(random.choice(TOSS))
 
 
 @run_async
 def react(bot: Bot, update: Update):
-	 # reply to correct message 
+     # reply to correct message 
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
-    reply_text = reply_text(random.choice(REACTS))
+    reply_text(random.choice(REACTS))
     
 
 @run_async
@@ -217,14 +225,14 @@ def pat(bot: Bot, update: Update):
     msg_id = update.effective_message.reply_to_message.message_id if update.effective_message.reply_to_message else update.effective_message.message_id
     pats = []
     pats = json.loads(urllib.request.urlopen(urllib.request.Request(
-    'http://headp.at/js/pats.json',
+    '[http://headp.at/js/pats.json](http://headp.at/js/pats.json)',
     headers={'User-Agent': 'Mozilla/5.0 (X11; U; Linux i686) '
          'Gecko/20071127 Firefox/2.0.0.11'}
     )).read().decode('utf-8'))
     if "@" in msg and len(msg) > 5:
-        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', caption=msg)
+        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', caption=msg)
     else:
-        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
+        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
 
 
 @run_async
@@ -248,8 +256,8 @@ def spank(bot: Bot, update: Update):
     # list) - using "slap" as the closest equivalent that actually exists.
     try:
         req = urllib.request.Request(
-            'https://nekos.best/api/v2/slap',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
+            '[https://nekos.best/api/v2/slap](https://nekos.best/api/v2/slap)',
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 ([https://github.com/Gumballi/TheRealPhoenixBot-Restored](https://github.com/Gumballi/TheRealPhoenixBot-Restored))'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -267,7 +275,7 @@ def spank(bot: Bot, update: Update):
     else:
         caption = f"*{sender}* is looking around for someone to spank..."
 
-    # If replying, match the structure and target reply_to_message_id[cite: 3]
+    # If replying, match the structure and target reply_to_message_id
     msg_id = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
     
     bot.send_document(
@@ -297,8 +305,8 @@ def cuddle(bot: Bot, update: Update):
     # Call Nekos.best API to fetch a random cuddle GIF
     try:
         req = urllib.request.Request(
-            'https://nekos.best/api/v2/cuddle',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
+            '[https://nekos.best/api/v2/cuddle](https://nekos.best/api/v2/cuddle)',
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 ([https://github.com/Gumballi/TheRealPhoenixBot-Restored](https://github.com/Gumballi/TheRealPhoenixBot-Restored))'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -370,7 +378,7 @@ def wiki(bot: Bot, update: Update):
     if res:
         result = f"<b>{search.title()}</b>\n\n"
         result += f"<i>{res}</i>\n\n"
-        result += f"""<a href="https://en.wikipedia.org/wiki/{urllib.parse.quote(search)}">Read more...</a>"""
+        result += f"""<a href="[https://en.wikipedia.org/wiki/](https://en.wikipedia.org/wiki/){urllib.parse.quote(search)}">Read more...</a>"""
         
         if len(result) > 4000:
             with open("result.txt", 'w', encoding='utf-8') as f:
@@ -396,7 +404,7 @@ def judge(bot: Bot, update: Update):
     else:
         user = msg.from_user.first_name
     res = random.choice(judger)
-    reply = msg.reply_text(f"{user} {res}", parse_mode=ParseMode.HTML)
+    msg.reply_text(f"{user} {res}", parse_mode=ParseMode.HTML)
 
 
 @run_async
@@ -421,6 +429,56 @@ def weebify(bot: Bot, update: Update, args):
         msg.reply_text(string)
 
 
+@run_async
+def night_api_nsfw(bot: Bot, update: Update, args):
+    msg = update.effective_message
+    
+    if not NIGHT_API_KEY:
+        msg.reply_text("❌ The bot owner has not configured the `NIGHT_API_KEY`.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Default to 'hentai' if the user doesn't provide a specific argument
+    category = args[0].lower() if args else "hentai"
+    
+    # Common categories for Night API
+    valid_categories = ["hentai", "boobs", "pussy", "ass", "thighs", "feet"]
+    
+    if category not in valid_categories:
+        msg.reply_text(f"⚠️ Invalid category! Available options:\n`{', '.join(valid_categories)}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Send a typing action since external API calls can take a second to resolve
+    bot.send_chat_action(chat_id=msg.chat_id, action="upload_photo")
+
+    headers = {
+        "Authorization": f"{NIGHT_API_KEY}" 
+    }
+    
+    try:
+        response = requests.get(f"{NIGHT_API_URL}/{category}", headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Extract the image URL.
+            image_url = data.get("content", {}).get("url") or data.get("url") or data.get("message")
+            
+            if image_url:
+                msg.reply_photo(photo=image_url)
+            else:
+                msg.reply_text("❌ API request succeeded, but couldn't parse the image URL from the JSON.")
+                
+        elif response.status_code == 401:
+            msg.reply_text("❌ Unauthorized! The provided Night API key is invalid.")
+        elif response.status_code == 404:
+            msg.reply_text("❌ Endpoint not found. Night API may have renamed this category.")
+        else:
+            msg.reply_text(f"❌ API Error: {response.status_code}")
+            
+    except requests.exceptions.RequestException as e:
+        LOGGER.error(f"[Night-API] Request failed: {e}")
+        msg.reply_text("❌ An error occurred while communicating with the Night API servers.")
+
 
 __help__ = """
  - /shg or /shrug: pretty self-explanatory.
@@ -434,6 +492,7 @@ __help__ = """
  - /wiki <term>: do a search on Wikipedia.
  - /judge: as a reply to someone, checks if they're lying or not!
  - /weebify: as a reply to a message, "weebifies" the message.
+ - /nsfw <category>: Fetch a random NSFW image (defaults to hentai). Categories: hentai, boobs, pussy, ass, thighs, feet.
 """
 
 __mod_name__ = "Extras"
@@ -450,6 +509,7 @@ CUDDLE_HANDLER = DisableAbleCommandHandler("cuddle", cuddle)
 WIKI_HANDLER = DisableAbleCommandHandler("wiki", wiki)
 JUDGE_HANDLER = DisableAbleCommandHandler("judge", judge)
 WEEBIFY_HANDLER = DisableAbleCommandHandler("weebify", weebify, pass_args=True)
+NSFW_HANDLER = DisableAbleCommandHandler("nsfw", night_api_nsfw, pass_args=True)
 
 dispatcher.add_handler(SHRUG_HANDLER)
 dispatcher.add_handler(HUG_HANDLER)
@@ -462,3 +522,4 @@ dispatcher.add_handler(CUDDLE_HANDLER)
 dispatcher.add_handler(WIKI_HANDLER)
 dispatcher.add_handler(JUDGE_HANDLER)
 dispatcher.add_handler(WEEBIFY_HANDLER)
+dispatcher.add_handler(NSFW_HANDLER)
