@@ -15,7 +15,7 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-YTS_API_URL = "https://yts.mx/api/v2/list_movies.json"
+YTS_API_URL = "https://yts.rs/api/v2/list_movies.json"
 YIFY_URL = "https://yifysubtitles.org"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
