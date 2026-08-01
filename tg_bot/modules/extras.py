@@ -331,26 +331,46 @@ def cuddle(bot: Bot, update: Update):
         reply_to_message_id=msg_id
     )
 
-
 @run_async
 def kiss(bot, update):
     message = update.effective_message
     user = update.effective_user
 
-    # Force the user to reply to someone's message to kiss them
-    if not message.reply_to_message:
-        message.reply_text("Reply to someone's message to kiss them.")
-        return
+    target_name = ""
+    target_id = None
+    is_bot = False
+    is_self = False
 
-    target = message.reply_to_message.from_user
+    # Check if it's a reply to a message
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+        target_name = target.first_name
+        target_id = target.id
+        is_bot = target.id == bot.id
+        is_self = target.id == user.id
     
-    # Prevent them from kissing the bot
-    if target.id == bot.id:
+    # If not a reply, check if they typed a username/name after the command
+    else:
+        args = message.text.split(None, 1)
+        if len(args) > 1:
+            target_name = args[1]
+            
+            # Check if they tagged the bot's username
+            if target_name.lower() == "@{}".format(bot.username.lower()):
+                is_bot = True
+            # Check if they tagged their own username
+            elif user.username and target_name.lower() == "@{}".format(user.username.lower()):
+                is_self = True
+        else:
+            message.reply_text("Reply to someone's message or tag them to kiss them.")
+            return
+
+    # Safety checks
+    if is_bot:
         message.reply_text("I am a bot. You cannot kiss me.")
         return
 
-    # Prevent them from kissing themselves
-    if target.id == user.id:
+    if is_self:
         message.reply_text("You cannot kiss yourself.")
         return
 
@@ -360,18 +380,22 @@ def kiss(bot, update):
         req = requests.get(api_url)
         if req.status_code == 200:
             data = req.json()
-            
-            # Most APIs use 'url' for the image link. If the bot says "unexpected response",
-            # the API might be using 'image' or 'link' instead of 'url'.
             gif_url = data.get("url") 
             
             if not gif_url:
                 message.reply_text("The API returned an unexpected response.")
                 return
 
-            caption = "[{}](tg://user?id={}) kissed [{}](tg://user?id={})!".format(
-                user.first_name, user.id, target.first_name, target.id
-            )
+            # Format the caption dynamically based on whether we have their ID (from a reply) 
+            # or just a text string (from a typed username)
+            if target_id:
+                caption = "[{}](tg://user?id={}) kissed [{}](tg://user?id={})!".format(
+                    user.first_name, user.id, target_name, target_id
+                )
+            else:
+                caption = "[{}](tg://user?id={}) kissed {}!".format(
+                    user.first_name, user.id, target_name
+                )
             
             message.reply_animation(
                 animation=gif_url,
