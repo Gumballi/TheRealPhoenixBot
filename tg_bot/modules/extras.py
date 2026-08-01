@@ -332,83 +332,82 @@ def cuddle(bot: Bot, update: Update):
     )
 
 @run_async
-def kiss(bot, update):
-    message = update.effective_message
+def kiss(bot: Bot, update: Update):
+    chat_id = update.effective_chat.id
+    msg = update.effective_message
+    sender = update.effective_user.first_name
     user = update.effective_user
 
+    # Identify target (either who we are replying to or who is mentioned)
     target_name = ""
     target_id = None
     is_bot = False
     is_self = False
 
-    # Check if it's a reply
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
+    if msg.reply_to_message:
+        target = msg.reply_to_message.from_user
         target_name = target.first_name
         target_id = target.id
         is_bot = target.id == bot.id
         is_self = target.id == user.id
-    
-    # Check if they typed a username
     else:
-        args = message.text.split(None, 1)
+        args = msg.text.split(" ", 1)
         if len(args) > 1:
-            target_name = args[1]
+            target_name = args[1].strip()
             if target_name.lower() == "@{}".format(bot.username.lower()):
                 is_bot = True
             elif user.username and target_name.lower() == "@{}".format(user.username.lower()):
                 is_self = True
         else:
-            message.reply_text("Reply to someone's message or tag them to kiss them.")
+            msg.reply_text("Reply to someone's message or tag them to kiss them.")
             return
 
     # Safety checks
     if is_bot:
-        message.reply_text("I am a bot. You cannot kiss me.")
+        msg.reply_text("I am a bot. You cannot kiss me.")
         return
 
     if is_self:
-        message.reply_text("You cannot kiss yourself.")
+        msg.reply_text("You cannot kiss yourself.")
         return
 
     try:
-        # Corrected URL based on official docs (removed /v1/)
         api_url = "https://api.gifukai.com/kiss?type=mouth&pairing=fm" 
         
-        req = requests.get(api_url)
+        req = requests.get(api_url, timeout=8)
         if req.status_code == 200:
             data = req.json()
             gif_url = data.get("url") 
             
             if not gif_url:
-                message.reply_text("The API returned an unexpected response.")
+                msg.reply_text("The API returned an unexpected response.")
                 return
 
-            # Sanitize the names so underscores in usernames don't crash Telegram
-            safe_user = escape_markdown(user.first_name)
-            safe_target = escape_markdown(target_name)
+            # Sanitize names using HTML encoding to completely bypass markdown underscore crashes
+            safe_user = urllib.parse.quote(user.first_name) # Or use html.escape if preferred
+            # Using HTML anchors so Telegram natively links usernames with underscores safely
+            safe_user_html = html.escape(user.first_name)
+            safe_target_html = html.escape(target_name)
 
             if target_id:
-                caption = "[{}](tg://user?id={}) kissed [{}](tg://user?id={})!".format(
-                    safe_user, user.id, safe_target, target_id
-                )
+                caption = f"<b>{safe_user_html}</b> kissed <a href='tg://user?id={target_id}'>{safe_target_html}</a>!"
             else:
-                caption = "[{}](tg://user?id={}) kissed {}!".format(
-                    safe_user, user.id, safe_target
-                )
+                caption = f"<b>{safe_user_html}</b> kissed {safe_target_html}!"
             
-            message.reply_animation(
+            msg_id = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
+
+            bot.send_animation(
+                chat_id=chat_id,
                 animation=gif_url,
                 caption=caption,
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=msg_id
             )
         else:
-            message.reply_text("The API is currently unresponsive.")
+            msg.reply_text("The API is currently unresponsive.")
     except Exception as e:
-        # I added a print statement here so if it ever fails again, 
-        # you can check your Render logs and see the exact reason!
         print(f"Kiss Command Error: {e}")
-        message.reply_text("An error occurred while fetching the animation.")
+        msg.reply_text("An error occurred while fetching the animation.")
 
 @run_async
 def wiki(bot: Bot, update: Update):
