@@ -25,3 +25,4 @@ lxml
 youtube-transcript-api
 beautifulsoup4
 cloudscraper
+curl_cffi
