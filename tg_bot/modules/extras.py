@@ -1,4 +1,5 @@
 import os
+import html
 import random
 import re
 import json
@@ -338,7 +339,6 @@ def kiss(bot: Bot, update: Update):
     sender = update.effective_user.first_name
     user = update.effective_user
 
-    # Identify target (either who we are replying to or who is mentioned)
     target_name = ""
     target_id = None
     is_bot = False
@@ -362,7 +362,6 @@ def kiss(bot: Bot, update: Update):
             msg.reply_text("Reply to someone's message or tag them to kiss them.")
             return
 
-    # Safety checks
     if is_bot:
         msg.reply_text("I am a bot. You cannot kiss me.")
         return
@@ -383,9 +382,6 @@ def kiss(bot: Bot, update: Update):
                 msg.reply_text("The API returned an unexpected response.")
                 return
 
-            # Sanitize names using HTML encoding to completely bypass markdown underscore crashes
-            safe_user = urllib.parse.quote(user.first_name) # Or use html.escape if preferred
-            # Using HTML anchors so Telegram natively links usernames with underscores safely
             safe_user_html = html.escape(user.first_name)
             safe_target_html = html.escape(target_name)
 
