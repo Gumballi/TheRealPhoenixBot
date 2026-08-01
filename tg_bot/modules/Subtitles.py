@@ -64,10 +64,9 @@ def search_subtitles(bot: Bot, update: Update, args):
         return
 
     movie_name = " ".join(args)
-    status_msg = msg.reply_text(f"Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
+    status_msg = msg.reply_text(f"🔍 Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        # Use standard requests for OMDb since it has no anti-bot protection
         resp = requests.get(f"{OMDB_URL}?s={movie_name}&type=movie&apikey={OMDB_API_KEY}", timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -132,8 +131,6 @@ def movie_callback(bot: Bot, update: Update):
 
     try:
         url = f"{YIFY_URL}/movie-imdb/{imdb_code}"
-        
-        # We use cf_scraper and impersonate="chrome" to bypass Cloudflare
         html_resp = cf_scraper.get(url, impersonate="chrome", timeout=15)
         
         if html_resp.status_code == 404:
@@ -162,8 +159,10 @@ def movie_callback(bot: Bot, update: Update):
 
             if lang_name not in seen_langs:
                 seen_langs.add(lang_name)
-                dl_link = a_tag['href'].replace('/subtitles/', '/subtitle/') + '.zip'
-                available_subs.append((lang_name, dl_link))
+                # Save BOTH the direct zip link AND the original page link for the Referer header
+                orig_link = a_tag['href']
+                dl_link = orig_link.replace('/subtitles/', '/subtitle/') + '.zip'
+                available_subs.append((lang_name, dl_link, orig_link))
 
         if not available_subs:
             query.message.edit_text(f"No subtitles found for *{movie['title']}*.", parse_mode=ParseMode.MARKDOWN)
@@ -174,7 +173,7 @@ def movie_callback(bot: Bot, update: Update):
 
         keyboard = []
         row_btns = []
-        for lang_idx, (lang_name, _) in enumerate(available_subs):
+        for lang_idx, (lang_name, _, _) in enumerate(available_subs):
             btn = InlineKeyboardButton(lang_name, callback_data=f"lg_{msg_id}_{idx}_{lang_idx}")
             row_btns.append(btn)
             
@@ -216,14 +215,24 @@ def language_callback(bot: Bot, update: Update):
         query.answer("Invalid language selection.", show_alert=True)
         return
 
-    target_lang, subtitle_url = available_subs[lang_idx]
+    # Unpack the 3 variables (including our new referer_url)
+    target_lang, subtitle_url, referer_url = available_subs[lang_idx]
 
     query.answer(f"Downloading {target_lang} subtitles...")
     query.message.edit_text(f"Downloading {target_lang} subtitles for *{movie['title']}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        # Use cf_scraper with Chrome impersonation to grab the zip file
-        zip_resp = cf_scraper.get(f"{YIFY_URL}{subtitle_url}", impersonate="chrome", timeout=15)
+        # Forge the Referer header to bypass hotlink protection
+        headers = {
+            "Referer": f"{YIFY_URL}{referer_url}"
+        }
+        
+        zip_resp = cf_scraper.get(
+            f"{YIFY_URL}{subtitle_url}", 
+            impersonate="chrome", 
+            headers=headers,
+            timeout=15
+        )
         zip_resp.raise_for_status()
     except Exception as e:
         LOGGER.error(f"[Subtitles] Failed to download zip: {e}")
