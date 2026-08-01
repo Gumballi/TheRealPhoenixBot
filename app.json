@@ -16,7 +16,7 @@
       "BAN_STICKER": {
          "description": "ID of the sticker you want to use when banning people.",
          "required": false,
-         "value": "CAADBQADfQADv7rGI0wxx1ORU7UzAg"
+         "value": "CAACAgQAAxkBAAEF3P5qbi2G4Mo1tIK1Ik0tvrUm1reTIAACOB4AAlkweFPKbljPzjIN3j0E"
       },
       "DEL_CMDS": {
          "description": "Set this to True if you want to delete command messages from users who don't have the perms to run that command.",
@@ -25,7 +25,7 @@
       "DONATION_LINK": {
          "description": "Optional: link where you would like to receive donations.",
          "required": false,
-         "value": "https://www.paypal.me/PaulSonOfLars"
+         "value": ""
       },
       "ENV": {
          "description": "Setting this to ANYTHING will enable environment variables.",
@@ -33,11 +33,11 @@
       },
       "OWNER_ID": {
          "description": "Your user ID as an integer.",
-         "value": "615304572"
+         "value": "7179117035"
       },
       "OWNER_USERNAME": {
          "description": "Your username",
-         "value": "TheRealPhoenix"
+         "value": "Gumballization"
       },
       "PORT": {
          "description": "Port to use for your webhooks.",
@@ -50,11 +50,11 @@
       },
       "SUDO_USERS": {
          "description": "A space separated list of user IDs who you want to assign as sudo users.",
-         "value": "615304572 745191358"
+         "value": "7179117035 6724626308"
       },
       "SUPPORT_USERS": {
          "description": "A space separated list of user IDs who you wanna assign as support users(gban perms only).",
-         "value": "254318997 18673980 83489514"
+         "value": "7179117035 6724626308"
       },
       "BL_CHATS": {
           "description": "A space separated list of chat IDs to blacklist. Bot will leave those chats when added to them.",
@@ -77,7 +77,7 @@
       },
       "WHITELIST_USERS": {
          "description": "A space separated list of user IDs who you want to assign as whitelisted - can't be banned with your bot.",
-         "value": "254318997 18673980 83489514"
+         "value": "7179117035 6724626308"
       }
    },
    "keywords": [
@@ -88,5 +88,5 @@
       "phoenix"
    ],
    "name": "Phoenix",
-   "repository": "https://github.com/rsktg/TheRealPhoenixBot"
+   "repository": "https://github.com/Gumballi/TheRealPhoenixBot"
 }
