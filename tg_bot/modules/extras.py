@@ -341,7 +341,7 @@ def kiss(bot, update):
     is_bot = False
     is_self = False
 
-    # Check if it's a reply to a message
+    # Check if it's a reply
     if message.reply_to_message:
         target = message.reply_to_message.from_user
         target_name = target.first_name
@@ -349,16 +349,13 @@ def kiss(bot, update):
         is_bot = target.id == bot.id
         is_self = target.id == user.id
     
-    # If not a reply, check if they typed a username/name after the command
+    # Check if they typed a username
     else:
         args = message.text.split(None, 1)
         if len(args) > 1:
             target_name = args[1]
-            
-            # Check if they tagged the bot's username
             if target_name.lower() == "@{}".format(bot.username.lower()):
                 is_bot = True
-            # Check if they tagged their own username
             elif user.username and target_name.lower() == "@{}".format(user.username.lower()):
                 is_self = True
         else:
@@ -375,7 +372,8 @@ def kiss(bot, update):
         return
 
     try:
-        api_url = "https://api.gifukai.com/v1/kiss?type=mouth&pairing=fm" 
+        # Corrected URL based on official docs (removed /v1/)
+        api_url = "https://api.gifukai.com/kiss?type=mouth&pairing=fm" 
         
         req = requests.get(api_url)
         if req.status_code == 200:
@@ -386,15 +384,17 @@ def kiss(bot, update):
                 message.reply_text("The API returned an unexpected response.")
                 return
 
-            # Format the caption dynamically based on whether we have their ID (from a reply) 
-            # or just a text string (from a typed username)
+            # Sanitize the names so underscores in usernames don't crash Telegram
+            safe_user = escape_markdown(user.first_name)
+            safe_target = escape_markdown(target_name)
+
             if target_id:
                 caption = "[{}](tg://user?id={}) kissed [{}](tg://user?id={})!".format(
-                    user.first_name, user.id, target_name, target_id
+                    safe_user, user.id, safe_target, target_id
                 )
             else:
                 caption = "[{}](tg://user?id={}) kissed {}!".format(
-                    user.first_name, user.id, target_name
+                    safe_user, user.id, safe_target
                 )
             
             message.reply_animation(
@@ -405,6 +405,9 @@ def kiss(bot, update):
         else:
             message.reply_text("The API is currently unresponsive.")
     except Exception as e:
+        # I added a print statement here so if it ever fails again, 
+        # you can check your Render logs and see the exact reason!
+        print(f"Kiss Command Error: {e}")
         message.reply_text("An error occurred while fetching the animation.")
 
 @run_async
