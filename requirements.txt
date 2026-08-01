@@ -24,3 +24,4 @@ mistralai>=1.0.0
 lxml
 youtube-transcript-api
 beautifulsoup4
+cloudscraper
