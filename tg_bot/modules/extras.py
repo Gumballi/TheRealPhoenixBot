@@ -333,6 +333,57 @@ def cuddle(bot: Bot, update: Update):
 
 
 @run_async
+def kiss(bot, update):
+    message = update.effective_message
+    user = update.effective_user
+
+    # Force the user to reply to someone's message to kiss them
+    if not message.reply_to_message:
+        message.reply_text("Reply to someone's message to kiss them.")
+        return
+
+    target = message.reply_to_message.from_user
+    
+    # Prevent them from kissing the bot
+    if target.id == bot.id:
+        message.reply_text("I am a bot. You cannot kiss me.")
+        return
+
+    # Prevent them from kissing themselves
+    if target.id == user.id:
+        message.reply_text("You cannot kiss yourself.")
+        return
+
+    try:
+        api_url = "https://api.gifukai.com/v1/kiss?type=mouth&pairing=fm" 
+        
+        req = requests.get(api_url)
+        if req.status_code == 200:
+            data = req.json()
+            
+            # Most APIs use 'url' for the image link. If the bot says "unexpected response",
+            # the API might be using 'image' or 'link' instead of 'url'.
+            gif_url = data.get("url") 
+            
+            if not gif_url:
+                message.reply_text("The API returned an unexpected response.")
+                return
+
+            caption = "[{}](tg://user?id={}) kissed [{}](tg://user?id={})!".format(
+                user.first_name, user.id, target.first_name, target.id
+            )
+            
+            message.reply_animation(
+                animation=gif_url,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            message.reply_text("The API is currently unresponsive.")
+    except Exception as e:
+        message.reply_text("An error occurred while fetching the animation.")
+
+@run_async
 def wiki(bot: Bot, update: Update):
     msg = update.effective_message.reply_to_message if update.effective_message.reply_to_message else update.effective_message
     res = ""
@@ -520,6 +571,7 @@ SHOUT_HANDLER = DisableAbleCommandHandler("shout", shout, pass_args=True)
 PAT_HANDLER = DisableAbleCommandHandler("pat", pat)
 SPANK_HANDLER = DisableAbleCommandHandler("spank", spank)
 CUDDLE_HANDLER = DisableAbleCommandHandler("cuddle", cuddle)
+KISS_HANDLER = DisableAbleCommandHandler("kiss", kiss)
 WIKI_HANDLER = DisableAbleCommandHandler("wiki", wiki)
 JUDGE_HANDLER = DisableAbleCommandHandler("judge", judge)
 WEEBIFY_HANDLER = DisableAbleCommandHandler("weebify", weebify, pass_args=True)
@@ -533,6 +585,7 @@ dispatcher.add_handler(TOSS_HANDLER)
 dispatcher.add_handler(PAT_HANDLER)
 dispatcher.add_handler(SPANK_HANDLER)
 dispatcher.add_handler(CUDDLE_HANDLER)
+dispatcher.add_handler(KISS_HANDLER)
 dispatcher.add_handler(WIKI_HANDLER)
 dispatcher.add_handler(JUDGE_HANDLER)
 dispatcher.add_handler(WEEBIFY_HANDLER)
