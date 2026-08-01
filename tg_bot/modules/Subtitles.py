@@ -1,3 +1,4 @@
+import os
 import io
 import time
 import zipfile
@@ -15,8 +16,11 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-YTS_API_URL = "https://yts.rs/api/v2/list_movies.json"
-YIFY_URL = "https://yifysubtitles.org"
+OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
+OMDB_URL = "http://www.omdbapi.com/"
+
+# You can change this to a proxy (like yifysubtitles.ch) if .org ever blocks
+YIFY_URL = "https://yifysubtitles.org" 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
 }
@@ -28,7 +32,6 @@ RATE_LIMIT_SECONDS = 10       # per-user cooldown on /sub
 # In-memory state
 # ---------------------------------------------------------------------------
 # Search results keyed by the status message id. 
-# We will dynamically store the available languages here after scraping!
 SEARCH_RESULTS = {}       # {msg_id: [movie_dict, ...]}
 LAST_REQUEST = {}         # {user_id: timestamp}
 
@@ -56,34 +59,50 @@ def search_subtitles(bot: Bot, update: Update, args):
         return
 
     if _rate_limited(user_id):
-        msg.reply_text(f"⏳ Please wait a few seconds before searching again.")
+        msg.reply_text(f"Please wait a few seconds before searching again.")
+        return
+
+    if not OMDB_API_KEY:
+        msg.reply_text("The bot owner has not configured the `OMDB_API_KEY`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     movie_name = " ".join(args)
-    status_msg = msg.reply_text(f"🔍 Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
+    status_msg = msg.reply_text(f"Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        resp = requests.get(f"{YTS_API_URL}?query_term={movie_name}", timeout=10)
+        # Ask OMDb for the movie instead of YTS
+        resp = requests.get(f"{OMDB_URL}?s={movie_name}&type=movie&apikey={OMDB_API_KEY}", timeout=10)
         resp.raise_for_status()
         data = resp.json()
+        
     except requests.Timeout:
         status_msg.edit_text("The movie database took too long to respond. Try again shortly.")
         return
     except requests.RequestException as e:
-        LOGGER.error(f"[Subtitles] YTS API unreachable: {e}")
+        LOGGER.error(f"[Subtitles] OMDb API unreachable: {e}")
         status_msg.edit_text("Couldn't reach the movie database right now.")
         return
     except ValueError:
-        LOGGER.error("[Subtitles] YTS API returned non-JSON response")
-        status_msg.edit_text("Movie database returned an unexpected response. Try again later.")
+        LOGGER.error("[Subtitles] OMDb API returned non-JSON response")
+        status_msg.edit_text("Movie database returned an unexpected response.")
         return
 
-    movies = (data.get("data") or {}).get("movies") or []
-    if not movies:
+    # OMDb returns "Response": "False" if nothing is found
+    if data.get("Response") == "False":
         status_msg.edit_text(f"No results found for *{movie_name}*. Check your spelling!", parse_mode=ParseMode.MARKDOWN)
         return
 
-    top_matches = movies[:MAX_RESULTS]
+    # Extract the top results and format them to match our existing code
+    movies = data.get("Search", [])
+    top_matches = []
+    
+    for m in movies[:MAX_RESULTS]:
+        top_matches.append({
+            "title": m["Title"],
+            "year": m["Year"],
+            "imdb_code": m["imdbID"]
+        })
+
     SEARCH_RESULTS[status_msg.message_id] = top_matches
 
     keyboard = [
@@ -161,7 +180,7 @@ def movie_callback(bot: Bot, update: Update):
         # Sort the languages alphabetically for a clean UI
         available_subs.sort(key=lambda x: x[0])
         
-        # Save the scraped languages directly into our memory state so we don't have to scrape again!
+        # Save the scraped languages directly into our memory state
         movie['available_subs'] = available_subs
 
         # Build dynamic buttons (2 per row)
@@ -187,7 +206,7 @@ def movie_callback(bot: Bot, update: Update):
 
     except requests.RequestException as e:
         LOGGER.error(f"[Subtitles] YIFY unreachable: {e}")
-        query.message.edit_text("❌ Couldn't reach the subtitle site right now.")
+        query.message.edit_text("Couldn't reach the subtitle site right now.")
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +234,7 @@ def language_callback(bot: Bot, update: Update):
     target_lang, subtitle_url = available_subs[lang_idx]
 
     query.answer(f"Downloading {target_lang} subtitles...")
-    query.message.edit_text(f"📥 Downloading {target_lang} subtitles for *{movie['title']}*...", parse_mode=ParseMode.MARKDOWN)
+    query.message.edit_text(f"Downloading {target_lang} subtitles for *{movie['title']}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
         zip_resp = requests.get(f"{YIFY_URL}{subtitle_url}", headers=HEADERS, timeout=10)
@@ -233,7 +252,7 @@ def language_callback(bot: Bot, update: Update):
                 query.message.edit_text("The subtitle archive didn't contain an .srt file.")
                 return
 
-            query.message.edit_text("📤 Uploading subtitle file(s) to Telegram...")
+            query.message.edit_text("Uploading subtitle file(s) to Telegram...")
 
             for srt_filename in srt_files:
                 srt_content = z.read(srt_filename)
