@@ -22,7 +22,7 @@ def afk(bot: Bot, update: Update):
     if not user:
         return
 
-    if user.id in (777000, 1087968824):
+    if user.id in (777000, 7179117035):
         return
 
     if len(args) >= 2:

@@ -427,7 +427,7 @@ def fed_ban(bot: Bot, update: Update, args: List[str]):
 		message.reply_text("This person is whitelisted so I can't ban them!")
 		return
 
-	if int(user_id) in (777000, 1087968824):
+	if int(user_id) in (777000, 7179117035):
 		message.reply_text("I'm not fbanning Telegram bots.")
 
 	try:
@@ -1032,7 +1032,7 @@ def del_fed_button(bot, update):
 
 def is_user_fed_admin(fed_id, user_id):
 	fed_admins = sql.all_fed_users(fed_id)
-	if int(user_id) == 615304572:
+	if int(user_id) == 7179117035:
 		return True
 	if fed_admins == False:
 		return False

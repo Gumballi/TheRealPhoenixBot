@@ -141,9 +141,7 @@ If you have any questions on how to use me, head over to @PhoenixSupport
 And the following:
 """.format(dispatcher.bot.first_name, "" if not ALLOW_EXCL else "\nAll commands can either be used with / or !.\n")
 
-DONATE_STRING = """{0} doesn't currently need any donations.
-However you can donate to the creator of the original source code which {0} \
-is based on:- [PayPal](paypal.me/PaulSonOfLars), or [Monzo](monzo.me/paulnionvestergaardlarsen).""".format(dispatcher.bot.first_name)
+DONATE_STRING = "I don't currently have a donation link set up, but thanks for wanting to support {}!".format(dispatcher.bot.first_name)
 
 IMPORTED = {}
 MIGRATEABLE = []
@@ -383,7 +381,7 @@ def settings_button(bot: Bot, update: Update):
             chat = bot.get_chat(chat_id)
             text = "*{}* has the following settings for the *{}* module:\n\n".format(escape_markdown(chat.title),
                                                                                      CHAT_SETTINGS[
-                                                                                      module].__mod_name__) + \
+                                                                                         module].__mod_name__) + \
                    CHAT_SETTINGS[module].__chat_settings__(chat_id, user.id)
             query.message.reply_text(text=text,
                                      parse_mode=ParseMode.MARKDOWN,
@@ -457,18 +455,19 @@ def donate(bot: Bot, update: Update):
     user = update.effective_message.from_user
     chat = update.effective_chat
 
+    # Determine what message to send based on your DONATION_LINK variable
+    if DONATION_LINK:
+        donate_text = "You can donate to support {} [here]({})".format(bot.first_name, DONATION_LINK)
+    else:
+        donate_text = DONATE_STRING
+
+    # Send the message
     if chat.type == "private":
-        update.effective_message.reply_text(DONATE_STRING, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-        if OWNER_ID != 254318997 and DONATION_LINK:
-            update.effective_message.reply_text("You can also donate to the person currently running me "
-                                                "[here]({})".format(DONATION_LINK),
-                                                parse_mode=ParseMode.MARKDOWN)
-
+        update.effective_message.reply_text(donate_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     else:
         try:
-            bot.send_message(user.id, DONATE_STRING, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            update.effective_message.reply_text("I've PM'ed you about donating to my creator!")
+            bot.send_message(user.id, donate_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            update.effective_message.reply_text("I've PM'ed you about supporting the bot!")
         except Unauthorized:
             update.effective_message.reply_text("Contact me in PM first to get donation information.")
 
