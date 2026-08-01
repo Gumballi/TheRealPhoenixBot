@@ -3,7 +3,7 @@ import io
 import time
 import zipfile
 import requests
-import cloudscraper
+from curl_cffi import requests as cf_scraper
 from bs4 import BeautifulSoup
 import logging
 from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton, ParseMode
@@ -20,21 +20,11 @@ LOGGER = logging.getLogger(__name__)
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
 OMDB_URL = "http://www.omdbapi.com/"
 
-# Using the .ch mirror as it is less strictly blocked than .org
+# YIFY Mirror
 YIFY_URL = "https://yifysubtitles.ch" 
 
 MAX_RESULTS = 3
 RATE_LIMIT_SECONDS = 10       # per-user cooldown on /sub
-
-# Initialize the Cloudflare-bypassing scraper
-# This mimics a real desktop Chrome browser to prevent 403 Forbidden errors
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
-)
 
 # ---------------------------------------------------------------------------
 # In-memory state
@@ -74,10 +64,10 @@ def search_subtitles(bot: Bot, update: Update, args):
         return
 
     movie_name = " ".join(args)
-    status_msg = msg.reply_text(f"🔍 Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
+    status_msg = msg.reply_text(f"Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        # Ask OMDb for the movie
+        # Use standard requests for OMDb since it has no anti-bot protection
         resp = requests.get(f"{OMDB_URL}?s={movie_name}&type=movie&apikey={OMDB_API_KEY}", timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -142,8 +132,9 @@ def movie_callback(bot: Bot, update: Update):
 
     try:
         url = f"{YIFY_URL}/movie-imdb/{imdb_code}"
-        # Use cloudscraper instead of requests to bypass the 403 Forbidden block
-        html_resp = scraper.get(url, timeout=15)
+        
+        # We use cf_scraper and impersonate="chrome" to bypass Cloudflare
+        html_resp = cf_scraper.get(url, impersonate="chrome", timeout=15)
         
         if html_resp.status_code == 404:
             query.message.edit_text(f"No subtitles exist on YIFY for *{movie['title']}*.", parse_mode=ParseMode.MARKDOWN)
@@ -200,7 +191,7 @@ def movie_callback(bot: Bot, update: Update):
             parse_mode=ParseMode.MARKDOWN
         )
 
-    except requests.RequestException as e:
+    except Exception as e:
         LOGGER.error(f"[Subtitles] YIFY unreachable: {e}")
         query.message.edit_text("Couldn't reach the subtitle site right now.")
 
@@ -231,10 +222,10 @@ def language_callback(bot: Bot, update: Update):
     query.message.edit_text(f"Downloading {target_lang} subtitles for *{movie['title']}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        # Use cloudscraper again to download the actual zip file
-        zip_resp = scraper.get(f"{YIFY_URL}{subtitle_url}", timeout=15)
+        # Use cf_scraper with Chrome impersonation to grab the zip file
+        zip_resp = cf_scraper.get(f"{YIFY_URL}{subtitle_url}", impersonate="chrome", timeout=15)
         zip_resp.raise_for_status()
-    except requests.RequestException as e:
+    except Exception as e:
         LOGGER.error(f"[Subtitles] Failed to download zip: {e}")
         query.message.edit_text("Failed to download the subtitle archive. Try again shortly.")
         return
