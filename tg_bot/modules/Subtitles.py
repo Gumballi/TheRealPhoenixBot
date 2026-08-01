@@ -3,6 +3,7 @@ import io
 import time
 import zipfile
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import logging
 from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton, ParseMode
@@ -19,19 +20,25 @@ LOGGER = logging.getLogger(__name__)
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY")
 OMDB_URL = "http://www.omdbapi.com/"
 
-# You can change this to a proxy (like yifysubtitles.ch) if .org ever blocks
-YIFY_URL = "https://yifysubtitles.org" 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-}
+# Using the .ch mirror as it is less strictly blocked than .org
+YIFY_URL = "https://yifysubtitles.ch" 
 
 MAX_RESULTS = 3
 RATE_LIMIT_SECONDS = 10       # per-user cooldown on /sub
 
+# Initialize the Cloudflare-bypassing scraper
+# This mimics a real desktop Chrome browser to prevent 403 Forbidden errors
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
+
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
-# Search results keyed by the status message id. 
 SEARCH_RESULTS = {}       # {msg_id: [movie_dict, ...]}
 LAST_REQUEST = {}         # {user_id: timestamp}
 
@@ -67,10 +74,10 @@ def search_subtitles(bot: Bot, update: Update, args):
         return
 
     movie_name = " ".join(args)
-    status_msg = msg.reply_text(f"Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
+    status_msg = msg.reply_text(f"🔍 Searching for *{movie_name}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        # Ask OMDb for the movie instead of YTS
+        # Ask OMDb for the movie
         resp = requests.get(f"{OMDB_URL}?s={movie_name}&type=movie&apikey={OMDB_API_KEY}", timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -87,12 +94,10 @@ def search_subtitles(bot: Bot, update: Update, args):
         status_msg.edit_text("Movie database returned an unexpected response.")
         return
 
-    # OMDb returns "Response": "False" if nothing is found
     if data.get("Response") == "False":
         status_msg.edit_text(f"No results found for *{movie_name}*. Check your spelling!", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Extract the top results and format them to match our existing code
     movies = data.get("Search", [])
     top_matches = []
     
@@ -115,7 +120,6 @@ def search_subtitles(bot: Bot, update: Update, args):
         parse_mode=ParseMode.MARKDOWN
     )
 
-
 # ---------------------------------------------------------------------------
 # Movie selection — Scrape available languages and show dynamic buttons
 # ---------------------------------------------------------------------------
@@ -136,12 +140,11 @@ def movie_callback(bot: Bot, update: Update):
     query.answer("Fetching available languages...")
     query.message.edit_text(f"🔍 Checking available languages for *{movie['title']}*...", parse_mode=ParseMode.MARKDOWN)
 
-    # Scrape YIFY for this specific movie
     try:
         url = f"{YIFY_URL}/movie-imdb/{imdb_code}"
-        html_resp = requests.get(url, headers=HEADERS, timeout=10)
+        # Use cloudscraper instead of requests to bypass the 403 Forbidden block
+        html_resp = scraper.get(url, timeout=15)
         
-        # If the movie doesn't have a page on YIFY at all
         if html_resp.status_code == 404:
             query.message.edit_text(f"No subtitles exist on YIFY for *{movie['title']}*.", parse_mode=ParseMode.MARKDOWN)
             return
@@ -149,8 +152,7 @@ def movie_callback(bot: Bot, update: Update):
         html_resp.raise_for_status()
         soup = BeautifulSoup(html_resp.text, 'html.parser')
 
-        # Extract unique languages and their first/top download link
-        available_subs = [] # List of tuples: (lang_name, zip_url)
+        available_subs = [] 
         seen_langs = set()
 
         for a_tag in soup.find_all('a', href=True):
@@ -167,7 +169,6 @@ def movie_callback(bot: Bot, update: Update):
 
             lang_name = lang_cell.get_text(strip=True)
 
-            # We only keep the first link we find for each language (usually the most popular)
             if lang_name not in seen_langs:
                 seen_langs.add(lang_name)
                 dl_link = a_tag['href'].replace('/subtitles/', '/subtitle/') + '.zip'
@@ -177,13 +178,9 @@ def movie_callback(bot: Bot, update: Update):
             query.message.edit_text(f"No subtitles found for *{movie['title']}*.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        # Sort the languages alphabetically for a clean UI
         available_subs.sort(key=lambda x: x[0])
-        
-        # Save the scraped languages directly into our memory state
         movie['available_subs'] = available_subs
 
-        # Build dynamic buttons (2 per row)
         keyboard = []
         row_btns = []
         for lang_idx, (lang_name, _) in enumerate(available_subs):
@@ -194,7 +191,6 @@ def movie_callback(bot: Bot, update: Update):
                 keyboard.append(row_btns)
                 row_btns = []
                 
-        # Catch any leftover odd-numbered button
         if row_btns:
             keyboard.append(row_btns)
 
@@ -207,7 +203,6 @@ def movie_callback(bot: Bot, update: Update):
     except requests.RequestException as e:
         LOGGER.error(f"[Subtitles] YIFY unreachable: {e}")
         query.message.edit_text("Couldn't reach the subtitle site right now.")
-
 
 # ---------------------------------------------------------------------------
 # Language selection — download and send the subtitle file
@@ -230,14 +225,14 @@ def language_callback(bot: Bot, update: Update):
         query.answer("Invalid language selection.", show_alert=True)
         return
 
-    # Grab the pre-scraped URL from memory
     target_lang, subtitle_url = available_subs[lang_idx]
 
     query.answer(f"Downloading {target_lang} subtitles...")
     query.message.edit_text(f"Downloading {target_lang} subtitles for *{movie['title']}*...", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        zip_resp = requests.get(f"{YIFY_URL}{subtitle_url}", headers=HEADERS, timeout=10)
+        # Use cloudscraper again to download the actual zip file
+        zip_resp = scraper.get(f"{YIFY_URL}{subtitle_url}", timeout=15)
         zip_resp.raise_for_status()
     except requests.RequestException as e:
         LOGGER.error(f"[Subtitles] Failed to download zip: {e}")
