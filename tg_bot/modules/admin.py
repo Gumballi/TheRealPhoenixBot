@@ -59,28 +59,32 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
         message.reply_text("I can't promote myself! Get an admin to do it for me.")
         return ""
 
+    bot_member = chat.get_member(bot.id)
+
     if promote_type == "full":
-        # Direct API request to ensure all modern permissions (stories, tags, topics, etc.) are enabled
+        # Dynamically mirror all permissions the bot itself holds to avoid RIGHT_FORBIDDEN
         url = f"https://api.telegram.org/bot{TOKEN}/promoteChatMember"
         payload = {
             "chat_id": chat_id,
             "user_id": user_id,
             "is_anonymous": False,
-            "can_manage_chat": True,
-            "can_change_info": True,
-            "can_delete_messages": True,
-            "can_restrict_members": True,
-            "can_invite_users": True,
-            "can_pin_messages": True,
-            "can_promote_members": True,
-            "can_manage_video_chats": True,
-            "can_manage_topics": True,
-            "can_post_stories": True,
-            "can_edit_stories": True,
-            "can_delete_stories": True,
-            "can_manage_tags": True
+            "can_manage_chat": getattr(bot_member, "can_manage_chat", True),
+            "can_post_messages": getattr(bot_member, "can_post_messages", False),
+            "can_edit_messages": getattr(bot_member, "can_edit_messages", False),
+            "can_change_info": getattr(bot_member, "can_change_info", False),
+            "can_delete_messages": getattr(bot_member, "can_delete_messages", False),
+            "can_restrict_members": getattr(bot_member, "can_restrict_members", False),
+            "can_invite_users": getattr(bot_member, "can_invite_users", False),
+            "can_pin_messages": getattr(bot_member, "can_pin_messages", False),
+            "can_promote_members": getattr(bot_member, "can_promote_members", False),
+            "can_manage_video_chats": getattr(bot_member, "can_manage_video_chats", False),
+            "can_manage_topics": getattr(bot_member, "can_manage_topics", False),
+            "can_post_stories": getattr(bot_member, "can_post_stories", False),
+            "can_edit_stories": getattr(bot_member, "can_edit_stories", False),
+            "can_delete_stories": getattr(bot_member, "can_delete_stories", False),
+            "can_manage_tags": getattr(bot_member, "can_manage_tags", False)
         }
-        res = requests.post(url, json=payload)
+        res = requests.post(url, json=payload, timeout=10)
         if res.status_code != 200 or not res.json().get("ok"):
             try:
                 err_desc = res.json().get("description", "Unknown error")
@@ -89,7 +93,6 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
             message.reply_text(f"Failed to fully promote user: {err_desc}")
             return ""
     else:
-        bot_member = chat.get_member(bot.id)
         bot.promoteChatMember(
             chat_id, user_id,
             can_change_info=bot_member.can_change_info,
@@ -135,10 +138,13 @@ def set_title(bot: Bot, update: Update, args):
         return
 
     response = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/setChatAdministratorCustomTitle"
-        f"?chat_id={chat.id}"
-        f"&user_id={user_id}"
-        f"&custom_title={title}"
+        f"https://api.telegram.org/bot{TOKEN}/setChatAdministratorCustomTitle",
+        params={
+            "chat_id": chat.id,
+            "user_id": user_id,
+            "custom_title": title,
+        },
+        timeout=10
     )
     
     if response.status_code != 200:
@@ -158,6 +164,11 @@ def demote(bot: Bot, update: Update, args: List[str]) -> str:
     chat = update.effective_chat  # type: Optional[Chat]
     message = update.effective_message  # type: Optional[Message]
     user = update.effective_user  # type: Optional[User]
+
+    promoter = chat.get_member(user.id)
+    if not (promoter.can_promote_members or promoter.status == "creator") and not user.id in SUDO_USERS:
+        message.reply_text("You don't have the necessary rights to do that!")
+        return ""
 
     user_id = extract_user(message, args)
     if not user_id:
@@ -282,7 +293,8 @@ def adminlist(bot: Bot, update: Update):
     text = "Admins in <b>{}</b>:".format(update.effective_chat.title or "this chat")
     for admin in administrators:
         user = admin.user
-        name = """<a href="tg://user?id={}">{}</a>""".format(user.id, user.first_name + (user.last_name or ""))
+        full_name = user.first_name + ((" " + user.last_name) if user.last_name else "")
+        name = """<a href="tg://user?id={}">{}</a>""".format(user.id, html.escape(full_name))
         text += "\n • {}".format(name)
 
     update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -301,7 +313,7 @@ __help__ = """
  - /unpin: unpins the currently pinned message.
  - /link: gets invitelink of the chat.
  - /promote or /promote basic: promotes the user you reply to with standard permissions.
- - /promote full: promotes the user with complete administrative permissions (including stories and tags, excluding anonymous).
+ - /promote full: promotes the user with all available administrative permissions held by the bot.
  - /settitle <title>: as a reply to a user, sets admin title.
  - /demote: demotes the user you reply to.
 
