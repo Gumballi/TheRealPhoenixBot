@@ -59,36 +59,37 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
         message.reply_text("I can't promote myself! Get an admin to do it for me.")
         return ""
 
-    bot_member = chat.get_member(bot.id)
-
     if promote_type == "full":
-        try:
-            bot.promoteChatMember(
-                chat_id,
-                user_id,
-                can_change_info=True,
-                can_delete_messages=True,
-                can_restrict_members=True,
-                can_invite_users=True,
-                can_pin_messages=True,
-                can_promote_members=True,
-                can_manage_chat=True,
-                can_manage_video_chats=True
-            )
-        except TypeError:
-            # Fallback for older python-telegram-bot wrapper versions
-            bot.promoteChatMember(
-                chat_id,
-                user_id,
-                can_change_info=True,
-                can_delete_messages=True,
-                can_restrict_members=True,
-                can_invite_users=True,
-                can_pin_messages=True,
-                can_promote_members=True
-            )
+        # Direct API request to ensure all modern permissions (stories, tags, topics, etc.) are enabled
+        url = f"https://api.telegram.org/bot{TOKEN}/promoteChatMember"
+        payload = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "is_anonymous": False,
+            "can_manage_chat": True,
+            "can_change_info": True,
+            "can_delete_messages": True,
+            "can_restrict_members": True,
+            "can_invite_users": True,
+            "can_pin_messages": True,
+            "can_promote_members": True,
+            "can_manage_video_chats": True,
+            "can_manage_topics": True,
+            "can_post_stories": True,
+            "can_edit_stories": True,
+            "can_delete_stories": True,
+            "can_manage_tags": True
+        }
+        res = requests.post(url, json=payload)
+        if res.status_code != 200 or not res.json().get("ok"):
+            try:
+                err_desc = res.json().get("description", "Unknown error")
+            except Exception:
+                err_desc = res.text
+            message.reply_text(f"Failed to fully promote user: {err_desc}")
+            return ""
     else:
-        # Set same perms as bot or basic matching
+        bot_member = chat.get_member(bot.id)
         bot.promoteChatMember(
             chat_id, user_id,
             can_change_info=bot_member.can_change_info,
@@ -300,7 +301,7 @@ __help__ = """
  - /unpin: unpins the currently pinned message.
  - /link: gets invitelink of the chat.
  - /promote or /promote basic: promotes the user you reply to with standard permissions.
- - /promote full: promotes the user with full administrative permissions (excluding anonymous).
+ - /promote full: promotes the user with complete administrative permissions (including stories and tags, excluding anonymous).
  - /settitle <title>: as a reply to a user, sets admin title.
  - /demote: demotes the user you reply to.
 
