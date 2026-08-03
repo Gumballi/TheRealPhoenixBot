@@ -34,7 +34,18 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
         message.reply_text("You don't have the necessary rights to do that!")
         return ""
 
-    user_id = extract_user(message, args)
+    # Determine promotion type (basic vs full)
+    promote_type = "basic"
+    clean_args = []
+    for arg in args:
+        if arg.lower() == "full":
+            promote_type = "full"
+        elif arg.lower() == "basic":
+            promote_type = "basic"
+        else:
+            clean_args.append(arg)
+
+    user_id = extract_user(message, clean_args)
     if not user_id:
         message.reply_text("You don't seem to be referring to a user.")
         return ""
@@ -48,24 +59,54 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
         message.reply_text("I can't promote myself! Get an admin to do it for me.")
         return ""
 
-    # set same perms as bot - bot can't assign higher perms than itself!
     bot_member = chat.get_member(bot.id)
 
-    bot.promoteChatMember(chat_id, user_id,
-                          can_change_info=bot_member.can_change_info,
-                          can_post_messages=bot_member.can_post_messages,
-                          can_edit_messages=bot_member.can_edit_messages,
-                          can_delete_messages=bot_member.can_delete_messages,
-                          can_invite_users=bot_member.can_invite_users,
-                          can_restrict_members=bot_member.can_restrict_members,
-                          can_pin_messages=bot_member.can_pin_messages,
-                          can_promote_members=bot_member.can_promote_members)
+    if promote_type == "full":
+        try:
+            bot.promoteChatMember(
+                chat_id,
+                user_id,
+                can_change_info=True,
+                can_delete_messages=True,
+                can_restrict_members=True,
+                can_invite_users=True,
+                can_pin_messages=True,
+                can_promote_members=True,
+                can_manage_chat=True,
+                can_manage_video_chats=True
+            )
+        except TypeError:
+            # Fallback for older python-telegram-bot wrapper versions
+            bot.promoteChatMember(
+                chat_id,
+                user_id,
+                can_change_info=True,
+                can_delete_messages=True,
+                can_restrict_members=True,
+                can_invite_users=True,
+                can_pin_messages=True,
+                can_promote_members=True
+            )
+    else:
+        # Set same perms as bot or basic matching
+        bot.promoteChatMember(
+            chat_id, user_id,
+            can_change_info=bot_member.can_change_info,
+            can_post_messages=bot_member.can_post_messages,
+            can_edit_messages=bot_member.can_edit_messages,
+            can_delete_messages=bot_member.can_delete_messages,
+            can_invite_users=bot_member.can_invite_users,
+            can_restrict_members=bot_member.can_restrict_members,
+            can_pin_messages=bot_member.can_pin_messages,
+            can_promote_members=bot_member.can_promote_members
+        )
 
-    message.reply_text("Successfully promoted!")
+    message.reply_text(f"Successfully promoted ({promote_type.capitalize()})!")
     return "<b>{}:</b>" \
-           "\n#PROMOTED" \
-           "\n<b>Admin:</b> {}" \
-           "\n<b>User:</b> {}".format(html.escape(chat.title),
+            "\n#PROMOTED ({})" \
+            "\n<b>Admin:</b> {}" \
+            "\n<b>User:</b> {}".format(html.escape(chat.title),
+                                      promote_type.capitalize(),
                                       mention_html(user.id, user.first_name),
                                       mention_html(user_member.user.id, user_member.user.first_name))
 
@@ -150,8 +191,8 @@ def demote(bot: Bot, update: Update, args: List[str]) -> str:
                "\n#DEMOTED" \
                "\n<b>Admin:</b> {}" \
                "\n<b>User:</b> {}".format(html.escape(chat.title),
-                                          mention_html(user.id, user.first_name),
-                                          mention_html(user_member.user.id, user_member.user.first_name))
+                                         mention_html(user.id, user.first_name),
+                                         mention_html(user_member.user.id, user_member.user.first_name))
 
     except BadRequest:
         message.reply_text("Could not demote. I might not be admin, or the admin status was appointed by another "
@@ -258,7 +299,8 @@ __help__ = """
  - /pin: silently pins the message replied to - add 'loud' or 'notify' to give notifs to users.
  - /unpin: unpins the currently pinned message.
  - /link: gets invitelink of the chat.
- - /promote: promotes the user you reply to.
+ - /promote or /promote basic: promotes the user you reply to with standard permissions.
+ - /promote full: promotes the user with full administrative permissions (excluding anonymous).
  - /settitle <title>: as a reply to a user, sets admin title.
  - /demote: demotes the user you reply to.
 
