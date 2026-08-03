@@ -68,7 +68,7 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
             "chat_id": chat_id,
             "user_id": user_id,
             "is_anonymous": False,
-            "can_manage_chat": getattr(bot_member, "can_manage_chat", True),
+            "can_manage_chat": getattr(bot_member, "can_manage_chat", False),
             "can_post_messages": getattr(bot_member, "can_post_messages", False),
             "can_edit_messages": getattr(bot_member, "can_edit_messages", False),
             "can_change_info": getattr(bot_member, "can_change_info", False),
@@ -84,7 +84,7 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
             "can_delete_stories": getattr(bot_member, "can_delete_stories", False),
             "can_manage_tags": getattr(bot_member, "can_manage_tags", False)
         }
-        res = requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload)
         if res.status_code != 200 or not res.json().get("ok"):
             try:
                 err_desc = res.json().get("description", "Unknown error")
@@ -93,16 +93,21 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
             message.reply_text(f"Failed to fully promote user: {err_desc}")
             return ""
     else:
+        # A genuine "basic" tier: standard day-to-day moderator rights only.
+        # This is intentionally NOT a mirror of the bot's own permissions -
+        # that's what "full" is for. Keeping this a fixed, modest preset also
+        # avoids RIGHT_FORBIDDEN, since these rights are almost always a
+        # subset of what a group-management bot holds.
         bot.promoteChatMember(
             chat_id, user_id,
-            can_change_info=bot_member.can_change_info,
-            can_post_messages=bot_member.can_post_messages,
-            can_edit_messages=bot_member.can_edit_messages,
-            can_delete_messages=bot_member.can_delete_messages,
-            can_invite_users=bot_member.can_invite_users,
-            can_restrict_members=bot_member.can_restrict_members,
-            can_pin_messages=bot_member.can_pin_messages,
-            can_promote_members=bot_member.can_promote_members
+            can_change_info=False,
+            can_post_messages=False,
+            can_edit_messages=False,
+            can_delete_messages=True,
+            can_invite_users=True,
+            can_restrict_members=True,
+            can_pin_messages=True,
+            can_promote_members=False
         )
 
     message.reply_text(f"Successfully promoted ({promote_type.capitalize()})!")
@@ -144,7 +149,6 @@ def set_title(bot: Bot, update: Update, args):
             "user_id": user_id,
             "custom_title": title,
         },
-        timeout=10
     )
     
     if response.status_code != 200:
