@@ -1,18 +1,13 @@
-import glob
 import html
 import io
 import logging
-import os
 import re
-import shutil
-import tempfile
 import urllib.parse
 from typing import List, Optional
 
 import requests
 from telegram import Bot, ParseMode, Update
 from telegram.ext import run_async
-from torrentp import TorrentDownloader
 
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
@@ -26,14 +21,10 @@ LOGGER = logging.getLogger(__name__)
 class OpenLibraryFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[dict]:
-        """
-        Searches Open Library for books, then fetches the raw EPUB/PDF 
-        directly from the Internet Archive. Immune to Cloudflare.
-        """
+        """Searches Open Library for public domain books via Internet Archive."""
         search_url = "https://openlibrary.org/search.json"
         
         try:
-            # Step 1: Search Open Library (Standard requests, no Cloudflare block!)
             resp = requests.get(search_url, params={"q": query, "limit": 15}, timeout=15)
             resp.raise_for_status()
             data = resp.json()
@@ -41,13 +32,11 @@ class OpenLibraryFetcher:
             LOGGER.error(f"[OpenLibrary] Search failed: {e!r}")
             return None
 
-        # Step 2: Look for a public domain book with an Internet Archive ID
         for doc in data.get("docs", []):
             if doc.get("public_scan_b") and doc.get("ia"):
-                ia_id = doc.get("ia")[0] # Grab the Internet Archive identifier
-                
-                # Step 3: Check Internet Archive for the actual files
+                ia_id = doc.get("ia")[0]
                 ia_meta_url = f"https://archive.org/metadata/{ia_id}"
+                
                 try:
                     ia_resp = requests.get(ia_meta_url, timeout=10)
                     ia_resp.raise_for_status()
@@ -71,7 +60,6 @@ class OpenLibraryFetcher:
                                 ext = "pdf"
                                 break
 
-                    # If we found a file, package it up and return it
                     if dl_url:
                         authors = ", ".join(doc.get("author_name", ["Unknown Author"]))
                         cover_i = doc.get("cover_i")
@@ -85,10 +73,10 @@ class OpenLibraryFetcher:
                             "cover": cover_url
                         }
                 except Exception as e:
-                    LOGGER.warning(f"[InternetArchive] Failed to fetch metadata for {ia_id}: {e!r}")
+                    LOGGER.warning(f"[InternetArchive] Failed metadata for {ia_id}: {e!r}")
                     continue
 
-        return {} # Search worked, but no downloadable files found
+        return {} 
 
 
 @run_async
@@ -103,16 +91,12 @@ def book(bot: Bot, update: Update, args: List[str]):
         )
         return
 
-    status_msg = msg.reply_text(
-        f"Searching Open Library for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
-    )
-
+    status_msg = msg.reply_text(f"Searching Open Library for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML)
     book_info = OpenLibraryFetcher.search_books(query)
 
     if book_info is None:
         status_msg.edit_text("Search failed — Open Library didn't respond. Try again in a moment.")
         return
-
     if not book_info.get("download_url"):
         status_msg.edit_text("No downloadable public domain book found for your query.")
         return
@@ -123,13 +107,9 @@ def book(bot: Bot, update: Update, args: List[str]):
     ext = book_info["ext"]
     cover_url = book_info.get("cover")
 
-    status_msg.edit_text(
-        f"Found <b>{html.escape(title)}</b> by <i>{html.escape(author)}</i>\nDownloading from Internet Archive...",
-        parse_mode=ParseMode.HTML,
-    )
+    status_msg.edit_text(f"Found <b>{html.escape(title)}</b> by <i>{html.escape(author)}</i>\nDownloading from Internet Archive...", parse_mode=ParseMode.HTML)
 
     try:
-        # Download from Internet Archive (No Cloudflare blocking!)
         resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=45)
         resp.raise_for_status()
         
@@ -146,90 +126,86 @@ def book(bot: Bot, update: Update, args: List[str]):
                 thumb_obj = io.BytesIO(thumb_resp.content)
                 thumb_obj.name = "cover.jpg"
                 thumb_obj.seek(0)
-            except requests.exceptions.RequestException as thumb_err:
-                LOGGER.warning(f"[book] Failed to download thumbnail for {title}: {thumb_err}")
+            except Exception:
+                pass
 
+        # Added timeout=120 to fix the TimedOut() crash during large Telegram uploads
         msg.reply_document(
             document=file_obj,
             thumb=thumb_obj,
-            caption=(
-                f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\n\n"
-                f"Downloaded via @{bot.username}"
-            ),
+            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\n\nDownloaded via @{bot.username}",
             parse_mode=ParseMode.HTML,
+            timeout=120 
         )
-
         try:
             status_msg.delete()
         except Exception:
             pass
 
-    except requests.exceptions.RequestException as e:
-        LOGGER.error(f"[book] Download error: {e!r}")
-        status_msg.edit_text(
-            f"Failed to download file. Direct link: <a href='{html.escape(dl_url)}'>Download Book</a>",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    except requests.exceptions.RequestException:
+        status_msg.edit_text(f"Failed to download file. Direct link: <a href='{html.escape(dl_url)}'>Download Book</a>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         LOGGER.error(f"[book] Unexpected error sending document: {e!r}")
         status_msg.edit_text("Something went wrong sending the file. Check logs.")
 
 
 # ==========================================
-# PIRATE BAY (TORRENT) LOGIC (Unchanged)
+# LIBRARY GENESIS (DIRECT DOWNLOAD) LOGIC
 # ==========================================
 
-TRACKERS = "&tr=" + "&tr=".join([
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-])
-
-class TPBDownloader:
+class LibGenFetcher:
     @staticmethod
-    def get_best_magnet(query: str) -> Optional[dict]:
-        try:
-            st_url = "https://bitsearch.to/api/v1/search"
-            st_resp = requests.get(st_url, params={"q": query, "category": "all"}, timeout=15)
-            st_resp.raise_for_status()
-            
-            st_data = st_resp.json()
-            results = st_data.get("data", []) if "data" in st_data else st_data.get("results", [])
-            
-            if results:
-                top = results[0]
-                info_hash = top.get("info_hash")
-                name = top.get("name") or top.get("title", "Unknown_Torrent")
+    def search_books(query: str) -> Optional[dict]:
+        """Scrapes LibGen and Library.lol for direct file downloads. No Torrents."""
+        domains = ["libgen.is", "libgen.rs", "libgen.st"]
+        
+        for domain in domains:
+            try:
+                url = f"https://{domain}/search.php"
+                resp = requests.get(url, params={"req": query, "res": 25, "view": "simple"}, timeout=15)
+                resp.raise_for_status()
                 
-                if info_hash:
-                    magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}{TRACKERS}"
-                    return {"name": name, "magnet": magnet}
-        except Exception as e:
-            LOGGER.warning(f"[BitSearch] Search failed for '{query}': {e!r}")
-
-        try:
-            target_url = f"https://apibay.org/q.php?q={urllib.parse.quote(query)}&cat=0"
-            proxy_url = f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(target_url)}"
-            
-            pb_resp = requests.get(proxy_url, timeout=20)
-            pb_resp.raise_for_status()
-            
-            pb_data = pb_resp.json()
-            if pb_data and isinstance(pb_data, list) and pb_data[0].get("id") != "0":
-                top = pb_data[0]
-                info_hash = top.get("info_hash")
-                name = top.get("name", "Unknown_Torrent")
+                # Extract the MD5 hash of the first result
+                match = re.search(r'\?md5=([A-Fa-f0-9]{32})', resp.text, re.IGNORECASE)
+                if not match:
+                    continue # Try next domain if empty
                 
-                magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}{TRACKERS}"
-                return {"name": name, "magnet": magnet}
+                md5 = match.group(1)
                 
-        except Exception as e:
-            safe_text = str(e).replace("<", "[").replace(">", "]")
-            LOGGER.error(f"[TPB Proxy] Search failed: {safe_text}")
-            return None
-            
-        return {}
+                # Use the MD5 to hit the direct download gateway
+                gate_url = f"https://library.lol/main/{md5}"
+                gate_resp = requests.get(gate_url, timeout=15)
+                gate_resp.raise_for_status()
+                
+                # Scrape the direct 'GET' link
+                dl_match = re.search(r'href="([^"]+)">GET</a>', gate_resp.text)
+                if not dl_match:
+                    return {}
+                    
+                dl_url = dl_match.group(1)
+                
+                # Scrape Title, Author, and Extension from the gateway page
+                title_match = re.search(r'<h1>(.*?)</h1>', gate_resp.text, re.IGNORECASE | re.DOTALL)
+                title = title_match.group(1).strip() if title_match else query
+                
+                author_match = re.search(r'Author\(s\):\s*(.*?)(?:<br|</div>)', gate_resp.text, re.IGNORECASE)
+                author = author_match.group(1).strip() if author_match else "Unknown Author"
+                
+                ext_match = re.search(r'Extension:\s*([a-zA-Z0-9]+)', gate_resp.text, re.IGNORECASE)
+                ext = ext_match.group(1).lower() if ext_match else "epub"
+                ext = re.sub(r'[^a-z0-9]', '', ext) # Sanitize extension
+                
+                return {
+                    "title": title,
+                    "author": author,
+                    "download_url": dl_url,
+                    "ext": ext
+                }
+            except requests.exceptions.RequestException as e:
+                LOGGER.warning(f"[LibGen] Failed on {domain}: {e!r}")
+                continue
+                
+        return None # All domains completely failed
 
 
 @run_async
@@ -238,66 +214,53 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
     query = " ".join(args).strip()
 
     if not query:
-        msg.reply_text(
-            "Please specify a book title!\n<b>Usage:</b> <code>/piratebook 1984 George Orwell</code>", 
-            parse_mode=ParseMode.HTML
-        )
+        msg.reply_text("Please specify a book title!\n<b>Usage:</b> <code>/piratebook 1984 George Orwell</code>", parse_mode=ParseMode.HTML)
         return
 
-    status_msg = msg.reply_text(
-        f"Searching torrents for: <b>{html.escape(query)}</b>...", 
-        parse_mode=ParseMode.HTML
-    )
+    status_msg = msg.reply_text(f"Searching Library Genesis for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML)
 
-    result = TPBDownloader.get_best_magnet(query)
+    book_info = LibGenFetcher.search_books(query)
     
-    if result is None:
-        status_msg.edit_text("Search failed — torrent trackers didn't respond. Try again in a moment.")
+    if book_info is None:
+        status_msg.edit_text("Search failed — LibGen is currently unresponsive.")
         return
-        
-    if not result:
-        status_msg.edit_text("No ebook torrents found for that query.")
+    if not book_info.get("download_url"):
+        status_msg.edit_text("No ebooks found on Library Genesis for that query.")
         return
 
-    torrent_name = result["name"]
-    magnet_link = result["magnet"]
+    title = book_info["title"]
+    author = book_info["author"]
+    dl_url = book_info["download_url"]
+    ext = book_info["ext"]
 
-    status_msg.edit_text(
-        f"Downloading torrent: <b>{html.escape(torrent_name)}</b>...\n<i>Please wait, this depends on active seeders.</i>", 
-        parse_mode=ParseMode.HTML
-    )
+    status_msg.edit_text(f"Found <b>{html.escape(title)}</b> by <i>{html.escape(author)}</i>\nDownloading file directly to server...", parse_mode=ParseMode.HTML)
 
-    temp_dir = tempfile.mkdtemp()
     try:
-        downloader = TorrentDownloader(magnet_link, temp_dir)
-        downloader.start_download()
-
-        found_files = []
-        for ext in ['*.epub', '*.pdf', '*.mobi', '*.azw3']:
-            found_files.extend(glob.glob(os.path.join(temp_dir, '**', ext), recursive=True))
-
-        if not found_files:
-            found_files = [f for f in glob.glob(os.path.join(temp_dir, '**', '*'), recursive=True) if os.path.isfile(f)]
-
-        if not found_files:
-            status_msg.edit_text("Download timed out or no file was extracted.")
+        # Stream the download so we can check the file size before loading it all into memory
+        resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=20)
+        resp.raise_for_status()
+        
+        size = int(resp.headers.get("Content-Length", 0))
+        if size > 50 * 1024 * 1024:
+            status_msg.edit_text(f"⚠️ File size ({round(size / 1024 / 1024, 2)} MB) exceeds Telegram's 50MB bot limit.\n\nDirect link: <a href='{html.escape(dl_url)}'>Download Here</a>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             return
 
-        target_file = found_files[0]
-        file_size_mb = round(os.path.getsize(target_file) / (1024 * 1024), 2)
-
-        if file_size_mb > 50:
-            status_msg.edit_text(f"Warning: File size ({file_size_mb} MB) exceeds Telegram's 50MB bot upload limit.")
-            return
+        # Read into memory
+        content = resp.content
+        file_obj = io.BytesIO(content)
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", title).replace(" ", "_")
+        file_obj.name = f"{safe_title}.{ext}"
+        file_obj.seek(0)
 
         status_msg.edit_text("Uploading book to Telegram...")
 
-        with open(target_file, "rb") as doc:
-            msg.reply_document(
-                document=doc,
-                caption=f"<b>{html.escape(torrent_name)}</b>\nSize: <code>{file_size_mb} MB</code>\n\nDownloaded via @{bot.username}",
-                parse_mode=ParseMode.HTML
-            )
+        # Added timeout=120 here as well to prevent Telegram API disconnects
+        msg.reply_document(
+            document=file_obj,
+            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\n\nDownloaded via @{bot.username}",
+            parse_mode=ParseMode.HTML,
+            timeout=120
+        )
             
         try:
             status_msg.delete()
@@ -305,13 +268,8 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
             pass
 
     except Exception as e:
-        LOGGER.error(f"[TPB Download Error]: {e!r}")
-        status_msg.edit_text(
-            f"Failed to download torrent file.\n<b>Error:</b> <code>{html.escape(str(e))}</code>", 
-            parse_mode=ParseMode.HTML
-        )
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        LOGGER.error(f"[LibGen Download Error]: {e!r}")
+        status_msg.edit_text(f"Failed to download file.\nDirect link: <a href='{html.escape(dl_url)}'>Download Book</a>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ==========================================
@@ -323,7 +281,7 @@ Download ebooks directly to Telegram.
 
 *Available commands:*
  - /book <title or author>: Searches Open Library / Internet Archive for free books and sends the file directly.
- - /piratebook <title/author>: Searches torrent indexers, downloads the ebook, and uploads it to chat.
+ - /piratebook <title/author>: Searches Library Genesis, bypasses torrents, and uploads the direct file to chat.
 """
 
 __mod_name__ = "Books"
