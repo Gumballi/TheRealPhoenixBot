@@ -21,17 +21,13 @@ LOGGER = logging.getLogger(__name__)
 # ==========================================
 # STATE MANAGEMENT (CACHE)
 # ==========================================
-# Stores search results temporarily so pagination and downloading work.
-# Structure: { "search_id": { "query": str, "type": str, "results": list } }
 SEARCH_CACHE = {}
 
 def clean_cache():
-    """Prevents memory leaks by clearing cache if it gets too large."""
     if len(SEARCH_CACHE) > 500:
         SEARCH_CACHE.clear()
 
 def build_keyboard(search_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
-    """Builds the inline keyboard for book selection and pagination."""
     keyboard = []
     search_data = SEARCH_CACHE.get(search_id)
     if not search_data:
@@ -41,10 +37,8 @@ def build_keyboard(search_id: str, page: int, total_pages: int) -> InlineKeyboar
     end = start + 5
     items = search_data["results"][start:end]
     
-    # Book selection buttons
     for i, item in enumerate(items):
         idx = start + i
-        # Truncate text so it doesn't break Telegram's button length limits
         title_trunc = item['title'][:35] + ("..." if len(item['title']) > 35 else "")
         author_trunc = item['author'][:15]
         
@@ -54,7 +48,6 @@ def build_keyboard(search_id: str, page: int, total_pages: int) -> InlineKeyboar
             
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"b_dl|{search_id}|{idx}")])
         
-    # Pagination row
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton("< Prev", callback_data=f"b_pg|{search_id}|{page-1}"))
@@ -71,29 +64,39 @@ def build_keyboard(search_id: str, page: int, total_pages: int) -> InlineKeyboar
 
 
 # ==========================================
-# PROXY ROUTING NETWORK (FIREWALL BYPASS)
+# PROXY & DIRECT ROUTING NETWORK
 # ==========================================
 class ProxyNetwork:
     @staticmethod
-    def get(target_url: str, stream: bool = False, timeout: int = 30) -> requests.Response:
+    def get(target_url: str, stream: bool = False, timeout: int = 25) -> requests.Response:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        
+        # Try direct connection first
+        try:
+            resp = requests.get(target_url, headers=headers, stream=stream, timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+        except requests.exceptions.RequestException:
+            pass
+
+        # Fallback to working public proxies if direct is blocked/timed out
         encoded_url = urllib.parse.quote(target_url, safe='')
         proxies = [
             f"https://api.allorigins.win/raw?url={encoded_url}",
-            f"https://api.codetabs.com/v1/proxy?quest={encoded_url}",
-            f"https://corsproxy.io/?{encoded_url}"
+            f"https://api.codetabs.com/v1/proxy?quest={encoded_url}"
         ]
         
         last_err = None
         for proxy in proxies:
             try:
-                resp = requests.get(proxy, stream=stream, timeout=timeout)
+                resp = requests.get(proxy, headers=headers, stream=stream, timeout=timeout)
                 resp.raise_for_status()
                 return resp
             except requests.exceptions.RequestException as e:
                 last_err = e
                 continue
                 
-        raise requests.exceptions.RequestException(f"All proxies failed. Last error: {last_err}")
+        raise requests.exceptions.RequestException(f"All connection paths failed. Last error: {last_err}")
 
 
 # ==========================================
@@ -172,7 +175,6 @@ def do_openlib_download(bot: Bot, msg, item: dict):
     cover_url = item["cover"]
     
     try:
-        # Step 1: Find the actual file extension
         ia_meta_url = f"https://archive.org/metadata/{ia_id}"
         ia_resp = requests.get(ia_meta_url, timeout=10)
         ia_resp.raise_for_status()
@@ -232,20 +234,20 @@ def do_openlib_download(bot: Bot, msg, item: dict):
 
 
 # ==========================================
-# LIBRARY GENESIS (PROXY)
+# LIBRARY GENESIS (ACTIVE DOMAINS)
 # ==========================================
 class LibGenFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[List[dict]]:
         req_query = urllib.parse.quote_plus(query)
-        domains = ["libgen.is", "libgen.rs", "libgen.st", "libgen.li"]
+        # Using currently verified working mirrors
+        domains = ["libgen.la", "libgen.bz", "libgen.vg", "libgen.li"]
         
         for domain in domains:
             try:
                 url = f"https://{domain}/search.php?req={req_query}&res=25&view=simple"
                 resp = ProxyNetwork.get(url, timeout=20)
                 
-                # Scrape rows from the HTML table
                 rows = re.findall(r'<tr valign="top"[^>]*>(.*?)</tr>', resp.text, re.DOTALL | re.IGNORECASE)
                 if not rows:
                     continue
@@ -270,8 +272,8 @@ class LibGenFetcher:
                             })
                 if books:
                     return books
-            except requests.exceptions.RequestException as e:
-                LOGGER.warning(f"[LibGen] Proxy search failed on {domain}: {e!r}")
+            except Exception as e:
+                LOGGER.warning(f"[LibGen] Search failed on {domain}: {e!r}")
                 continue
                 
         return None 
@@ -289,7 +291,7 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
     results = LibGenFetcher.search_books(query)
     
     if results is None:
-        status_msg.edit_text("Search failed. Proxy network could not reach Library Genesis.")
+        status_msg.edit_text("Search failed. Could not reach active Library Genesis mirrors.")
         return
     if not results:
         status_msg.edit_text("No ebooks found on Library Genesis for that query.")
@@ -320,8 +322,7 @@ def do_libgen_download(bot: Bot, msg, item: dict):
     ext = item["ext"]
 
     try:
-        # Step 1: Scrape the download link from the gateway
-        msg.edit_text("Fetching direct download link via proxy...")
+        msg.edit_text("Fetching direct download link...")
         gate_url = f"https://library.lol/main/{md5}"
         gate_resp = ProxyNetwork.get(gate_url, timeout=20)
         
@@ -332,11 +333,9 @@ def do_libgen_download(bot: Bot, msg, item: dict):
             
         dl_url = dl_match.group(1)
         
-        # Step 2: Download the file
         msg.edit_text("Downloading file to server...")
         resp = ProxyNetwork.get(dl_url, stream=True, timeout=45)
         
-        # Check size limits
         size = int(resp.headers.get("Content-Length", 0))
         if size > 50 * 1024 * 1024:
             msg.edit_text(
@@ -362,9 +361,9 @@ def do_libgen_download(bot: Bot, msg, item: dict):
         )
         msg.delete()
 
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         LOGGER.error(f"[LibGen DL Error] {e!r}")
-        msg.edit_text("Proxy download timed out. The file might be too large for the free proxy to process.")
+        msg.edit_text("Download timed out or failed.")
 
 
 # ==========================================
@@ -421,8 +420,8 @@ __help__ = """
 Download ebooks directly to Telegram.
 
 *Available commands:*
- - /book <title/author>: Searches Open Library / Internet Archive for free books.
- - /piratebook <title/author>: Searches Library Genesis and uploads the direct file to chat.
+ - /book <title or author>: Searches Open Library / Internet Archive with interactive book selection.
+ - /piratebook <title or author>: Searches Library Genesis with interactive book selection.
 """
 
 __mod_name__ = "Books"
