@@ -24,7 +24,6 @@ CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
 CACHE_MAX_ENTRIES = 500
 
 def clean_cache():
-    """Evict expired entries individually instead of wiping everyone's session at once."""
     now = time.time()
     expired = [sid for sid, data in SEARCH_CACHE.items() if now - data["created"] > CACHE_TTL_SECONDS]
     for sid in expired:
@@ -167,6 +166,8 @@ def do_openlib_download(bot: Bot, msg, item: dict):
 
         dl_url = None
         ext = "txt"
+        
+        # Prioritize epub, fallback to pdf, forcing load-balanced base router to prevent 500 node errors
         for f in files:
             if f.get("name", "").endswith(".epub"):
                 dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
@@ -220,50 +221,56 @@ def do_openlib_download(bot: Bot, msg, item: dict):
     except Exception as e:
         safe_err = str(e).replace("<", "[").replace(">", "]")
         LOGGER.error(f"[OpenLib DL Error] {safe_err}")
-        msg.edit_text("Failed to process download. The file may be unavailable.")
+        msg.edit_text("Failed to process download. The archive node returned an error, try a different edition.")
 
 
 # ==========================================
-# ANNA'S ARCHIVE (SHADOW LIBRARY)
+# ANNA'S ARCHIVE (ACTIVE DOMAINS ROTATION)
 # ==========================================
 class AnnasArchiveFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[List[dict]]:
-        search_url = "https://annas-archive.org/search"
+        # Using working active domains to bypass the dead .org domainHold status
+        domains = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se"]
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         
-        try:
-            resp = requests.get(search_url, params={"q": query}, headers=headers, timeout=15)
-            if resp.status_code != 200:
-                return None
-                
-            books = []
-            seen_md5s = set()
-            
-            for item in re.finditer(r'href="/(md5|slow_download)/([a-fA-F0-9]{32})"[^>]*>(.*?)</a>', resp.text, re.DOTALL):
-                _, md5, raw_title_html = item.groups()
-                if md5 in seen_md5s:
+        for domain in domains:
+            search_url = f"https://{domain}/search"
+            try:
+                resp = requests.get(search_url, params={"q": query}, headers=headers, timeout=15)
+                if resp.status_code != 200:
                     continue
-                seen_md5s.add(md5)
+                    
+                books = []
+                seen_md5s = set()
                 
-                clean_title = re.sub(r'<[^>]+>', '', raw_title_html).strip()
-                if not clean_title or len(clean_title) < 2:
-                    clean_title = query
+                for item in re.finditer(r'href="/(md5|slow_download)/([a-fA-F0-9]{32})"[^>]*>(.*?)</a>', resp.text, re.DOTALL):
+                    _, md5, raw_title_html = item.groups()
+                    if md5 in seen_md5s:
+                        continue
+                    seen_md5s.add(md5)
                     
-                books.append({
-                    "md5": md5,
-                    "title": clean_title[:100],
-                    "author": "Unknown Author",
-                    "ext": "epub"
-                })
-                if len(books) >= 25:
-                    break
-                    
-            return books
-        except Exception as e:
-            safe_err = str(e).replace("<", "[").replace(">", "]")
-            LOGGER.error(f"[AnnasArchive] Search failed: {safe_err}")
-            return None
+                    clean_title = re.sub(r'<[^>]+>', '', raw_title_html).strip()
+                    if not clean_title or len(clean_title) < 2:
+                        clean_title = query
+                        
+                    books.append({
+                        "md5": md5,
+                        "title": clean_title[:100],
+                        "author": "Unknown Author",
+                        "ext": "epub"
+                    })
+                    if len(books) >= 25:
+                        break
+                        
+                if books:
+                    return books
+            except Exception as e:
+                safe_err = str(e).replace("<", "[").replace(">", "]")
+                LOGGER.warning(f"[AnnasArchive] Search failed on {domain}: {safe_err}")
+                continue
+                
+        return None
 
 
 @run_async
@@ -284,7 +291,7 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
     results = AnnasArchiveFetcher.search_books(query)
 
     if results is None:
-        status_msg.edit_text("Search failed. Could not reach archive network.")
+        status_msg.edit_text("Search failed. Could not reach active archive networks.")
         return
     if not results:
         status_msg.edit_text("No ebooks found for that query.")
@@ -317,7 +324,7 @@ def do_annas_download(bot: Bot, msg, item: dict):
 
     try:
         msg.edit_text("Fetching download link from archive...")
-        dl_url = f"https://annas-archive.org/slow_download/{md5}"
+        dl_url = f"https://annas-archive.gl/slow_download/{md5}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
         page_resp = requests.get(dl_url, headers=headers, timeout=20)
@@ -329,7 +336,7 @@ def do_annas_download(bot: Bot, msg, item: dict):
         if file_link_match:
             actual_dl = [g for g in file_link_match.groups() if g and g.startswith('http')][0]
         else:
-            actual_dl = f"https://annas-archive.org/md5/{md5}"
+            actual_dl = f"https://annas-archive.gl/md5/{md5}"
 
         msg.edit_text("Downloading file to server...")
         resp = requests.get(actual_dl, headers=headers, stream=True, timeout=45)
@@ -363,7 +370,7 @@ def do_annas_download(bot: Bot, msg, item: dict):
         safe_err = str(e).replace("<", "[").replace(">", "]")
         LOGGER.error(f"[Annas DL Error] {safe_err}")
         msg.edit_text(
-            f"Direct download stream failed.\n\n<b>Mirror Link:</b> <a href='https://annas-archive.org/md5/{md5}'>Open on Anna's Archive</a>", 
+            f"Direct download stream failed.\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
             parse_mode=ParseMode.HTML, 
             disable_web_page_preview=True
         )
