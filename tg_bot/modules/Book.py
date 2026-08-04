@@ -1,6 +1,5 @@
 import os
 import glob
-import shutil
 import tempfile
 import io
 import re
@@ -150,10 +149,12 @@ TRACKERS = "&tr=" + "&tr=".join([
 class TPBDownloader:
     @staticmethod
     def get_best_magnet(query: str) -> dict:
-        """Searches TPB (cat=601 for Ebooks) and returns top magnet link."""
+        """Searches TPB across all categories and returns top magnet link."""
         url = "https://apibay.org/q.php"
         try:
-            resp = requests.get(url, params={"q": query, "cat": 601}, timeout=10)
+            # Changed cat to 0 to search absolutely everything
+            resp = requests.get(url, params={"q": query, "cat": 0}, timeout=10)
+            
             if resp.status_code == 200:
                 data = resp.json()
                 if data and isinstance(data, list) and data[0].get("id") != "0":
@@ -163,10 +164,13 @@ class TPBDownloader:
                     
                     magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}{TRACKERS}"
                     return {"name": name, "magnet": magnet}
+            else:
+                # This will expose Cloudflare blocks or server outages in your logs
+                LOGGER.error(f"[TPB HTTP Error] Code: {resp.status_code}, Response: {resp.text[:200]}")
+                
         except Exception as e:
             LOGGER.error(f"[TPB Search Error]: {e!r}")
         return {}
-
 
 @run_async
 def piratebook(bot: Bot, update: Update, args: List[str]):
