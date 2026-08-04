@@ -1,5 +1,6 @@
 import os
 import glob
+import shutil
 import tempfile
 import io
 import re
@@ -7,6 +8,7 @@ import html
 import urllib.parse
 import requests
 import logging
+import cloudscraper
 from typing import List
 
 from telegram import Bot, Update, ParseMode
@@ -149,11 +151,12 @@ TRACKERS = "&tr=" + "&tr=".join([
 class TPBDownloader:
     @staticmethod
     def get_best_magnet(query: str) -> dict:
-        """Searches TPB across all categories and returns top magnet link."""
+        """Searches TPB (cat=0 for all) and returns top magnet link."""
         url = "https://apibay.org/q.php"
         try:
-            # Changed cat to 0 to search absolutely everything
-            resp = requests.get(url, params={"q": query, "cat": 0}, timeout=10)
+            # Use cloudscraper to bypass Cloudflare's "Just a moment..." anti-bot pages
+            scraper = cloudscraper.create_scraper()
+            resp = scraper.get(url, params={"q": query, "cat": 0}, timeout=15)
             
             if resp.status_code == 200:
                 data = resp.json()
@@ -165,12 +168,14 @@ class TPBDownloader:
                     magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}{TRACKERS}"
                     return {"name": name, "magnet": magnet}
             else:
-                # This will expose Cloudflare blocks or server outages in your logs
-                LOGGER.error(f"[TPB HTTP Error] Code: {resp.status_code}, Response: {resp.text[:200]}")
+                # Sanitize the < and > tags so Loguru doesn't crash trying to parse HTML as colors
+                safe_text = resp.text[:200].replace("<", "[").replace(">", "]")
+                LOGGER.error(f"[TPB HTTP Error] Code: {resp.status_code}, Response: {safe_text}")
                 
         except Exception as e:
-            LOGGER.error(f"[TPB Search Error]: {e!r}")
+            LOGGER.error(f"[TPB Search Error]: {str(e).replace('<', '[').replace('>', ']')}")
         return {}
+
 
 @run_async
 def piratebook(bot: Bot, update: Update, args: List[str]):
@@ -221,7 +226,7 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
 
         # Telegram limit check (50MB for bots)
         if file_size_mb > 50:
-            status_msg.edit_text(f"File size ({file_size_mb} MB) exceeds Telegram's 50MB bot upload limit.")
+            status_msg.edit_text(f"Warning: File size ({file_size_mb} MB) exceeds Telegram's 50MB bot upload limit.")
             return
 
         status_msg.edit_text("Uploading book to Telegram...")
