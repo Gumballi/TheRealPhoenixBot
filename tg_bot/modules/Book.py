@@ -10,6 +10,7 @@ import urllib.parse
 from typing import List, Optional
 
 import requests
+import cloudscraper
 from telegram import Bot, ParseMode, Update
 from telegram.ext import run_async
 from torrentp import TorrentDownloader
@@ -18,6 +19,16 @@ from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
 LOGGER = logging.getLogger(__name__)
+
+# Create a global scraper configured to perfectly mimic a real desktop browser
+# This bypasses the 403 Forbidden blocks caused by Cloudflare.
+SCRAPER = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
 # ==========================================
 # GUTENDEX (PUBLIC DOMAIN) LOGIC
@@ -33,16 +44,11 @@ class BookFetcher:
 
     @staticmethod
     def search_books(query: str) -> Optional[dict]:
-        """
-        Searches Gutendex API for free public-domain books and direct downloads.
-        Returns None on network/API failure, {} is never returned - caller checks for None
-        vs a dict with no usable download_url.
-        """
         url = "https://gutendex.com/books"
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; PhoenixBookBot/1.0)"}
-
+        
         try:
-            resp = requests.get(url, params={"search": query}, headers=headers, timeout=12)
+            # Using SCRAPER instead of requests
+            resp = SCRAPER.get(url, params={"search": query}, timeout=15)
             resp.raise_for_status()
         except requests.exceptions.Timeout:
             LOGGER.warning(f"[book] Gutendex timed out for '{query}'")
@@ -57,7 +63,6 @@ class BookFetcher:
             LOGGER.warning(f"[book] Gutendex returned non-JSON for '{query}'")
             return None
 
-        # Scan results (not just the first) for one that actually has a downloadable format
         for book in results:
             formats = book.get("formats", {})
             dl_url = None
@@ -76,7 +81,7 @@ class BookFetcher:
                 "cover": formats.get("image/jpeg"),
             }
 
-        return {}  # searched fine, nothing usable found
+        return {}
 
 
 @run_async
@@ -116,7 +121,8 @@ def book(bot: Bot, update: Update, args: List[str]):
     )
 
     try:
-        resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        # Use SCRAPER to download the file so Cloudflare doesn't block the download itself
+        resp = SCRAPER.get(dl_url, timeout=30)
         resp.raise_for_status()
         content = resp.content
 
@@ -137,7 +143,8 @@ def book(bot: Bot, update: Update, args: List[str]):
         thumb_obj = None
         if cover_url:
             try:
-                thumb_resp = requests.get(cover_url, timeout=10)
+                # Use SCRAPER for the thumbnail too
+                thumb_resp = SCRAPER.get(cover_url, timeout=10)
                 thumb_resp.raise_for_status()
                 thumb_obj = io.BytesIO(thumb_resp.content)
                 thumb_obj.name = "cover.jpg"
@@ -185,39 +192,41 @@ TRACKERS = "&tr=" + "&tr=".join([
 class TPBDownloader:
     @staticmethod
     def get_best_magnet(query: str) -> Optional[dict]:
-        """
-        Searches SolidTorrents first, then falls back to Pirate Bay via proxy.
-        Returns None on complete network/API failure, {} if no results found,
-        or a dict with name and magnet link.
-        """
-        # --- Attempt 1: SolidTorrents (No Cloudflare, very reliable) ---
+        # --- Attempt 1: SolidTorrents/BitSearch ---
         try:
-            st_url = "https://solidtorrents.net/api/v1/search"
-            st_resp = requests.get(st_url, params={"q": query, "category": "all"}, timeout=10)
+            # We noticed SolidTorrents redirected to BitSearch in your logs.
+            # Using SCRAPER to bypass the Cloudflare 403 blocks.
+            st_url = "https://bitsearch.to/api/v1/search"
+            st_resp = SCRAPER.get(st_url, params={"q": query, "category": "all"}, timeout=15)
             st_resp.raise_for_status()
             
             st_data = st_resp.json()
-            results = st_data.get("results", [])
+            # Bitsearch JSON structure is slightly different, it uses 'data' instead of 'results'
+            results = st_data.get("data", []) if "data" in st_data else st_data.get("results", [])
+            
             if results:
                 top = results[0]
-                magnet = top.get("magnet")
-                name = top.get("title", "Unknown_Torrent")
+                # BitSearch uses 'magnet' or constructs it from info_hash
+                info_hash = top.get("info_hash")
+                name = top.get("name") or top.get("title", "Unknown_Torrent")
                 
-                if magnet:
+                if info_hash:
+                    magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}{TRACKERS}"
                     return {"name": name, "magnet": magnet}
         except requests.exceptions.Timeout:
-            LOGGER.warning(f"[SolidTorrents] Timed out for '{query}'")
+            LOGGER.warning(f"[BitSearch] Timed out for '{query}'")
         except requests.exceptions.RequestException as e:
-            LOGGER.warning(f"[SolidTorrents] Search failed for '{query}': {e!r}")
+            LOGGER.warning(f"[BitSearch] Search failed for '{query}': {e!r}")
         except ValueError:
-            LOGGER.warning(f"[SolidTorrents] Returned non-JSON for '{query}'")
+            LOGGER.warning(f"[BitSearch] Returned non-JSON for '{query}'")
 
-        # --- Attempt 2: Pirate Bay via Proxy (Fallback) ---
+        # --- Attempt 2: Pirate Bay via CodeTabs Proxy (Fallback) ---
         try:
             target_url = f"https://apibay.org/q.php?q={urllib.parse.quote(query)}&cat=0"
-            proxy_url = f"https://api.allorigins.win/raw?url={urllib.parse.quote(target_url)}"
+            # Swapped AllOrigins for CodeTabs to bypass the 520 Error
+            proxy_url = f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(target_url)}"
             
-            pb_resp = requests.get(proxy_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            pb_resp = SCRAPER.get(proxy_url, timeout=20)
             pb_resp.raise_for_status()
             
             pb_data = pb_resp.json()
@@ -233,7 +242,6 @@ class TPBDownloader:
             LOGGER.warning(f"[TPB Proxy] Timed out for '{query}'")
             return None
         except requests.exceptions.RequestException as e:
-            # Sanitize in case an HTML block makes it into the exception string
             safe_text = str(e).replace("<", "[").replace(">", "]")
             LOGGER.error(f"[TPB Proxy] Search failed: {safe_text}")
             return None
@@ -290,7 +298,6 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
             found_files.extend(glob.glob(os.path.join(temp_dir, '**', ext), recursive=True))
 
         if not found_files:
-            # Fallback: take any file downloaded in the folder
             found_files = [f for f in glob.glob(os.path.join(temp_dir, '**', '*'), recursive=True) if os.path.isfile(f)]
 
         if not found_files:
@@ -300,7 +307,6 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
         target_file = found_files[0]
         file_size_mb = round(os.path.getsize(target_file) / (1024 * 1024), 2)
 
-        # Telegram limit check (50MB for bots)
         if file_size_mb > 50:
             status_msg.edit_text(f"Warning: File size ({file_size_mb} MB) exceeds Telegram's 50MB bot upload limit.")
             return
@@ -326,7 +332,6 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
             parse_mode=ParseMode.HTML
         )
     finally:
-        # Step 5: Clean up temporary files from disk
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
