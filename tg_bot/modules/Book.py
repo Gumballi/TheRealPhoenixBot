@@ -71,7 +71,6 @@ class ProxyNetwork:
     def get(target_url: str, stream: bool = False, timeout: int = 25) -> requests.Response:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
         
-        # Try direct connection first
         try:
             resp = requests.get(target_url, headers=headers, stream=stream, timeout=timeout)
             if resp.status_code == 200:
@@ -79,7 +78,6 @@ class ProxyNetwork:
         except requests.exceptions.RequestException:
             pass
 
-        # Fallback to working public proxies if direct is blocked/timed out
         encoded_url = urllib.parse.quote(target_url, safe='')
         proxies = [
             f"https://api.allorigins.win/raw?url={encoded_url}",
@@ -111,7 +109,8 @@ class OpenLibraryFetcher:
             resp.raise_for_status()
             data = resp.json()
         except requests.exceptions.RequestException as e:
-            LOGGER.error(f"[OpenLibrary] Search failed: {e!r}")
+            safe_err = str(e).replace("<", "[").replace(">", "]")
+            LOGGER.error(f"[OpenLibrary] Search failed: {safe_err}")
             return None
 
         books = []
@@ -229,7 +228,8 @@ def do_openlib_download(bot: Bot, msg, item: dict):
         msg.delete()
 
     except Exception as e:
-        LOGGER.error(f"[OpenLib DL Error] {e!r}")
+        safe_err = str(e).replace("<", "[").replace(">", "]")
+        LOGGER.error(f"[OpenLib DL Error] {safe_err}")
         msg.edit_text("Failed to process download. The file may be unavailable.")
 
 
@@ -240,7 +240,6 @@ class LibGenFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[List[dict]]:
         req_query = urllib.parse.quote_plus(query)
-        # Using currently verified working mirrors
         domains = ["libgen.la", "libgen.bz", "libgen.vg", "libgen.li"]
         
         for domain in domains:
@@ -273,7 +272,8 @@ class LibGenFetcher:
                 if books:
                     return books
             except Exception as e:
-                LOGGER.warning(f"[LibGen] Search failed on {domain}: {e!r}")
+                safe_err = str(e).replace("<", "[").replace(">", "]")
+                LOGGER.warning(f"[LibGen] Search failed on {domain}: {safe_err}")
                 continue
                 
         return None 
@@ -362,7 +362,8 @@ def do_libgen_download(bot: Bot, msg, item: dict):
         msg.delete()
 
     except Exception as e:
-        LOGGER.error(f"[LibGen DL Error] {e!r}")
+        safe_err = str(e).replace("<", "[").replace(">", "]")
+        LOGGER.error(f"[LibGen DL Error] {safe_err}")
         msg.edit_text("Download timed out or failed.")
 
 
