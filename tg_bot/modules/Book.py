@@ -10,7 +10,6 @@ import urllib.parse
 from typing import List, Optional
 
 import requests
-import cloudscraper
 from telegram import Bot, ParseMode, Update
 from telegram.ext import run_async
 from torrentp import TorrentDownloader
@@ -20,68 +19,76 @@ from tg_bot.modules.disable import DisableAbleCommandHandler
 
 LOGGER = logging.getLogger(__name__)
 
-# Create a global scraper configured to perfectly mimic a real desktop browser
-# This bypasses the 403 Forbidden blocks caused by Cloudflare.
-SCRAPER = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
-)
-
 # ==========================================
-# GUTENDEX (PUBLIC DOMAIN) LOGIC
+# OPEN LIBRARY (PUBLIC DOMAIN) LOGIC
 # ==========================================
 
-class BookFetcher:
-    FORMAT_PRIORITY = [
-        ("application/epub+zip", "epub"),
-        ("application/x-mobipocket-ebook", "mobi"),
-        ("application/pdf", "pdf"),
-        ("text/plain; charset=utf-8", "txt"),
-    ]
-
+class OpenLibraryFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[dict]:
-        url = "https://gutendex.com/books"
+        """
+        Searches Open Library for books, then fetches the raw EPUB/PDF 
+        directly from the Internet Archive. Immune to Cloudflare.
+        """
+        search_url = "https://openlibrary.org/search.json"
         
         try:
-            # Using SCRAPER instead of requests
-            resp = SCRAPER.get(url, params={"search": query}, timeout=15)
+            # Step 1: Search Open Library (Standard requests, no Cloudflare block!)
+            resp = requests.get(search_url, params={"q": query, "limit": 15}, timeout=15)
             resp.raise_for_status()
-        except requests.exceptions.Timeout:
-            LOGGER.warning(f"[book] Gutendex timed out for '{query}'")
-            return None
+            data = resp.json()
         except requests.exceptions.RequestException as e:
-            LOGGER.warning(f"[book] Gutendex search failed for '{query}': {e!r}")
+            LOGGER.error(f"[OpenLibrary] Search failed: {e!r}")
             return None
 
-        try:
-            results = resp.json().get("results", [])
-        except ValueError:
-            LOGGER.warning(f"[book] Gutendex returned non-JSON for '{query}'")
-            return None
+        # Step 2: Look for a public domain book with an Internet Archive ID
+        for doc in data.get("docs", []):
+            if doc.get("public_scan_b") and doc.get("ia"):
+                ia_id = doc.get("ia")[0] # Grab the Internet Archive identifier
+                
+                # Step 3: Check Internet Archive for the actual files
+                ia_meta_url = f"https://archive.org/metadata/{ia_id}"
+                try:
+                    ia_resp = requests.get(ia_meta_url, timeout=10)
+                    ia_resp.raise_for_status()
+                    ia_data = ia_resp.json()
+                    
+                    files = ia_data.get("files", [])
+                    dl_url = None
+                    ext = "txt"
 
-        for book in results:
-            formats = book.get("formats", {})
-            dl_url = None
-            for mime, _ext in BookFetcher.FORMAT_PRIORITY:
-                if mime in formats:
-                    dl_url = formats[mime]
-                    break
-            if not dl_url:
-                continue
+                    # Prioritize EPUB, fallback to PDF
+                    for f in files:
+                        if f.get("name", "").endswith(".epub"):
+                            dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
+                            ext = "epub"
+                            break
+                    
+                    if not dl_url:
+                        for f in files:
+                            if f.get("name", "").endswith(".pdf"):
+                                dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
+                                ext = "pdf"
+                                break
 
-            authors = ", ".join(a.get("name", "") for a in book.get("authors", []))
-            return {
-                "title": book.get("title", "Unknown Title"),
-                "author": authors or "Unknown Author",
-                "download_url": dl_url,
-                "cover": formats.get("image/jpeg"),
-            }
+                    # If we found a file, package it up and return it
+                    if dl_url:
+                        authors = ", ".join(doc.get("author_name", ["Unknown Author"]))
+                        cover_i = doc.get("cover_i")
+                        cover_url = f"https://covers.openlibrary.org/b/id/{cover_i}-L.jpg" if cover_i else None
+                        
+                        return {
+                            "title": doc.get("title", "Unknown Title"),
+                            "author": authors,
+                            "download_url": dl_url,
+                            "ext": ext,
+                            "cover": cover_url
+                        }
+                except Exception as e:
+                    LOGGER.warning(f"[InternetArchive] Failed to fetch metadata for {ia_id}: {e!r}")
+                    continue
 
-        return {}
+        return {} # Search worked, but no downloadable files found
 
 
 @run_async
@@ -97,13 +104,13 @@ def book(bot: Bot, update: Update, args: List[str]):
         return
 
     status_msg = msg.reply_text(
-        f"Searching public domain for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
+        f"Searching Open Library for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
     )
 
-    book_info = BookFetcher.search_books(query)
+    book_info = OpenLibraryFetcher.search_books(query)
 
     if book_info is None:
-        status_msg.edit_text("Search failed — Gutendex didn't respond. Try again in a moment.")
+        status_msg.edit_text("Search failed — Open Library didn't respond. Try again in a moment.")
         return
 
     if not book_info.get("download_url"):
@@ -113,29 +120,20 @@ def book(bot: Bot, update: Update, args: List[str]):
     title = book_info["title"]
     author = book_info["author"]
     dl_url = book_info["download_url"]
+    ext = book_info["ext"]
     cover_url = book_info.get("cover")
 
     status_msg.edit_text(
-        f"Found <b>{html.escape(title)}</b> by <i>{html.escape(author)}</i>\nDownloading and sending file to you...",
+        f"Found <b>{html.escape(title)}</b> by <i>{html.escape(author)}</i>\nDownloading from Internet Archive...",
         parse_mode=ParseMode.HTML,
     )
 
     try:
-        # Use SCRAPER to download the file so Cloudflare doesn't block the download itself
-        resp = SCRAPER.get(dl_url, timeout=30)
+        # Download from Internet Archive (No Cloudflare blocking!)
+        resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=45)
         resp.raise_for_status()
-        content = resp.content
-
-        if "epub" in dl_url:
-            ext = "epub"
-        elif "pdf" in dl_url:
-            ext = "pdf"
-        elif "mobi" in dl_url:
-            ext = "mobi"
-        else:
-            ext = "txt"
-
-        file_obj = io.BytesIO(content)
+        
+        file_obj = io.BytesIO(resp.content)
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title).replace(" ", "_")
         file_obj.name = f"{safe_title}.{ext}"
         file_obj.seek(0)
@@ -143,8 +141,7 @@ def book(bot: Bot, update: Update, args: List[str]):
         thumb_obj = None
         if cover_url:
             try:
-                # Use SCRAPER for the thumbnail too
-                thumb_resp = SCRAPER.get(cover_url, timeout=10)
+                thumb_resp = requests.get(cover_url, timeout=10)
                 thumb_resp.raise_for_status()
                 thumb_obj = io.BytesIO(thumb_resp.content)
                 thumb_obj.name = "cover.jpg"
@@ -164,8 +161,8 @@ def book(bot: Bot, update: Update, args: List[str]):
 
         try:
             status_msg.delete()
-        except Exception as del_err:
-            LOGGER.warning(f"[book] Could not delete status message: {del_err!r}")
+        except Exception:
+            pass
 
     except requests.exceptions.RequestException as e:
         LOGGER.error(f"[book] Download error: {e!r}")
@@ -180,7 +177,7 @@ def book(bot: Bot, update: Update, args: List[str]):
 
 
 # ==========================================
-# PIRATE BAY (TORRENT) LOGIC
+# PIRATE BAY (TORRENT) LOGIC (Unchanged)
 # ==========================================
 
 TRACKERS = "&tr=" + "&tr=".join([
@@ -192,41 +189,30 @@ TRACKERS = "&tr=" + "&tr=".join([
 class TPBDownloader:
     @staticmethod
     def get_best_magnet(query: str) -> Optional[dict]:
-        # --- Attempt 1: SolidTorrents/BitSearch ---
         try:
-            # We noticed SolidTorrents redirected to BitSearch in your logs.
-            # Using SCRAPER to bypass the Cloudflare 403 blocks.
             st_url = "https://bitsearch.to/api/v1/search"
-            st_resp = SCRAPER.get(st_url, params={"q": query, "category": "all"}, timeout=15)
+            st_resp = requests.get(st_url, params={"q": query, "category": "all"}, timeout=15)
             st_resp.raise_for_status()
             
             st_data = st_resp.json()
-            # Bitsearch JSON structure is slightly different, it uses 'data' instead of 'results'
             results = st_data.get("data", []) if "data" in st_data else st_data.get("results", [])
             
             if results:
                 top = results[0]
-                # BitSearch uses 'magnet' or constructs it from info_hash
                 info_hash = top.get("info_hash")
                 name = top.get("name") or top.get("title", "Unknown_Torrent")
                 
                 if info_hash:
                     magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}{TRACKERS}"
                     return {"name": name, "magnet": magnet}
-        except requests.exceptions.Timeout:
-            LOGGER.warning(f"[BitSearch] Timed out for '{query}'")
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             LOGGER.warning(f"[BitSearch] Search failed for '{query}': {e!r}")
-        except ValueError:
-            LOGGER.warning(f"[BitSearch] Returned non-JSON for '{query}'")
 
-        # --- Attempt 2: Pirate Bay via CodeTabs Proxy (Fallback) ---
         try:
             target_url = f"https://apibay.org/q.php?q={urllib.parse.quote(query)}&cat=0"
-            # Swapped AllOrigins for CodeTabs to bypass the 520 Error
             proxy_url = f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(target_url)}"
             
-            pb_resp = SCRAPER.get(proxy_url, timeout=20)
+            pb_resp = requests.get(proxy_url, timeout=20)
             pb_resp.raise_for_status()
             
             pb_data = pb_resp.json()
@@ -238,16 +224,9 @@ class TPBDownloader:
                 magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}{TRACKERS}"
                 return {"name": name, "magnet": magnet}
                 
-        except requests.exceptions.Timeout:
-            LOGGER.warning(f"[TPB Proxy] Timed out for '{query}'")
-            return None
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             safe_text = str(e).replace("<", "[").replace(">", "]")
             LOGGER.error(f"[TPB Proxy] Search failed: {safe_text}")
-            return None
-        except ValueError:
-            safe_text = pb_resp.text[:200].replace("<", "[").replace(">", "]")
-            LOGGER.warning(f"[TPB Proxy] Returned non-JSON for '{query}'. Response: {safe_text}")
             return None
             
         return {}
@@ -322,8 +301,8 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
             
         try:
             status_msg.delete()
-        except Exception as del_err:
-            LOGGER.warning(f"[piratebook] Could not delete status message: {del_err!r}")
+        except Exception:
+            pass
 
     except Exception as e:
         LOGGER.error(f"[TPB Download Error]: {e!r}")
@@ -343,7 +322,7 @@ __help__ = """
 Download ebooks directly to Telegram.
 
 *Available commands:*
- - /book <title or author>: Searches the Gutendex API for free public domain books and sends the file directly.
+ - /book <title or author>: Searches Open Library / Internet Archive for free books and sends the file directly.
  - /piratebook <title/author>: Searches torrent indexers, downloads the ebook, and uploads it to chat.
 """
 
