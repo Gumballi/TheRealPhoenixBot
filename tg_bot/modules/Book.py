@@ -1,13 +1,17 @@
 import html
 import io
 import logging
+import math
 import re
+import shutil
+import tempfile
 import urllib.parse
+import uuid
 from typing import List, Optional
 
 import requests
-from telegram import Bot, ParseMode, Update
-from telegram.ext import run_async
+from telegram import Bot, ParseMode, Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import run_async, CallbackQueryHandler
 
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
@@ -15,69 +19,114 @@ from tg_bot.modules.disable import DisableAbleCommandHandler
 LOGGER = logging.getLogger(__name__)
 
 # ==========================================
-# OPEN LIBRARY (PUBLIC DOMAIN) LOGIC
+# STATE MANAGEMENT (CACHE)
 # ==========================================
+# Stores search results temporarily so pagination and downloading work.
+# Structure: { "search_id": { "query": str, "type": str, "results": list } }
+SEARCH_CACHE = {}
 
+def clean_cache():
+    """Prevents memory leaks by clearing cache if it gets too large."""
+    if len(SEARCH_CACHE) > 500:
+        SEARCH_CACHE.clear()
+
+def build_keyboard(search_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Builds the inline keyboard for book selection and pagination."""
+    keyboard = []
+    search_data = SEARCH_CACHE.get(search_id)
+    if not search_data:
+        return InlineKeyboardMarkup([])
+
+    start = page * 5
+    end = start + 5
+    items = search_data["results"][start:end]
+    
+    # Book selection buttons
+    for i, item in enumerate(items):
+        idx = start + i
+        # Truncate text so it doesn't break Telegram's button length limits
+        title_trunc = item['title'][:35] + ("..." if len(item['title']) > 35 else "")
+        author_trunc = item['author'][:15]
+        
+        btn_text = f"{i+1}. {title_trunc} | {author_trunc}"
+        if item.get('ext'):
+            btn_text += f" [{item['ext'].upper()}]"
+            
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"b_dl|{search_id}|{idx}")])
+        
+    # Pagination row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("< Prev", callback_data=f"b_pg|{search_id}|{page-1}"))
+    
+    nav_row.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="ignore"))
+    
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next >", callback_data=f"b_pg|{search_id}|{page+1}"))
+        
+    if nav_row:
+        keyboard.append(nav_row)
+        
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ==========================================
+# PROXY ROUTING NETWORK (FIREWALL BYPASS)
+# ==========================================
+class ProxyNetwork:
+    @staticmethod
+    def get(target_url: str, stream: bool = False, timeout: int = 30) -> requests.Response:
+        encoded_url = urllib.parse.quote(target_url, safe='')
+        proxies = [
+            f"https://api.allorigins.win/raw?url={encoded_url}",
+            f"https://api.codetabs.com/v1/proxy?quest={encoded_url}",
+            f"https://corsproxy.io/?{encoded_url}"
+        ]
+        
+        last_err = None
+        for proxy in proxies:
+            try:
+                resp = requests.get(proxy, stream=stream, timeout=timeout)
+                resp.raise_for_status()
+                return resp
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                continue
+                
+        raise requests.exceptions.RequestException(f"All proxies failed. Last error: {last_err}")
+
+
+# ==========================================
+# OPEN LIBRARY (PUBLIC DOMAIN)
+# ==========================================
 class OpenLibraryFetcher:
     @staticmethod
-    def search_books(query: str) -> Optional[dict]:
-        """Searches Open Library for public domain books via Internet Archive."""
+    def search_books(query: str) -> Optional[List[dict]]:
         search_url = "https://openlibrary.org/search.json"
-        
         try:
-            resp = requests.get(search_url, params={"q": query, "limit": 15}, timeout=15)
+            resp = requests.get(search_url, params={"q": query, "limit": 30}, timeout=15)
             resp.raise_for_status()
             data = resp.json()
         except requests.exceptions.RequestException as e:
             LOGGER.error(f"[OpenLibrary] Search failed: {e!r}")
             return None
 
+        books = []
         for doc in data.get("docs", []):
             if doc.get("public_scan_b") and doc.get("ia"):
                 ia_id = doc.get("ia")[0]
-                ia_meta_url = f"https://archive.org/metadata/{ia_id}"
+                title = doc.get("title", "Unknown Title")
+                authors = ", ".join(doc.get("author_name", ["Unknown Author"]))
+                cover_i = doc.get("cover_i")
+                cover_url = f"https://covers.openlibrary.org/b/id/{cover_i}-L.jpg" if cover_i else None
                 
-                try:
-                    ia_resp = requests.get(ia_meta_url, timeout=10)
-                    ia_resp.raise_for_status()
-                    ia_data = ia_resp.json()
-                    
-                    files = ia_data.get("files", [])
-                    dl_url = None
-                    ext = "txt"
-
-                    # Prioritize EPUB, fallback to PDF
-                    for f in files:
-                        if f.get("name", "").endswith(".epub"):
-                            dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
-                            ext = "epub"
-                            break
-                    
-                    if not dl_url:
-                        for f in files:
-                            if f.get("name", "").endswith(".pdf"):
-                                dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
-                                ext = "pdf"
-                                break
-
-                    if dl_url:
-                        authors = ", ".join(doc.get("author_name", ["Unknown Author"]))
-                        cover_i = doc.get("cover_i")
-                        cover_url = f"https://covers.openlibrary.org/b/id/{cover_i}-L.jpg" if cover_i else None
-                        
-                        return {
-                            "title": doc.get("title", "Unknown Title"),
-                            "author": authors,
-                            "download_url": dl_url,
-                            "ext": ext,
-                            "cover": cover_url
-                        }
-                except Exception as e:
-                    LOGGER.warning(f"[InternetArchive] Failed metadata for {ia_id}: {e!r}")
-                    continue
-
-        return {} 
-
+                books.append({
+                    "ia_id": ia_id,
+                    "title": title,
+                    "author": authors,
+                    "cover": cover_url
+                })
+        return books
 
 @run_async
 def book(bot: Bot, update: Update, args: List[str]):
@@ -85,32 +134,70 @@ def book(bot: Bot, update: Update, args: List[str]):
     query = " ".join(args).strip()
 
     if not query:
-        msg.reply_text(
-            "Please provide a book title or title and author!\n<b>Usage:</b> <code>/book Pride and Prejudice</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        msg.reply_text("Please provide a book title.\n<b>Usage:</b> <code>/book Pride and Prejudice</code>", parse_mode=ParseMode.HTML)
         return
 
-    status_msg = msg.reply_text(f"Searching Open Library for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML)
-    book_info = OpenLibraryFetcher.search_books(query)
+    status_msg = msg.reply_text(f"Searching public domain for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML)
+    results = OpenLibraryFetcher.search_books(query)
 
-    if book_info is None:
-        status_msg.edit_text("Search failed — Open Library didn't respond. Try again in a moment.")
+    if results is None:
+        status_msg.edit_text("Search failed. Open Library didn't respond. Try again later.")
         return
-    if not book_info.get("download_url"):
-        status_msg.edit_text("No downloadable public domain book found for your query.")
+    if not results:
+        status_msg.edit_text("No public domain books found for that query.")
         return
 
-    title = book_info["title"]
-    author = book_info["author"]
-    dl_url = book_info["download_url"]
-    ext = book_info["ext"]
-    cover_url = book_info.get("cover")
+    clean_cache()
+    search_id = uuid.uuid4().hex[:8]
+    SEARCH_CACHE[search_id] = {
+        "query": query,
+        "type": "openlib",
+        "results": results
+    }
 
-    status_msg.edit_text(f"Found <b>{html.escape(title)}</b> by <i>{html.escape(author)}</i>\nDownloading from Internet Archive...", parse_mode=ParseMode.HTML)
+    total_pages = math.ceil(len(results) / 5)
+    kb = build_keyboard(search_id, 0, total_pages)
+    
+    status_msg.edit_text(
+        f"Results for <b>{html.escape(query)}</b>:\nSelect a book to download:",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
 
+
+def do_openlib_download(bot: Bot, msg, item: dict):
+    ia_id = item["ia_id"]
+    title = item["title"]
+    author = item["author"]
+    cover_url = item["cover"]
+    
     try:
-        resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=45)
+        # Step 1: Find the actual file extension
+        ia_meta_url = f"https://archive.org/metadata/{ia_id}"
+        ia_resp = requests.get(ia_meta_url, timeout=10)
+        ia_resp.raise_for_status()
+        files = ia_resp.json().get("files", [])
+        
+        dl_url = None
+        ext = "txt"
+        for f in files:
+            if f.get("name", "").endswith(".epub"):
+                dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
+                ext = "epub"
+                break
+        if not dl_url:
+            for f in files:
+                if f.get("name", "").endswith(".pdf"):
+                    dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
+                    ext = "pdf"
+                    break
+                    
+        if not dl_url:
+            msg.edit_text("Could not find a downloadable EPUB or PDF for this specific edition.")
+            return
+            
+        msg.edit_text("Downloading from Internet Archive...")
+        resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
         resp.raise_for_status()
         
         file_obj = io.BytesIO(resp.content)
@@ -129,7 +216,7 @@ def book(bot: Bot, update: Update, args: List[str]):
             except Exception:
                 pass
 
-        # Added timeout=120 to fix the TimedOut() crash during large Telegram uploads
+        msg.edit_text("Uploading file to Telegram...")
         msg.reply_document(
             document=file_obj,
             thumb=thumb_obj,
@@ -137,76 +224,57 @@ def book(bot: Bot, update: Update, args: List[str]):
             parse_mode=ParseMode.HTML,
             timeout=120 
         )
-        try:
-            status_msg.delete()
-        except Exception:
-            pass
+        msg.delete()
 
-    except requests.exceptions.RequestException:
-        status_msg.edit_text(f"Failed to download file. Direct link: <a href='{html.escape(dl_url)}'>Download Book</a>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
-        LOGGER.error(f"[book] Unexpected error sending document: {e!r}")
-        status_msg.edit_text("Something went wrong sending the file. Check logs.")
+        LOGGER.error(f"[OpenLib DL Error] {e!r}")
+        msg.edit_text("Failed to process download. The file may be unavailable.")
 
 
 # ==========================================
-# LIBRARY GENESIS (DIRECT DOWNLOAD) LOGIC
+# LIBRARY GENESIS (PROXY)
 # ==========================================
-
 class LibGenFetcher:
     @staticmethod
-    def search_books(query: str) -> Optional[dict]:
-        """Scrapes LibGen and Library.lol for direct file downloads. No Torrents."""
-        domains = ["libgen.is", "libgen.rs", "libgen.st"]
+    def search_books(query: str) -> Optional[List[dict]]:
+        req_query = urllib.parse.quote_plus(query)
+        domains = ["libgen.is", "libgen.rs", "libgen.st", "libgen.li"]
         
         for domain in domains:
             try:
-                url = f"https://{domain}/search.php"
-                resp = requests.get(url, params={"req": query, "res": 25, "view": "simple"}, timeout=15)
-                resp.raise_for_status()
+                url = f"https://{domain}/search.php?req={req_query}&res=25&view=simple"
+                resp = ProxyNetwork.get(url, timeout=20)
                 
-                # Extract the MD5 hash of the first result
-                match = re.search(r'\?md5=([A-Fa-f0-9]{32})', resp.text, re.IGNORECASE)
-                if not match:
-                    continue # Try next domain if empty
-                
-                md5 = match.group(1)
-                
-                # Use the MD5 to hit the direct download gateway
-                gate_url = f"https://library.lol/main/{md5}"
-                gate_resp = requests.get(gate_url, timeout=15)
-                gate_resp.raise_for_status()
-                
-                # Scrape the direct 'GET' link
-                dl_match = re.search(r'href="([^"]+)">GET</a>', gate_resp.text)
-                if not dl_match:
-                    return {}
+                # Scrape rows from the HTML table
+                rows = re.findall(r'<tr valign="top"[^>]*>(.*?)</tr>', resp.text, re.DOTALL | re.IGNORECASE)
+                if not rows:
+                    continue
                     
-                dl_url = dl_match.group(1)
-                
-                # Scrape Title, Author, and Extension from the gateway page
-                title_match = re.search(r'<h1>(.*?)</h1>', gate_resp.text, re.IGNORECASE | re.DOTALL)
-                title = title_match.group(1).strip() if title_match else query
-                
-                author_match = re.search(r'Author\(s\):\s*(.*?)(?:<br|</div>)', gate_resp.text, re.IGNORECASE)
-                author = author_match.group(1).strip() if author_match else "Unknown Author"
-                
-                ext_match = re.search(r'Extension:\s*([a-zA-Z0-9]+)', gate_resp.text, re.IGNORECASE)
-                ext = ext_match.group(1).lower() if ext_match else "epub"
-                ext = re.sub(r'[^a-z0-9]', '', ext) # Sanitize extension
-                
-                return {
-                    "title": title,
-                    "author": author,
-                    "download_url": dl_url,
-                    "ext": ext
-                }
+                books = []
+                for row in rows:
+                    cols = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+                    if len(cols) >= 9:
+                        author = re.sub(r'<[^>]+>', '', cols[1]).strip()
+                        title_html = cols[2]
+                        title_match = re.search(r'md5=([a-fA-F0-9]{32})"[^>]*>(.*?)</a>', title_html, re.IGNORECASE)
+                        ext = re.sub(r'<[^>]+>', '', cols[8]).strip().lower()
+                        
+                        if title_match:
+                            md5 = title_match.group(1)
+                            title = re.sub(r'<[^>]+>', '', title_match.group(2)).strip()
+                            books.append({
+                                "md5": md5,
+                                "title": title,
+                                "author": author,
+                                "ext": ext
+                            })
+                if books:
+                    return books
             except requests.exceptions.RequestException as e:
-                LOGGER.warning(f"[LibGen] Failed on {domain}: {e!r}")
+                LOGGER.warning(f"[LibGen] Proxy search failed on {domain}: {e!r}")
                 continue
                 
-        return None # All domains completely failed
-
+        return None 
 
 @run_async
 def piratebook(bot: Bot, update: Update, args: List[str]):
@@ -214,62 +282,135 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
     query = " ".join(args).strip()
 
     if not query:
-        msg.reply_text("Please specify a book title!\n<b>Usage:</b> <code>/piratebook 1984 George Orwell</code>", parse_mode=ParseMode.HTML)
+        msg.reply_text("Please specify a book title.\n<b>Usage:</b> <code>/piratebook 1984 George Orwell</code>", parse_mode=ParseMode.HTML)
         return
 
     status_msg = msg.reply_text(f"Searching Library Genesis for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML)
-
-    book_info = LibGenFetcher.search_books(query)
+    results = LibGenFetcher.search_books(query)
     
-    if book_info is None:
-        status_msg.edit_text("Search failed — LibGen is currently unresponsive.")
+    if results is None:
+        status_msg.edit_text("Search failed. Proxy network could not reach Library Genesis.")
         return
-    if not book_info.get("download_url"):
+    if not results:
         status_msg.edit_text("No ebooks found on Library Genesis for that query.")
         return
 
-    title = book_info["title"]
-    author = book_info["author"]
-    dl_url = book_info["download_url"]
-    ext = book_info["ext"]
+    clean_cache()
+    search_id = uuid.uuid4().hex[:8]
+    SEARCH_CACHE[search_id] = {
+        "query": query,
+        "type": "libgen",
+        "results": results
+    }
 
-    status_msg.edit_text(f"Found <b>{html.escape(title)}</b> by <i>{html.escape(author)}</i>\nDownloading file directly to server...", parse_mode=ParseMode.HTML)
+    total_pages = math.ceil(len(results) / 5)
+    kb = build_keyboard(search_id, 0, total_pages)
+    
+    status_msg.edit_text(
+        f"Results for <b>{html.escape(query)}</b>:\nSelect a book to download:",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
+
+
+def do_libgen_download(bot: Bot, msg, item: dict):
+    md5 = item["md5"]
+    title = item["title"]
+    author = item["author"]
+    ext = item["ext"]
 
     try:
-        # Stream the download so we can check the file size before loading it all into memory
-        resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=20)
-        resp.raise_for_status()
+        # Step 1: Scrape the download link from the gateway
+        msg.edit_text("Fetching direct download link via proxy...")
+        gate_url = f"https://library.lol/main/{md5}"
+        gate_resp = ProxyNetwork.get(gate_url, timeout=20)
         
+        dl_match = re.search(r'href="([^"]+)">GET</a>', gate_resp.text)
+        if not dl_match:
+            msg.edit_text("Failed to locate the download gateway link.")
+            return
+            
+        dl_url = dl_match.group(1)
+        
+        # Step 2: Download the file
+        msg.edit_text("Downloading file to server...")
+        resp = ProxyNetwork.get(dl_url, stream=True, timeout=45)
+        
+        # Check size limits
         size = int(resp.headers.get("Content-Length", 0))
         if size > 50 * 1024 * 1024:
-            status_msg.edit_text(f"⚠️ File size ({round(size / 1024 / 1024, 2)} MB) exceeds Telegram's 50MB bot limit.\n\nDirect link: <a href='{html.escape(dl_url)}'>Download Here</a>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            msg.edit_text(
+                f"File size ({round(size / 1024 / 1024, 2)} MB) exceeds Telegram's 50MB limit.\n\n"
+                f"<b>Direct Download Link:</b> <a href='{html.escape(dl_url)}'>Click Here</a>", 
+                parse_mode=ParseMode.HTML, 
+                disable_web_page_preview=True
+            )
             return
 
-        # Read into memory
         content = resp.content
         file_obj = io.BytesIO(content)
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title).replace(" ", "_")
         file_obj.name = f"{safe_title}.{ext}"
         file_obj.seek(0)
 
-        status_msg.edit_text("Uploading book to Telegram...")
-
-        # Added timeout=120 here as well to prevent Telegram API disconnects
+        msg.edit_text("Uploading book to Telegram...")
         msg.reply_document(
             document=file_obj,
             caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\n\nDownloaded via @{bot.username}",
             parse_mode=ParseMode.HTML,
             timeout=120
         )
-            
-        try:
-            status_msg.delete()
-        except Exception:
-            pass
+        msg.delete()
 
-    except Exception as e:
-        LOGGER.error(f"[LibGen Download Error]: {e!r}")
-        status_msg.edit_text(f"Failed to download file.\nDirect link: <a href='{html.escape(dl_url)}'>Download Book</a>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except requests.exceptions.RequestException as e:
+        LOGGER.error(f"[LibGen DL Error] {e!r}")
+        msg.edit_text("Proxy download timed out. The file might be too large for the free proxy to process.")
+
+
+# ==========================================
+# CALLBACK HANDLER
+# ==========================================
+@run_async
+def book_callback(bot: Bot, update: Update):
+    query = update.callback_query
+    data = query.data
+    
+    if data == "ignore":
+        query.answer()
+        return
+        
+    parts = data.split("|")
+    if len(parts) != 3:
+        return
+        
+    action, search_id, param = parts
+    
+    if search_id not in SEARCH_CACHE:
+        query.answer("This search has expired. Please run the command again.", show_alert=True)
+        return
+        
+    search_data = SEARCH_CACHE[search_id]
+    
+    if action == "b_pg":
+        page = int(param)
+        total_pages = math.ceil(len(search_data["results"]) / 5)
+        kb = build_keyboard(search_id, page, total_pages)
+        
+        query.edit_message_text(
+            f"Results for <b>{html.escape(search_data['query'])}</b>:\nSelect a book to download:",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
+        )
+        
+    elif action == "b_dl":
+        idx = int(param)
+        item = search_data["results"][idx]
+        query.edit_message_text(f"Preparing to download: <b>{html.escape(item['title'])}</b>...", parse_mode=ParseMode.HTML)
+        
+        if search_data["type"] == "openlib":
+            do_openlib_download(bot, query.message, item)
+        elif search_data["type"] == "libgen":
+            do_libgen_download(bot, query.message, item)
 
 
 # ==========================================
@@ -280,14 +421,16 @@ __help__ = """
 Download ebooks directly to Telegram.
 
 *Available commands:*
- - /book <title or author>: Searches Open Library / Internet Archive for free books and sends the file directly.
- - /piratebook <title/author>: Searches Library Genesis, bypasses torrents, and uploads the direct file to chat.
+ - /book <title/author>: Searches Open Library / Internet Archive for free books.
+ - /piratebook <title/author>: Searches Library Genesis and uploads the direct file to chat.
 """
 
 __mod_name__ = "Books"
 
 BOOK_HANDLER = DisableAbleCommandHandler("book", book, pass_args=True)
 PIRATEBOOK_HANDLER = DisableAbleCommandHandler("piratebook", piratebook, pass_args=True)
+BOOK_BTN_HANDLER = CallbackQueryHandler(book_callback, pattern=r'^b_(pg|dl)\|')
 
 dispatcher.add_handler(BOOK_HANDLER)
 dispatcher.add_handler(PIRATEBOOK_HANDLER)
+dispatcher.add_handler(BOOK_BTN_HANDLER)
