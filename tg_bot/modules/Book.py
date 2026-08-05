@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
 from telegram.ext import CallbackQueryHandler, run_async
 
@@ -24,7 +25,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 LOGGER = logging.getLogger(__name__)
+
+# SILENCE NOISY DNS/SSL WARNINGS FOR DEAD/EXPIRED MIRRORS
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Constants & Configuration ---
 LIBGEN_DOMAINS = ["libgen.is", "libgen.rs", "libgen.st"]
@@ -198,14 +202,18 @@ def bookinfo_callback(bot, update: Update):
         
     elif action == "dl":
         book = results[idx]
-        search_query = f"{book['title']} {book['author']}"
+        
+        # LibGen is extremely strict. Subtitles break searches.
+        # We strip everything after a colon or parenthesis to get the core title.
+        clean_title = book['title'].split(':')[0].split('(')[0].strip()
+        
         query.answer("Searching LibGen...")
-        status_msg = query.message.edit_text(f"🔍 Searching LibGen for '{book['title']}'...")
+        status_msg = query.message.edit_text(f"🔍 Searching LibGen for '{clean_title}'...")
         
         try:
-            libgen_books = search_libgen(search_query)
+            libgen_books = search_libgen(clean_title)
             if not libgen_books:
-                status_msg.edit_text(f"😕 '{book['title']}' could not be found on LibGen.")
+                status_msg.edit_text(f"😕 '{clean_title}' could not be found on LibGen.")
                 return
                 
             ABOOK_RESULTS[status_msg.message_id] = libgen_books
@@ -351,7 +359,7 @@ def openlib_callback(bot, update: Update):
             resp = session.get(dl_url, stream=True, timeout=45)
             
             file_obj = io.BytesIO(resp.content)
-            safe_title = re.sub(r'[\\/*?:<>|]', '', item['title']).replace(' ', '_')
+            safe_title = re.sub(r'[\\/*?:"<>|]', '', item['title']).replace(' ', '_')
             file_obj.name = f"{safe_title}.{ext}"
             file_obj.seek(0)
             
@@ -371,20 +379,28 @@ def openlib_callback(bot, update: Update):
 # 3. LIBGEN ENGINE (/abook)
 # ==========================================
 def search_libgen(query: str, format_filter: Optional[str] = None) -> List[Book]:
-    """Search Library Genesis natively using their JSON API."""
+    """Search Library Genesis using verify=False to bypass expired certificates."""
     for domain in LIBGEN_DOMAINS:
         try:
-            search_url = f"http://{domain}/search.php"
-            resp = session.get(search_url, params={"req": query, "res": 25}, timeout=15)
+            search_url = f"https://{domain}/search.php"
+            # verify=False prevents crashes when LibGen forgets to renew their SSL cert
+            resp = session.get(search_url, params={"req": query, "res": 25}, timeout=15, verify=False)
+            
             if resp.status_code != 200:
                 continue
                 
-            ids = re.findall(r'name="id\[\]" value="(\d+)"', resp.text)
-            if not ids:
+            # If Cloudflare intercepts, skip domain
+            if "cloudflare" in resp.text.lower() or "just a moment" in resp.text.lower():
                 continue
                 
-            json_url = f"http://{domain}/json.php"
-            meta_resp = session.get(json_url, params={"ids": ",".join(ids[:20]), "c": "id,title,author,year,md5,extension"}, timeout=15)
+            ids = re.findall(r'name="id\[\]" value="(\d+)"', resp.text)
+            
+            # THE LOGICAL FIX: Connection worked, Cloudflare passed, but no IDs found = 0 results
+            if not ids:
+                return []
+                
+            json_url = f"https://{domain}/json.php"
+            meta_resp = session.get(json_url, params={"ids": ",".join(ids[:20]), "c": "id,title,author,year,md5,extension"}, timeout=15, verify=False)
             
             if meta_resp.status_code == 200:
                 data = meta_resp.json()
@@ -412,9 +428,9 @@ def search_libgen(query: str, format_filter: Optional[str] = None) -> List[Book]
     raise Exception("Could not reach active library networks. They may be temporarily down.")
 
 def get_libgen_download_url(md5: str) -> Optional[str]:
-    """Scrapes the direct GET link from library.lol."""
+    """Scrapes the direct GET link from library.lol with SSL checks bypassed."""
     try:
-        resp = session.get(f"http://library.lol/main/{md5}", timeout=15)
+        resp = session.get(f"https://library.lol/main/{md5}", timeout=15, verify=False)
         if resp.status_code == 200:
             match = re.search(r'href="(https?://[^"]+)"[^>]*>GET</a>', resp.text, re.IGNORECASE)
             if match:
@@ -445,7 +461,7 @@ def abook_command(bot, update: Update, args):
         books = search_libgen(query, format_filter)
         
         if not books:
-            status_msg.edit_text("😕 No results found. Try different keywords.")
+            status_msg.edit_text("😕 No results found. Try different keywords or check spelling.")
             return
         
         ABOOK_RESULTS[status_msg.message_id] = books
@@ -570,7 +586,8 @@ def abook_dl_callback(bot, update: Update):
         status_msg.edit_text(f"⬇️ Downloading file to server...")
         
         try:
-            resp = session.get(download_url, stream=True, timeout=60)
+            # verify=False prevents download stream crashes on expired library.lol certs
+            resp = session.get(download_url, stream=True, timeout=60, verify=False)
             resp.raise_for_status()
             
             content_length = int(resp.headers.get('content-length', 0))
@@ -648,4 +665,4 @@ __help__ = """
 
 __mod_name__ = "Books"
 
-LOGGER.info("Books module loaded successfully!")
+LOGGER.info("Books module loaded successfully (LibGen + BookInfo Engine Active)!")
