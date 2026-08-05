@@ -31,6 +31,8 @@ logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Constants & Configuration ---
+GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY")
+
 LIBGEN_DOMAINS = ["libgen.is", "libgen.rs", "libgen.st"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
@@ -91,7 +93,11 @@ class Book:
 def search_google_books(query: str) -> Optional[List[dict]]:
     """Semantic search for book recommendations and metadata."""
     try:
-        resp = session.get("https://www.googleapis.com/books/v1/volumes", params={"q": query, "maxResults": 10}, timeout=15)
+        params = {"q": query, "maxResults": 10}
+        if GOOGLE_BOOKS_API_KEY:
+            params["key"] = GOOGLE_BOOKS_API_KEY
+            
+        resp = session.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         
