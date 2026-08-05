@@ -555,7 +555,7 @@ def night_api_nsfw(bot: Bot, update: Update, args):
             api_status = data.get("status")
             if api_status == 400:
                 error_msg = data.get("content", "Invalid request")
-                msg.reply_text(f API Error: {error_msg}")
+                msg.reply_text(f"API Error:{error_msg}")
                 return
             
             # Safely extract the image URL
