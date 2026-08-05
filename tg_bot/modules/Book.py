@@ -224,33 +224,79 @@ def do_openlib_download(bot: Bot, msg, item: dict):
 
 
 # ==========================================
-# PIRATEBOOK (OPEN LIBRARY METADATA + ANNA'S ARCHIVE BRIDGE)
+# ANNA'S ARCHIVE (ROBUST BLOCK PARSER - /piratebook)
 # ==========================================
 class PirateBookFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[List[dict]]:
-        # Searches Open Library unrestricted database to guarantee 100% pristine JSON titles and authors
-        search_url = "https://openlibrary.org/search.json"
-        try:
-            resp = requests.get(search_url, params={"q": query, "limit": 30}, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            safe_err = str(e).replace("<", "[").replace(">", "]")
-            LOGGER.error(f"[PirateBook] Search failed: {safe_err}")
-            return None
+        domains = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se"]
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        
+        for domain in domains:
+            search_url = f"https://{domain}/search"
+            try:
+                resp = requests.get(search_url, params={"q": query}, headers=headers, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                    
+                books = []
+                seen_md5s = set()
+                
+                for match in re.finditer(r'href="/(?:md5|slow_download)/([a-fA-F0-9]{32})"', resp.text):
+                    md5 = match.group(1)
+                    if md5 in seen_md5s:
+                        continue
+                    seen_md5s.add(md5)
+                    
+                    start = max(0, match.start() - 300)
+                    end = min(len(resp.text), match.end() + 1000)
+                    block = resp.text[start:end]
+                    
+                    title = "Unknown Title"
+                    title_match = re.search(r'href="/(?:md5|slow_download)/[a-fA-F0-9]{32}"[^>]*>(.*?)</a>', block, re.DOTALL)
+                    if title_match:
+                        raw_t = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                        if raw_t and len(raw_t) > 1 and raw_t.lower() not in ["download", "slow download", "fast download"]:
+                            title = raw_t
+                            
+                    author = "Unknown Author"
+                    author_match = re.search(r'<div[^>]*class="[^"]*text-gray-[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+                    if not author_match:
+                        author_match = re.search(r'<div[^>]*class="[^"]*italic[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+                        
+                    if author_match:
+                        raw_a = re.sub(r'<[^>]+>', '', author_match.group(1)).strip()
+                        if raw_a and len(raw_a) < 80 and not any(unit in raw_a.upper() for unit in ["MB", "GB", "PDF", "EPUB", "MOBI"]):
+                            author = raw_a
 
-        books = []
-        for doc in data.get("docs", []):
-            title = doc.get("title")
-            authors = ", ".join(doc.get("author_name", ["Unknown Author"]))
-            if title:
-                books.append({
-                    "title": title,
-                    "author": authors,
-                    "ext": "epub"
-                })
-        return books
+                    ext = "epub"
+                    block_lower = block.lower()
+                    if "pdf" in block_lower:
+                        ext = "pdf"
+                    elif "mobi" in block_lower:
+                        ext = "mobi"
+                    elif "azw3" in block_lower:
+                        ext = "azw3"
+                    elif "djvu" in block_lower:
+                        ext = "djvu"
+
+                    books.append({
+                        "md5": md5,
+                        "title": title[:100],
+                        "author": author[:80],
+                        "ext": ext
+                    })
+                    if len(books) >= 25:
+                        break
+                        
+                if books:
+                    return books
+            except Exception as e:
+                safe_err = str(e).replace("<", "[").replace(">", "]")
+                LOGGER.warning(f"[PirateBook] Search failed on {domain}: {safe_err}")
+                continue
+                
+        return None
 
 
 @run_async
@@ -266,15 +312,15 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
         return
 
     status_msg = msg.reply_text(
-        f"Searching catalog for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
+        f"Searching archives for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
     )
     results = PirateBookFetcher.search_books(query)
 
     if results is None:
-        status_msg.edit_text("Search failed. Catalog didn't respond. Try again later.")
+        status_msg.edit_text("Search failed. Could not reach active archive networks.")
         return
     if not results:
-        status_msg.edit_text("No books found for that query.")
+        status_msg.edit_text("No ebooks found for that query.")
         return
 
     clean_cache()
@@ -297,33 +343,16 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
 
 
 def do_pirate_download(bot: Bot, msg, item: dict):
+    md5 = item["md5"]
     title = item["title"]
     author = item["author"]
-    search_query = f"{title} {author}"
+    ext = item["ext"]
 
     try:
-        msg.edit_text("Locating file across archive mirrors...")
-        domains = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se"]
+        msg.edit_text("Fetching download link from archive...")
+        dl_url = f"https://annas-archive.gl/slow_download/{md5}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         
-        md5 = None
-        for domain in domains:
-            try:
-                search_url = f"https://{domain}/search"
-                resp = requests.get(search_url, params={"q": search_query}, headers=headers, timeout=12)
-                if resp.status_code == 200:
-                    match = re.search(r'href="/(?:md5|slow_download)/([a-fA-F0-9]{32})"', resp.text)
-                    if match:
-                        md5 = match.group(1)
-                        break
-            except Exception:
-                continue
-
-        if not md5:
-            msg.edit_text("Could not find a downloadable file hash for this book.")
-            return
-
-        dl_url = f"https://annas-archive.gl/slow_download/{md5}"
         page_resp = None
         for attempt in range(3):
             page_resp = requests.get(dl_url, headers=headers, timeout=20)
@@ -336,26 +365,27 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         if page_resp is None or "Flood control exceeded" in page_resp.text:
             raise Exception("Flood control exceeded. Please try again in a few moments.")
         
-        # Dynamically detect real extension from Anna's Archive download page link
-        ext = "epub" # default fallback
-        file_link_match = re.search(r'href="(https?://[^"]+)"[^>]*>Download pilihan|href="(https?://[^"]+\.(epub|pdf|mobi|azw3|djvu)[^"]*)"', page_resp.text, re.IGNORECASE)
-        if not file_link_match:
-            file_link_match = re.search(r'href="(https?://(gen\.lib\.rus\.ec|library\.lol|dl\.booksdl\.org|cloudflare-ipfs\.com)[^"]+)"', page_resp.text)
-            
-        if file_link_match:
-            actual_dl = [g for g in file_link_match.groups() if g and g.startswith('http')][0]
-            # Sniff extension from the target URL string if present
-            for possible_ext in ["pdf", "epub", "mobi", "azw3", "djvu"]:
-                if possible_ext in actual_dl.lower():
-                    ext = possible_ext
-                    break
-        else:
+        # Safe domain-filtering link extraction to prevent disallowed character URL errors
+        all_links = re.findall(r'href="(https?://[^"]+)"', page_resp.text)
+        actual_dl = None
+        for link in all_links:
+            if any(partner in link.lower() for partner in ['library.lol', 'libgen', 'ipfs', 'cloudflare', 'booksdl', 'b-ok']):
+                actual_dl = link
+                break
+                
+        if not actual_dl:
             actual_dl = f"https://annas-archive.gl/md5/{md5}"
 
-        msg.edit_text(f"Downloading [{ext.upper()}] file to server...")
+        msg.edit_text("Downloading file to server...")
         resp = requests.get(actual_dl, headers=headers, stream=True, timeout=45)
         
-        size = int(resp.headers.get("Content-Length", 0))
+        content = resp.content
+        
+        # Content Guardrail: Verify the downloaded bytes are an actual file, not an HTML error page or CAPTCHA
+        if content.startswith(b'<!DOCTYPE') or content.startswith(b'<html') or b'captcha' in content.lower():
+            raise Exception("Mirror served an error page or CAPTCHA instead of the book.")
+
+        size = len(content)
         if size > 50 * 1024 * 1024:
             msg.edit_text(
                 f"File size exceeds Telegram's 50MB limit.\n\n"
@@ -365,7 +395,6 @@ def do_pirate_download(bot: Bot, msg, item: dict):
             )
             return
 
-        content = resp.content
         file_obj = io.BytesIO(content)
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title).replace(" ", "_")
         file_obj.name = f"{safe_title}.{ext}"
@@ -374,7 +403,7 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         msg.edit_text("Uploading book to Telegram...")
         msg.reply_document(
             document=file_obj,
-            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\nFormat: <code>{ext.upper()}</code>\n\nDownloaded via @{bot.username}",
+            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\n\nDownloaded via @{bot.username}",
             parse_mode=ParseMode.HTML,
             timeout=120
         )
@@ -383,7 +412,12 @@ def do_pirate_download(bot: Bot, msg, item: dict):
     except Exception as e:
         safe_err = str(e).replace("<", "[").replace(">", "]")
         LOGGER.error(f"[Pirate DL Error] {safe_err}")
-        msg.edit_text("Download stream failed. The archive mirror may be experiencing high traffic.")
+        msg.edit_text(
+            f"Direct download stream failed or mirror blocked the request.\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
+            parse_mode=ParseMode.HTML, 
+            disable_web_page_preview=True
+        )
+
 
 # ==========================================
 # CALLBACK HANDLER
@@ -451,7 +485,7 @@ Download ebooks directly to Telegram.
 
 *Available commands:*
  - /book <title or author>: Searches Open Library public domain scans with interactive selection.
- - /piratebook <title or author>: Searches general catalog with interactive selection and archive downloads.
+ - /piratebook <title or author>: Searches Anna's Archive with robust HTML block parsing and content verification.
 """
 
 __mod_name__ = "Books"
