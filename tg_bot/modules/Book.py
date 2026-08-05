@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import math
+import html
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 
@@ -22,12 +23,14 @@ from tg_bot.modules.disable import DisableAbleCommandHandler
 LOGGER = logging.getLogger(__name__)
 
 # --- Constants & Configuration ---
-ANNAS_DOMAINS = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se", "annas-archive.org"]
+# Updated list of currently active Anna's Archive domains
+ANNAS_DOMAINS = ["annas-archive.gs", "annas-archive.li", "annas-archive.se", "annas-archive.org", "annas-archive.gl"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
+# Reduced retries to 1. If a domain has a DNS error, we want it to fail fast and move to the next.
 RETRY_STRATEGY = Retry(
-    total=5,
-    backoff_factor=1,
+    total=1,
+    backoff_factor=0.5,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
     raise_on_status=False
@@ -54,7 +57,7 @@ def cleanup_caches():
 
 
 # ==========================================
-# DATA CLASSES (From User's Provided Code)
+# DATA CLASSES
 # ==========================================
 @dataclass
 class BookFile:
@@ -70,7 +73,7 @@ class BookFile:
     
     @property
     def is_valid(self) -> bool:
-        return True  # Validated dynamically during download to handle unknown sizes
+        return True
 
 @dataclass
 class Book:
@@ -78,6 +81,7 @@ class Book:
     title: str
     author: str
     year: str
+    domain: str = ""  # Remembers the working domain to prevent DNS errors on download
     publisher: str = ""
     language: str = ""
     pages: int = 0
@@ -267,7 +271,7 @@ def openlib_callback(bot, update: Update):
 # 2. ANNA'S ARCHIVE ENGINE (/abook)
 # ==========================================
 def search_annas_archive(query: str, format_filter: Optional[str] = None) -> List[Book]:
-    """Search Anna's Archive with HTML block parsing."""
+    """Search Anna's Archive with highly robust HTML block parsing."""
     params = {"q": query}
     if format_filter:
         params["ext"] = format_filter.lower()
@@ -276,7 +280,7 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
     
     for domain in ANNAS_DOMAINS:
         try:
-            resp = session.get(f"https://{domain}/search", params=params, headers=headers, timeout=15)
+            resp = session.get(f"https://{domain}/search", params=params, headers=headers, timeout=12)
             if resp.status_code == 200:
                 books = []
                 seen_md5s = set()
@@ -287,25 +291,34 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
                         continue
                     seen_md5s.add(md5)
                     
-                    start = max(0, match.start() - 300)
+                    start = max(0, match.start() - 50)
                     end = min(len(resp.text), match.end() + 1000)
                     block = resp.text[start:end]
                     
+                    # --- Robust Title/Author Extraction ---
                     title = "Unknown Title"
-                    title_match = re.search(r'href="/(?:md5|slow_download)/[a-fA-F0-9]{32}"[^>]*>(.*?)</a>', block, re.DOTALL)
-                    if title_match:
-                        raw_t = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-                        if raw_t and raw_t.lower() not in ["download", "slow download"]:
-                            title = raw_t
-                            
                     author = "Unknown Author"
-                    author_match = re.search(r'<div[^>]*class="[^"]*text-gray-[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
-                    if not author_match:
-                        author_match = re.search(r'<div[^>]*class="[^"]*italic[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
-                    if author_match:
-                        raw_a = re.sub(r'<[^>]+>', '', author_match.group(1)).strip()
-                        if raw_a and not any(unit in raw_a.upper() for unit in ["MB", "GB", "PDF", "EPUB"]):
+                    
+                    # Target new structural classes
+                    t_match = re.search(r'<(?:h3|div)[^>]*class="[^"]*(?:text-xl|font-bold|text-lg)[^"]*"[^>]*>(.*?)</(?:h3|div)>', block, re.IGNORECASE | re.DOTALL)
+                    if t_match:
+                        title = html.unescape(re.sub(r'<[^>]+>', '', t_match.group(1)).strip())
+                        
+                    a_match = re.search(r'<div[^>]*class="[^"]*(?:italic|text-sm text-gray-500|author)[^"]*"[^>]*>(.*?)</div>', block, re.IGNORECASE | re.DOTALL)
+                    if a_match:
+                        raw_a = html.unescape(re.sub(r'<[^>]+>', '', a_match.group(1)).strip())
+                        if not any(unit in raw_a.upper() for unit in ["MB", "GB", "PDF", "EPUB"]):
                             author = raw_a
+
+                    # Fallback generic tag stripping if classes fail
+                    if title == "Unknown Title":
+                        raw_text = html.unescape(re.sub(r'<[^>]+>', '\n', block))
+                        lines = [line.strip() for line in raw_text.split('\n') if line.strip() and not re.match(r'^(download|slow download|md5)', line, re.IGNORECASE)]
+                        if len(lines) > 0:
+                            title = lines[0]
+                        if len(lines) > 1 and "Unknown" in author:
+                            if not any(unit in lines[1].upper() for unit in ["MB", "GB", "PDF", "EPUB"]):
+                                author = lines[1]
 
                     year_match = re.search(r'\b(19\d{2}|20\d{2})\b', block)
                     year = year_match.group(1) if year_match else ""
@@ -315,7 +328,9 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
                         formats = {"epub"}
 
                     files = [BookFile(extension=fmt) for fmt in formats]
-                    books.append(Book(md5=md5, title=title[:100], author=author[:80], year=year, files=files))
+                    
+                    # Store the specific 'domain' that succeeded to prevent DNS loops during download
+                    books.append(Book(md5=md5, title=title[:100], author=author[:80], year=year, files=files, domain=domain))
                     
                     if len(books) >= 20:
                         break
@@ -325,12 +340,16 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
             continue
     raise Exception("Could not reach active archive networks.")
 
-def get_abook_download_url(md5: str) -> Optional[str]:
-    """Tiered fallback extraction for mirror links."""
+def get_abook_download_url(md5: str, known_working_domain: str) -> Optional[str]:
+    """Uses domain memory to instantly query the known active mirror."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    for domain in ANNAS_DOMAINS:
+    
+    # Put the domain that successfully executed the search at the front of the line
+    domains_to_try = [known_working_domain] + [d for d in ANNAS_DOMAINS if d != known_working_domain]
+    
+    for domain in domains_to_try:
         try:
-            resp = session.get(f"https://{domain}/slow_download/{md5}", headers=headers, timeout=15)
+            resp = session.get(f"https://{domain}/slow_download/{md5}", headers=headers, timeout=12)
             if resp.status_code == 200:
                 all_links = re.findall(r'href="(https?://[^"]+)"', resp.text)
                 for link in all_links:
@@ -490,7 +509,9 @@ def abook_dl_callback(bot, update: Update):
     status_msg = query.message.edit_text(f"⬇️ Downloading '{book.title}' [{selected_format.upper()}] to server...")
     
     try:
-        download_url = get_abook_download_url(book.md5)
+        # Utilizing domain memory to prevent DNS lookup errors
+        download_url = get_abook_download_url(book.md5, book.domain)
+        
         if not download_url:
             status_msg.edit_text("❌ Failed to extract direct download link from archive.")
             return
@@ -501,7 +522,7 @@ def abook_dl_callback(bot, update: Update):
 
         # Guard against HTML captchas
         if content.startswith(b'<!DOCTYPE') or b'captcha' in content[:500].lower():
-            status_msg.edit_text(f"❌ Mirror blocked request.\n\n[Open in Browser](https://annas-archive.org/md5/{book.md5})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            status_msg.edit_text(f"❌ Mirror blocked request.\n\n[Open in Browser](https://{book.domain}/md5/{book.md5})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
             return
 
         size = len(content)
@@ -528,7 +549,7 @@ def abook_dl_callback(bot, update: Update):
         
     except Exception as e:
         LOGGER.error(f"[ABook DL Error] {e}")
-        status_msg.edit_text(f"❌ Download stream failed.\n\n[Mirror Link](https://annas-archive.org/md5/{book.md5})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        status_msg.edit_text(f"❌ Download stream failed.\n\n[Mirror Link](https://{book.domain}/md5/{book.md5})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
 # ==========================================
