@@ -8,10 +8,15 @@ import urllib.parse
 import wikipedia
 import requests
 import logging
+import time
+import sqlite3
+import threading
+from typing import List, Tuple
 from wikipedia.exceptions import DisambiguationError, PageError
 
 from telegram import Message, Chat, Update, Bot, ParseMode
-from telegram.ext import run_async
+from telegram.error import RetryAfter, BadRequest
+from telegram.ext import run_async, MessageHandler, Filters
 
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
@@ -22,6 +27,28 @@ LOGGER = logging.getLogger(__name__)
 NIGHT_API_KEY = os.environ.get("NIGHT_API_KEY")
 NIGHT_API_URL = "https://api.night-api.com/images/nsfw"
 
+# ==========================================
+# TAG ALL / @ALL CACHE DATABASE SETUP
+# ==========================================
+TAG_DB_PATH = "tagall_cache.db"
+TAG_DB_CONN = sqlite3.connect(TAG_DB_PATH, check_same_thread=False)
+TAG_CURSOR = TAG_DB_CONN.cursor()
+
+TAG_CURSOR.execute("""
+    CREATE TABLE IF NOT EXISTS chat_users (
+        chat_id INTEGER,
+        user_id INTEGER,
+        first_name TEXT,
+        PRIMARY KEY (chat_id, user_id)
+    )
+""")
+TAG_DB_CONN.commit()
+
+TAGGING_STATE = {}
+
+# ==========================================
+# CONSTANTS & LISTS
+# ==========================================
 SHRUGS = (
     "┐(´д｀)┌",
     "┐(´～｀)┌",
@@ -112,7 +139,7 @@ REACTS = (
     "♥‿♥",
     "◔_◔",
     "⁽⁽ଘ( ˊᵕˋ )ଓ⁾⁾",
-    "乁( ◔ ౪◔)「      ┑(￣Д ￣)┍",
+    "乁( ◔ ౪◔)「     ┑(￣Д ￣)┍",
     "( ఠൠఠ )ﾉ",
     "٩(๏_๏)۶",
     "┌(ㆆ㉨ㆆ)ʃ",
@@ -172,13 +199,14 @@ REACTS = (
 normiefont = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z']
 weebyfont = ['卂','乃','匚','刀','乇','下','厶','卄','工','丁','长','乚','从','𠘨','口','尸','㔿','尺','丂','丅','凵','リ','山','乂','丫','乙']
 
-
+# ==========================================
+# EXTRAS HANDLERS
+# ==========================================
 @run_async
 def shrug(bot: Bot, update: Update):
     # reply to correct message 
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
     reply_text(random.choice(SHRUGS))
-
 
 @run_async
 def hug(bot: Bot, update: Update):
@@ -186,11 +214,9 @@ def hug(bot: Bot, update: Update):
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
     reply_text(random.choice(HUGS))
     
-    
 @run_async
 def toss(bot: Bot, update: Update):
      update.effective_message.reply_text(random.choice(TOSS))
-
 
 @run_async
 def react(bot: Bot, update: Update):
@@ -198,7 +224,6 @@ def react(bot: Bot, update: Update):
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
     reply_text(random.choice(REACTS))
     
-
 @run_async
 def shout(bot: Bot, update: Update, args):
     msg = "```"
@@ -214,7 +239,6 @@ def shout(bot: Bot, update: Update, args):
     msg = "```\n" + result + "```"
     return update.effective_message.reply_text(msg, parse_mode="MARKDOWN")
 
-
 @run_async
 def pat(bot: Bot, update: Update):
     chat_id = update.effective_chat.id
@@ -226,15 +250,14 @@ def pat(bot: Bot, update: Update):
     msg_id = update.effective_message.reply_to_message.message_id if update.effective_message.reply_to_message else update.effective_message.message_id
     pats = []
     pats = json.loads(urllib.request.urlopen(urllib.request.Request(
-    'http://headp.at/js/pats.json',
+    '[http://headp.at/js/pats.json](http://headp.at/js/pats.json)',
     headers={'User-Agent': 'Mozilla/5.0 (X11; U; Linux i686) '
          'Gecko/20071127 Firefox/2.0.0.11'}
     )).read().decode('utf-8'))
     if "@" in msg and len(msg) > 5:
-        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', caption=msg)
+        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', caption=msg)
     else:
-        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
-
+        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
 
 @run_async
 def spank(bot: Bot, update: Update):
@@ -254,8 +277,8 @@ def spank(bot: Bot, update: Update):
 
     try:
         req = urllib.request.Request(
-            'https://nekos.best/api/v2/slap',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
+            '[https://nekos.best/api/v2/slap](https://nekos.best/api/v2/slap)',
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 ([https://github.com/Gumballi/TheRealPhoenixBot](https://github.com/Gumballi/TheRealPhoenixBot))'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -269,7 +292,7 @@ def spank(bot: Bot, update: Update):
 
     # Build dynamic message
     if target:
-        caption = f"⚡ *{sender}* spanked *{target}*!"
+        caption = f"*{sender}* spanked *{target}*!"
     else:
         caption = f"*{sender}* is looking around for someone to spank..."
 
@@ -283,7 +306,6 @@ def spank(bot: Bot, update: Update):
         parse_mode=ParseMode.MARKDOWN,
         reply_to_message_id=msg_id
     )
-
 
 @run_async
 def cuddle(bot: Bot, update: Update):
@@ -303,8 +325,8 @@ def cuddle(bot: Bot, update: Update):
     # Call Nekos.best API to fetch a random cuddle GIF
     try:
         req = urllib.request.Request(
-            'https://nekos.best/api/v2/cuddle',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
+            '[https://nekos.best/api/v2/cuddle](https://nekos.best/api/v2/cuddle)',
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 ([https://github.com/Gumballi/TheRealPhoenixBot](https://github.com/Gumballi/TheRealPhoenixBot))'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -318,7 +340,7 @@ def cuddle(bot: Bot, update: Update):
 
     # Build dynamic message
     if target:
-        caption = f"🤗 *{sender}* cuddled *{target}*!"
+        caption = f"*{sender}* cuddled *{target}*!"
     else:
         caption = f"*{sender}* is looking around for someone to cuddle..."
 
@@ -371,7 +393,7 @@ def kiss(bot: Bot, update: Update):
         return
 
     try:
-        api_url = "https://api.gifukai.com/kiss?type=mouth&pairing=fm" 
+        api_url = "[https://api.gifukai.com/kiss?type=mouth&pairing=fm](https://api.gifukai.com/kiss?type=mouth&pairing=fm)" 
         
         req = requests.get(api_url, timeout=8)
         if req.status_code == 200:
@@ -438,7 +460,7 @@ def wiki(bot: Bot, update: Update):
                 parse_mode=ParseMode.HTML
             )
         else:
-            update.effective_message.reply_text(f"❌ Page not found for: <code>{search}</code>", parse_mode=ParseMode.HTML)
+            update.effective_message.reply_text(f"Page not found for: <code>{search}</code>", parse_mode=ParseMode.HTML)
         return # Stop execution here
     except Exception as e:
         update.effective_message.reply_text(f"An unexpected error occurred: {str(e)}")
@@ -448,7 +470,7 @@ def wiki(bot: Bot, update: Update):
     if res:
         result = f"<b>{search.title()}</b>\n\n"
         result += f"<i>{res}</i>\n\n"
-        result += f"""<a href="https://en.wikipedia.org/wiki/{urllib.parse.quote(search)}">Read more...</a>"""
+        result += f"""<a href="[https://en.wikipedia.org/wiki/](https://en.wikipedia.org/wiki/){urllib.parse.quote(search)}">Read more...</a>"""
         
         if len(result) > 4000:
             with open("result.txt", 'w', encoding='utf-8') as f:
@@ -463,7 +485,6 @@ def wiki(bot: Bot, update: Update):
         else:
             update.effective_message.reply_text(result, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
-
 @run_async
 def judge(bot: Bot, update: Update):
     judger = ["<b>is lying!</b>", "<b>is telling the truth!</b>"]
@@ -476,7 +497,6 @@ def judge(bot: Bot, update: Update):
         user = msg.from_user.first_name
     res = random.choice(judger)
     msg.reply_text(f"{user} {res}", parse_mode=ParseMode.HTML)
-
 
 @run_async
 def weebify(bot: Bot, update: Update, args):
@@ -499,23 +519,22 @@ def weebify(bot: Bot, update: Update, args):
     else:
         msg.reply_text(string)
 
-
 @run_async
 def night_api_nsfw(bot: Bot, update: Update, args):
     msg = update.effective_message
     
     if not NIGHT_API_KEY:
-        msg.reply_text("❌ The bot owner has not configured the `NIGHT_API_KEY`.", parse_mode=ParseMode.MARKDOWN)
+        msg.reply_text("The bot owner has not configured the `NIGHT_API_KEY`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     # Default to 'hentai' if the user doesn't provide a specific argument
     category = args[0].lower() if args else "hentai"
     
-    # Common categories for Night API (Removed unsupported 'thighs')
+    # Common categories for Night API
     valid_categories = ["hentai", "boobs", "pussy", "ass", "feet"]
     
     if category not in valid_categories:
-        msg.reply_text(f"⚠️ Invalid category! Available options:\n`{', '.join(valid_categories)}`", parse_mode=ParseMode.MARKDOWN)
+        msg.reply_text(f"Invalid category! Available options:\n`{', '.join(valid_categories)}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     # Send a typing action since external API calls can take a second to resolve
@@ -532,14 +551,14 @@ def night_api_nsfw(bot: Bot, update: Update, args):
         if response.status_code == 200:
             data = response.json()
             
-            # Check internal API status (Night-API sometimes returns HTTP 200 for internal 400 errors)
+            # Check internal API status
             api_status = data.get("status")
             if api_status == 400:
                 error_msg = data.get("content", "Invalid request")
-                msg.reply_text(f"❌ API Error: {error_msg}")
+                msg.reply_text(f API Error: {error_msg}")
                 return
             
-            # Safely extract the image URL based on the data type
+            # Safely extract the image URL
             image_url = None
             content = data.get("content")
             
@@ -553,20 +572,161 @@ def night_api_nsfw(bot: Bot, update: Update, args):
             if image_url:
                 msg.reply_photo(photo=image_url)
             else:
-                msg.reply_text("❌ API request succeeded, but couldn't parse the image URL from the JSON.")
+                msg.reply_text("API request succeeded, but couldn't parse the image URL from the JSON.")
                 
         elif response.status_code == 401:
-            msg.reply_text("❌ Unauthorized! The provided Night API key is invalid.")
+            msg.reply_text("Unauthorized! The provided Night API key is invalid.")
         elif response.status_code == 404:
-            msg.reply_text("❌ Endpoint not found. Night API may have renamed this category.")
+            msg.reply_text("Endpoint not found. Night API may have renamed this category.")
         else:
-            msg.reply_text(f"❌ HTTP Error: {response.status_code}")
+            msg.reply_text(f"HTTP Error: {response.status_code}")
             
     except requests.exceptions.RequestException as e:
         LOGGER.error(f"[Night-API] Request failed: {e}")
-        msg.reply_text("❌ An error occurred while communicating with the Night API servers.")
+        msg.reply_text("An error occurred while communicating with the Night API servers.")
+
+# ==========================================
+# @ALL / TAG ALL LOGIC
+# ==========================================
+def add_user(chat_id: int, user_id: int, first_name: str):
+    TAG_CURSOR.execute(
+        "INSERT OR REPLACE INTO chat_users (chat_id, user_id, first_name) VALUES (?, ?, ?)",
+        (chat_id, user_id, first_name)
+    )
+    TAG_DB_CONN.commit()
+
+def get_users(chat_id: int) -> List[Tuple[int, str]]:
+    TAG_CURSOR.execute("SELECT user_id, first_name FROM chat_users WHERE chat_id = ?", (chat_id,))
+    return TAG_CURSOR.fetchall()
+
+def is_user_admin(chat, user_id: int) -> bool:
+    if chat.type == 'private':
+        return True
+    try:
+        member = chat.get_member(user_id)
+        return member.status in ('administrator', 'creator')
+    except Exception:
+        return False
+
+def tag_worker(bot, chat_id: int, users: List[Tuple[int, str]], message_text: str):
+    """Background thread to tag 5 users at a time with anti-spam delays."""
+    chunk_size = 5
+    for i in range(0, len(users), chunk_size):
+        if not TAGGING_STATE.get(chat_id, False):
+            break
+            
+        chunk = users[i:i + chunk_size]
+        mentions = []
+        
+        for user_id, first_name in chunk:
+            safe_name = first_name.replace('[', '').replace(']', '').replace('*', '').replace('_', '')
+            if not safe_name.strip():
+                safe_name = "User"
+            mentions.append(f"[{safe_name}](tg://user?id={user_id})")
+            
+        tag_text = f"{message_text}\n\n" + ", ".join(mentions)
+        
+        try:
+            bot.send_message(chat_id, tag_text, parse_mode=ParseMode.MARKDOWN)
+            time.sleep(2.5)  # Strict delay to prevent Telegram from blocking the bot
+            
+        except RetryAfter as e:
+            time.sleep(e.retry_after + 1)
+        except BadRequest:
+            pass
+        except Exception:
+            pass
+
+    TAGGING_STATE[chat_id] = False
+    try:
+        bot.send_message(chat_id, "**Tagging process finished!**", parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+@run_async
+def passive_tracker(bot, update: Update):
+    """Silently logs active users."""
+    if not update.effective_message or not update.effective_chat or not update.effective_user:
+        return
+        
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if chat.type == 'private' or user.is_bot:
+        return
+        
+    add_user(chat.id, user.id, user.first_name)
+
+@run_async
+def tag_all(bot, update: Update, args: List[str] = None, regex_match=None):
+    """Triggers the tagging process."""
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+
+    if chat.type == 'private':
+        msg.reply_text("This command can only be used in groups.")
+        return
+
+    if not is_user_admin(chat, user.id):
+        msg.reply_text("Only group admins can tag everyone.")
+        return
+
+    if TAGGING_STATE.get(chat.id, False):
+        msg.reply_text("A tagging process is already running! Use `/cancelall` to stop it.")
+        return
+
+    text = ""
+    if args:
+        text = " ".join(args)
+    elif regex_match:
+        text = regex_match.group(1).strip()
+
+    if not text:
+        text = "**Attention Everyone!**"
+
+    users = get_users(chat.id)
+    if not users:
+        msg.reply_text("I don't have any users cached for this chat yet! People need to send messages first.")
+        return
+
+    TAGGING_STATE[chat.id] = True
+    msg.reply_text(f"**Starting to tag {len(users)} users...**\n_Use /cancelall to stop._", parse_mode=ParseMode.MARKDOWN)
+
+    threading.Thread(target=tag_worker, args=(bot, chat.id, users, text), daemon=True).start()
+
+@run_async
+def tag_all_regex(bot, update: Update):
+    """Catches @all triggers."""
+    msg_text = update.effective_message.text
+    match = re.match(r"(?i)^@all(.*)", msg_text)
+    if match:
+        tag_all(bot, update, regex_match=match)
+
+@run_async
+def cancel_tag_all(bot, update: Update):
+    """Aborts an active tag loop."""
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type == 'private':
+        return
+
+    if not is_user_admin(chat, user.id):
+        update.effective_message.reply_text("Only admins can cancel tagging.")
+        return
+
+    if not TAGGING_STATE.get(chat.id, False):
+        update.effective_message.reply_text("There is no active tagging process to cancel.")
+        return
+
+    TAGGING_STATE[chat.id] = False
+    update.effective_message.reply_text("**Stopping the tagging process...**", parse_mode=ParseMode.MARKDOWN)
 
 
+# ==========================================
+# HELP MENU & REGISTRATIONS
+# ==========================================
 __help__ = """
  - /shg or /shrug: pretty self-explanatory.
  - /hug: give a hug and spread the love :)
@@ -580,10 +740,13 @@ __help__ = """
  - /judge: as a reply to someone, checks if they're lying or not!
  - /weebify: as a reply to a message, "weebifies" the message.
  - /nsfw <category>: Fetch a random NSFW image (defaults to hentai). Categories: hentai, boobs, pussy, ass, feet.
+ 
+ *Tag All Commands:*
+ - `@all <message>` or `/all <message>`: Tag everyone in the group.
+ - `/cancelall`: Stop an ongoing tagging process.
 """
 
 __mod_name__ = "Extras"
-
 
 SHRUG_HANDLER = DisableAbleCommandHandler(["shrug", "shg"], shrug)
 HUG_HANDLER = DisableAbleCommandHandler("hug", hug)
@@ -599,6 +762,12 @@ JUDGE_HANDLER = DisableAbleCommandHandler("judge", judge)
 WEEBIFY_HANDLER = DisableAbleCommandHandler("weebify", weebify, pass_args=True)
 NSFW_HANDLER = DisableAbleCommandHandler("nsfw", night_api_nsfw, pass_args=True)
 
+# Tag All Handlers
+TRACKER_HANDLER = MessageHandler(Filters.all & Filters.group, passive_tracker)
+TAGALL_CMD_HANDLER = DisableAbleCommandHandler(["all", "tagall"], tag_all, pass_args=True)
+CANCEL_CMD_HANDLER = DisableAbleCommandHandler(["cancelall", "untagall", "stopall"], cancel_tag_all)
+TAGALL_REGEX_HANDLER = MessageHandler(Filters.regex(r"(?i)^@all(.*)"), tag_all_regex)
+
 dispatcher.add_handler(SHRUG_HANDLER)
 dispatcher.add_handler(HUG_HANDLER)
 dispatcher.add_handler(REACT_HANDLER)
@@ -612,3 +781,9 @@ dispatcher.add_handler(WIKI_HANDLER)
 dispatcher.add_handler(JUDGE_HANDLER)
 dispatcher.add_handler(WEEBIFY_HANDLER)
 dispatcher.add_handler(NSFW_HANDLER)
+
+# Add tag handlers (passive tracker gets group 10 so it doesn't block other message handlers)
+dispatcher.add_handler(TRACKER_HANDLER, group=10)
+dispatcher.add_handler(TAGALL_CMD_HANDLER)
+dispatcher.add_handler(CANCEL_CMD_HANDLER)
+dispatcher.add_handler(TAGALL_REGEX_HANDLER)
