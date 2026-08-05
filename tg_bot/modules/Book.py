@@ -20,17 +20,23 @@ from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
 # Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 LOGGER = logging.getLogger(__name__)
 
+# SILENCE NOISY DNS RETRY LOGS FOR DEAD MIRRORS
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+
 # --- Constants & Configuration ---
-# Updated list of currently active Anna's Archive domains
 ANNAS_DOMAINS = ["annas-archive.gs", "annas-archive.li", "annas-archive.se", "annas-archive.org", "annas-archive.gl"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
-# Reduced retries to 1. If a domain has a DNS error, we want it to fail fast and move to the next.
+# Fast-fail retries so dead domains are skipped instantly
 RETRY_STRATEGY = Retry(
     total=1,
-    backoff_factor=0.5,
+    backoff_factor=0.2,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
     raise_on_status=False
@@ -73,7 +79,7 @@ class BookFile:
     
     @property
     def is_valid(self) -> bool:
-        return True
+        return True 
 
 @dataclass
 class Book:
@@ -81,7 +87,7 @@ class Book:
     title: str
     author: str
     year: str
-    domain: str = ""  # Remembers the working domain to prevent DNS errors on download
+    domain: str = ""
     publisher: str = ""
     language: str = ""
     pages: int = 0
@@ -271,7 +277,7 @@ def openlib_callback(bot, update: Update):
 # 2. ANNA'S ARCHIVE ENGINE (/abook)
 # ==========================================
 def search_annas_archive(query: str, format_filter: Optional[str] = None) -> List[Book]:
-    """Search Anna's Archive with highly robust HTML block parsing."""
+    """Search Anna's Archive with innerText simulation scraping (immune to CSS changes)."""
     params = {"q": query}
     if format_filter:
         params["ext"] = format_filter.lower()
@@ -291,37 +297,43 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
                         continue
                     seen_md5s.add(md5)
                     
+                    # Extract the entire anchor block for this specific book
+                    a_tag_match = re.search(rf'href="/(?:md5|slow_download)/{md5}"[^>]*>(.*?)</a>', resp.text, re.IGNORECASE | re.DOTALL)
+                    
+                    title = "Unknown Title"
+                    author = "Unknown Author"
+                    year = ""
+                    
+                    if a_tag_match:
+                        content = a_tag_match.group(1)
+                        # Strip images so alt-text doesn't pollute the text
+                        content = re.sub(r'<img[^>]*>', '', content, flags=re.IGNORECASE)
+                        # Strip all remaining HTML tags to simulate browser innerText
+                        raw_text = html.unescape(re.sub(r'<[^>]+>', '\n', content))
+                        
+                        # Clean and filter lines
+                        lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+                        
+                        clean_lines = []
+                        for line in lines:
+                            ll = line.lower()
+                            # Filter out interface junk and file formats
+                            if not any(x in ll for x in ["download", "mb", "kb", "gb", "pdf", "epub", "mobi", "azw3", "djvu", "cover"]):
+                                clean_lines.append(line)
+                                
+                        if len(clean_lines) > 0:
+                            title = clean_lines[0]
+                        if len(clean_lines) > 1:
+                            author = clean_lines[1]
+                    
+                    # Ensure format is extracted correctly from the raw HTML block
                     start = max(0, match.start() - 50)
                     end = min(len(resp.text), match.end() + 1000)
                     block = resp.text[start:end]
                     
-                    # --- Robust Title/Author Extraction ---
-                    title = "Unknown Title"
-                    author = "Unknown Author"
-                    
-                    # Target new structural classes
-                    t_match = re.search(r'<(?:h3|div)[^>]*class="[^"]*(?:text-xl|font-bold|text-lg)[^"]*"[^>]*>(.*?)</(?:h3|div)>', block, re.IGNORECASE | re.DOTALL)
-                    if t_match:
-                        title = html.unescape(re.sub(r'<[^>]+>', '', t_match.group(1)).strip())
-                        
-                    a_match = re.search(r'<div[^>]*class="[^"]*(?:italic|text-sm text-gray-500|author)[^"]*"[^>]*>(.*?)</div>', block, re.IGNORECASE | re.DOTALL)
-                    if a_match:
-                        raw_a = html.unescape(re.sub(r'<[^>]+>', '', a_match.group(1)).strip())
-                        if not any(unit in raw_a.upper() for unit in ["MB", "GB", "PDF", "EPUB"]):
-                            author = raw_a
-
-                    # Fallback generic tag stripping if classes fail
-                    if title == "Unknown Title":
-                        raw_text = html.unescape(re.sub(r'<[^>]+>', '\n', block))
-                        lines = [line.strip() for line in raw_text.split('\n') if line.strip() and not re.match(r'^(download|slow download|md5)', line, re.IGNORECASE)]
-                        if len(lines) > 0:
-                            title = lines[0]
-                        if len(lines) > 1 and "Unknown" in author:
-                            if not any(unit in lines[1].upper() for unit in ["MB", "GB", "PDF", "EPUB"]):
-                                author = lines[1]
-
                     year_match = re.search(r'\b(19\d{2}|20\d{2})\b', block)
-                    year = year_match.group(1) if year_match else ""
+                    if year_match:
+                        year = year_match.group(1)
 
                     formats = set(f.lower() for f in re.findall(r'\b(pdf|epub|mobi|azw3|djvu)\b', block, re.IGNORECASE))
                     if not formats:
@@ -329,7 +341,6 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
 
                     files = [BookFile(extension=fmt) for fmt in formats]
                     
-                    # Store the specific 'domain' that succeeded to prevent DNS loops during download
                     books.append(Book(md5=md5, title=title[:100], author=author[:80], year=year, files=files, domain=domain))
                     
                     if len(books) >= 20:
@@ -343,8 +354,6 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
 def get_abook_download_url(md5: str, known_working_domain: str) -> Optional[str]:
     """Uses domain memory to instantly query the known active mirror."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
-    # Put the domain that successfully executed the search at the front of the line
     domains_to_try = [known_working_domain] + [d for d in ANNAS_DOMAINS if d != known_working_domain]
     
     for domain in domains_to_try:
@@ -428,7 +437,6 @@ def abook_menu_callback(bot, update: Update):
         query.answer()
         return
 
-    # Handle Back button
     if query.data.startswith("ab_back_"):
         _, msg_id_str = query.data.split("_", 2)[1:]
         msg_id = int(msg_id_str)
@@ -454,7 +462,6 @@ def abook_menu_callback(bot, update: Update):
         )
         return
 
-    # Handle Format Selection Menu
     if query.data.startswith("ab_opt_"):
         _, _, msg_id_str, idx_str = query.data.split("_", 3)
         msg_id, idx = int(msg_id_str), int(idx_str)
@@ -509,9 +516,7 @@ def abook_dl_callback(bot, update: Update):
     status_msg = query.message.edit_text(f"⬇️ Downloading '{book.title}' [{selected_format.upper()}] to server...")
     
     try:
-        # Utilizing domain memory to prevent DNS lookup errors
         download_url = get_abook_download_url(book.md5, book.domain)
-        
         if not download_url:
             status_msg.edit_text("❌ Failed to extract direct download link from archive.")
             return
@@ -520,7 +525,6 @@ def abook_dl_callback(bot, update: Update):
         resp = session.get(download_url, headers=headers, stream=True, timeout=45)
         content = resp.content
 
-        # Guard against HTML captchas
         if content.startswith(b'<!DOCTYPE') or b'captcha' in content[:500].lower():
             status_msg.edit_text(f"❌ Mirror blocked request.\n\n[Open in Browser](https://{book.domain}/md5/{book.md5})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
             return
