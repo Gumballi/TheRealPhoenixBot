@@ -482,8 +482,8 @@ Download ebooks directly to Telegram.
 
 __mod_name__ = "Books"
 
-BOOK_HANDLER = DisableAbleCommandHandler("book", book, parse_args=True)
-PIRATEBOOK_HANDLER = DisableAbleCommandHandler("piratebook", piratebook, parse_args=True)
+BOOK_HANDLER = DisableAbleCommandHandler("book", book, pass_args=True)
+PIRATEBOOK_HANDLER = DisableAbleCommandHandler("piratebook", piratebook, pass_args=True)
 BOOK_BTN_HANDLER = CallbackQueryHandler(book_callback, pattern=r'^b_(pg|dl)\|')
 
 dispatcher.add_handler(BOOK_HANDLER)
