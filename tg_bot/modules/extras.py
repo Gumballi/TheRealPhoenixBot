@@ -195,9 +195,9 @@ def pat(bot: Bot, update: Update):
     headers={'User-Agent': 'Mozilla/5.0 (X11; U; Linux i686) Gecko/20071127 Firefox/2.0.0.11'}
     )).read().decode('utf-8'))
     if "@" in msg and len(msg) > 5:
-        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', caption=msg)
+        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', caption=msg)
     else:
-        bot.send_photo(chat_id, f'[https://headp.at/pats/](https://headp.at/pats/){urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
+        bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
 
 @run_async
 def spank(bot: Bot, update: Update):
@@ -215,7 +215,7 @@ def spank(bot: Bot, update: Update):
 
     try:
         req = urllib.request.Request(
-            '[https://nekos.best/api/v2/slap](https://nekos.best/api/v2/slap)',
+            'https://nekos.best/api/v2/slap',
             headers={'User-Agent': 'TheRealPhoenixBot/1.0'}
         )
         res = urllib.request.urlopen(req, timeout=8)
@@ -251,7 +251,7 @@ def cuddle(bot: Bot, update: Update):
 
     try:
         req = urllib.request.Request(
-            '[https://nekos.best/api/v2/cuddle](https://nekos.best/api/v2/cuddle)',
+            'https://nekos.best/api/v2/cuddle',
             headers={'User-Agent': 'TheRealPhoenixBot/1.0'}
         )
         res = urllib.request.urlopen(req, timeout=8)
@@ -310,7 +310,7 @@ def kiss(bot: Bot, update: Update):
         return
 
     try:
-        api_url = "[https://api.gifukai.com/kiss?type=mouth&pairing=fm](https://api.gifukai.com/kiss?type=mouth&pairing=fm)" 
+        api_url = "https://api.gifukai.com/kiss?type=mouth&pairing=fm" 
         req = requests.get(api_url, timeout=8)
         if req.status_code == 200:
             data = req.json()
@@ -369,7 +369,7 @@ def wiki(bot: Bot, update: Update):
         return
 
     if res:
-        result = f"<b>{search.title()}</b>\n\n<i>{res}</i>\n\n<a href=\"[https://en.wikipedia.org/wiki/](https://en.wikipedia.org/wiki/){urllib.parse.quote(search)}\">Read more...</a>"
+        result = f"<b>{search.title()}</b>\n\n<i>{res}</i>\n\n<a href=\"https://en.wikipedia.org/wiki/{urllib.parse.quote(search)}\">Read more...</a>"
         
         if len(result) > 4000:
             with open("result.txt", 'w', encoding='utf-8') as f:
