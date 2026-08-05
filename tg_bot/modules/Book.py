@@ -73,7 +73,7 @@ def build_keyboard(search_id: str, page: int, total_pages: int) -> InlineKeyboar
 
 
 # ==========================================
-# OPEN LIBRARY (PUBLIC DOMAIN)
+# OPEN LIBRARY (PUBLIC DOMAIN - /book)
 # ==========================================
 class OpenLibraryFetcher:
     @staticmethod
@@ -167,7 +167,6 @@ def do_openlib_download(bot: Bot, msg, item: dict):
 
         dl_url = None
         ext = "txt"
-        
         for f in files:
             if f.get("name", "").endswith(".epub"):
                 dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
@@ -221,13 +220,13 @@ def do_openlib_download(bot: Bot, msg, item: dict):
     except Exception as e:
         safe_err = str(e).replace("<", "[").replace(">", "]")
         LOGGER.error(f"[OpenLib DL Error] {safe_err}")
-        msg.edit_text("Failed to process download. The archive node returned an error, try a different edition.")
+        msg.edit_text("Failed to process download. The file may be unavailable.")
 
 
 # ==========================================
-# ANNA'S ARCHIVE (ROBUST BLOCK WINDOW SCRAPER)
+# ANNA'S ARCHIVE (DIRECT HTML PARSER - /piratebook)
 # ==========================================
-class AnnasArchiveFetcher:
+class PirateBookFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[List[dict]]:
         domains = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se"]
@@ -243,34 +242,26 @@ class AnnasArchiveFetcher:
                 books = []
                 seen_md5s = set()
                 
-                # Scan for MD5 links and extract local context blocks
+                # Scan for MD5/slow_download links and extract surrounding structured context block
                 for match in re.finditer(r'href="/(?:md5|slow_download)/([a-fA-F0-9]{32})"', resp.text):
                     md5 = match.group(1)
                     if md5 in seen_md5s:
                         continue
                     seen_md5s.add(md5)
                     
-                    # Extract local HTML window around this match
-                    start = max(0, match.start() - 400)
-                    end = min(len(resp.text), match.end() + 1200)
+                    start = max(0, match.start() - 300)
+                    end = min(len(resp.text), match.end() + 900)
                     block = resp.text[start:end]
                     
-                    # Extract Title safely from link or heading inside the block
+                    # Extract Title cleanly from main link text
                     title = "Unknown Title"
                     title_match = re.search(r'href="/(?:md5|slow_download)/[a-fA-F0-9]{32}"[^>]*>(.*?)</a>', block, re.DOTALL)
                     if title_match:
                         raw_t = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-                        if raw_t and len(raw_t) > 1 and not raw_t.lower() in ["download", "slow download", "fast download"]:
+                        if raw_t and len(raw_t) > 1 and raw_t.lower() not in ["download", "slow download", "fast download"]:
                             title = raw_t
                             
-                    if title == "Unknown Title":
-                        h_match = re.search(r'<h[234][^>]*>(.*?)</h[234]>', block, re.DOTALL)
-                        if h_match:
-                            raw_h = re.sub(r'<[^>]+>', '', h_match.group(1)).strip()
-                            if raw_h and len(raw_h) > 1:
-                                title = raw_h
-
-                    # Extract Author safely from styling classes within the block
+                    # Extract Author cleanly from secondary metadata blocks
                     author = "Unknown Author"
                     author_match = re.search(r'<div[^>]*class="[^"]*text-gray-[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
                     if not author_match:
@@ -278,14 +269,21 @@ class AnnasArchiveFetcher:
                         
                     if author_match:
                         raw_a = re.sub(r'<[^>]+>', '', author_match.group(1)).strip()
-                        if raw_a and len(raw_a) < 100 and not "MB" in raw_a and not "GB" in raw_a:
+                        if raw_a and len(raw_a) < 80 and not any(unit in raw_a for unit in ["MB", "GB", "PDF", "EPUB"]):
                             author = raw_a
-                            
+
+                    # Extension detector
+                    ext = "epub"
+                    if "pdf" in block.lower():
+                        ext = "pdf"
+                    elif "mobi" in block.lower():
+                        ext = "mobi"
+
                     books.append({
                         "md5": md5,
                         "title": title[:100],
                         "author": author[:80],
-                        "ext": "epub"
+                        "ext": ext
                     })
                     if len(books) >= 25:
                         break
@@ -294,7 +292,7 @@ class AnnasArchiveFetcher:
                     return books
             except Exception as e:
                 safe_err = str(e).replace("<", "[").replace(">", "]")
-                LOGGER.warning(f"[AnnasArchive] Search failed on {domain}: {safe_err}")
+                LOGGER.warning(f"[PirateBook] Search failed on {domain}: {safe_err}")
                 continue
                 
         return None
@@ -315,7 +313,7 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
     status_msg = msg.reply_text(
         f"Searching archives for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
     )
-    results = AnnasArchiveFetcher.search_books(query)
+    results = PirateBookFetcher.search_books(query)
 
     if results is None:
         status_msg.edit_text("Search failed. Could not reach active archive networks.")
@@ -329,7 +327,7 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
     SEARCH_CACHE[search_id] = {
         "query": query,
         "results": results,
-        "type": "annas",
+        "type": "pirate",
         "created": time.time(),
     }
 
@@ -343,7 +341,7 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
     )
 
 
-def do_annas_download(bot: Bot, msg, item: dict):
+def do_pirate_download(bot: Bot, msg, item: dict):
     md5 = item["md5"]
     title = item["title"]
     author = item["author"]
@@ -352,7 +350,7 @@ def do_annas_download(bot: Bot, msg, item: dict):
     try:
         msg.edit_text("Fetching download link from archive...")
         dl_url = f"https://annas-archive.gl/slow_download/{md5}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         
         page_resp = None
         for attempt in range(3):
@@ -405,7 +403,7 @@ def do_annas_download(bot: Bot, msg, item: dict):
 
     except Exception as e:
         safe_err = str(e).replace("<", "[").replace(">", "]")
-        LOGGER.error(f"[Annas DL Error] {safe_err}")
+        LOGGER.error(f"[Pirate DL Error] {safe_err}")
         msg.edit_text(
             f"Direct download stream failed due to rate limiting.\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
             parse_mode=ParseMode.HTML, 
@@ -437,6 +435,7 @@ def book_callback(bot: Bot, update: Update):
         return
 
     search_data = SEARCH_CACHE[search_id]
+    search_data["created"] = time.time()  # sliding expiration refresh
 
     if action == "b_pg":
         query.answer()
@@ -465,8 +464,8 @@ def book_callback(bot: Bot, update: Update):
         
         if search_data["type"] == "openlib":
             do_openlib_download(bot, query.message, item)
-        elif search_data["type"] == "annas":
-            do_annas_download(bot, query.message, item)
+        elif search_data["type"] == "pirate":
+            do_pirate_download(bot, query.message, item)
 
 
 # ==========================================
@@ -477,14 +476,14 @@ __help__ = """
 Download ebooks directly to Telegram.
 
 *Available commands:*
- - /book <title or author>: Searches Open Library / Internet Archive with interactive selection.
- - /piratebook <title or author>: Searches Anna's Archive with interactive selection.
+ - /book <title or author>: Searches Open Library public domain scans with interactive selection.
+ - /piratebook <title or author>: Searches Anna's Archive with direct HTML block parsing for titles and authors.
 """
 
 __mod_name__ = "Books"
 
-BOOK_HANDLER = DisableAbleCommandHandler("book", book, pass_args=True)
-PIRATEBOOK_HANDLER = DisableAbleCommandHandler("piratebook", piratebook, pass_args=True)
+BOOK_HANDLER = DisableAbleCommandHandler("book", book, parse_args=True)
+PIRATEBOOK_HANDLER = DisableAbleCommandHandler("piratebook", piratebook, parse_args=True)
 BOOK_BTN_HANDLER = CallbackQueryHandler(book_callback, pattern=r'^b_(pg|dl)\|')
 
 dispatcher.add_handler(BOOK_HANDLER)
