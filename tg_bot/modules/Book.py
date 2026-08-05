@@ -364,28 +364,28 @@ def search_annas_archive(query: str, format_filter: Optional[str] = None) -> Lis
     raise Exception("Could not reach active archive networks or no results found.")
 
 def parse_html_search_results(html_content: str, domain: str) -> List[Book]:
-    """Bulletproof HTML parsing using raw text extraction."""
+    """Bulletproof HTML parsing using cleanly isolated anchor tags."""
     books = []
     seen_md5s = set()
     
-    # Split the raw HTML into blocks based on the MD5 link
-    pattern = r'href="/(?:md5|slow_download|book)/([a-fA-F0-9]{32})"'
-    parts = re.split(pattern, html_content)
+    # Match the entire anchor block enclosing each book result
+    pattern = r'<a[^>]*href="/(?:md5|slow_download|book)/([a-fA-F0-9]{32})"[^>]*>(.*?)</a>'
     
-    for i in range(1, len(parts) - 1, 2):
-        md5 = parts[i]
+    for match in re.finditer(pattern, html_content, re.IGNORECASE | re.DOTALL):
+        md5 = match.group(1)
         if md5 in seen_md5s:
             continue
         seen_md5s.add(md5)
         
-        block = parts[i+1]
-        end_idx = block.find('</a>')
-        if end_idx != -1:
-            block = block[:end_idx]
-            
-        block = re.sub(r'<img[^>]*>', '', block, flags=re.IGNORECASE)
-        raw_text = html.unescape(re.sub(r'<[^>]+>', '\n', block))
+        inner_html = match.group(2)
         
+        # Strip out images and their alt text to prevent title pollution
+        inner_html = re.sub(r'<img[^>]*>', '', inner_html, flags=re.IGNORECASE)
+        
+        # Strip all remaining HTML tags
+        raw_text = html.unescape(re.sub(r'<[^>]+>', '\n', inner_html))
+        
+        # Clean lines
         lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
         
         clean_lines = []
@@ -402,11 +402,11 @@ def parse_html_search_results(html_content: str, domain: str) -> List[Book]:
         if len(clean_lines) > 1:
             author = clean_lines[1]
             
-        formats = set(f.lower() for f in re.findall(r'\b(pdf|epub|mobi|azw3|djvu)\b', parts[i+1], re.IGNORECASE))
+        formats = set(f.lower() for f in re.findall(r'\b(pdf|epub|mobi|azw3|djvu)\b', inner_html, re.IGNORECASE))
         if not formats:
             formats = {"epub"}
             
-        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', parts[i+1])
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', inner_html)
         year = year_match.group(1) if year_match else ""
             
         files = [BookFile(extension=fmt) for fmt in formats]
@@ -693,23 +693,23 @@ def abook_dl_callback(bot, update: Update):
             resp = session.get(download_url, headers=headers, stream=True, timeout=60)
             resp.raise_for_status()
             
-            content_length = int(resp.headers.get('content-length', 0))
-            if content_length > MAX_FILE_SIZE:
-                status_msg.edit_text(
-                    f"⚠️ File exceeds Telegram's 50MB limit.\n\n"
-                    f"[Download Directly]({download_url})",
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True
-                )
-                return
-            
             content = resp.content
             
-            if content.startswith(b'<!DOCTYPE') or b'captcha' in content[:1000].lower():
+            # Guard against HTML error pages and Captchas being saved as books
+            if content.startswith(b'<!DOCTYPE') or content.startswith(b'<html') or b'<body' in content[:500].lower() or b'captcha' in content[:1000].lower():
                 status_msg.edit_text(
                     f"❌ Mirror is blocking downloads.\n\n"
                     f"Try opening in browser:\n"
                     f"https://{book.domain}/md5/{book.md5}",
+                    disable_web_page_preview=True
+                )
+                return
+
+            if len(content) > MAX_FILE_SIZE:
+                status_msg.edit_text(
+                    f"⚠️ File exceeds Telegram's 50MB limit.\n\n"
+                    f"[Download Directly]({download_url})",
+                    parse_mode=ParseMode.MARKDOWN,
                     disable_web_page_preview=True
                 )
                 return
