@@ -1,476 +1,566 @@
-import html
-import io
-import logging
-import math
+import os
 import re
 import time
-import uuid
-from typing import List, Optional
+import io
+import json
+import logging
+import math
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass, field
 
 import requests
-from telegram import Bot, ParseMode, Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import run_async, CallbackQueryHandler
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram.ext import CallbackQueryHandler, run_async
 
+# Import PhoenixBot specific modules
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
+# Configure logging
 LOGGER = logging.getLogger(__name__)
 
-# ==========================================
-# STATE MANAGEMENT (CACHE)
-# ==========================================
-SEARCH_CACHE = {}
-CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
-CACHE_MAX_ENTRIES = 500
+# --- Constants & Configuration ---
+ANNAS_DOMAINS = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se", "annas-archive.org"]
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
-def clean_cache():
-    """Evict expired entries individually instead of wiping everyone's session at once."""
-    now = time.time()
-    expired = [sid for sid, data in SEARCH_CACHE.items() if now - data["created"] > CACHE_TTL_SECONDS]
-    for sid in expired:
-        SEARCH_CACHE.pop(sid, None)
+RETRY_STRATEGY = Retry(
+    total=5,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+    raise_on_status=False
+)
 
-    if len(SEARCH_CACHE) > CACHE_MAX_ENTRIES:
-        by_age = sorted(SEARCH_CACHE.items(), key=lambda kv: kv[1]["created"])
-        overflow = len(SEARCH_CACHE) - CACHE_MAX_ENTRIES
-        for sid, _ in by_age[:overflow]:
-            SEARCH_CACHE.pop(sid, None)
+session = requests.Session()
+adapter = HTTPAdapter(max_retries=RETRY_STRATEGY, pool_connections=100, pool_maxsize=100)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
-def build_keyboard(search_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
-    keyboard = []
-    search_data = SEARCH_CACHE.get(search_id)
-    if not search_data:
-        return InlineKeyboardMarkup([])
+# --- Global Caches (PhoenixBot Style) ---
+OPENLIB_RESULTS = {}
+ABOOK_RESULTS = {}
+CACHE_TIMESTAMPS = {}
 
-    start = page * 5
-    end = start + 5
-    items = search_data["results"][start:end]
-
-    for i, item in enumerate(items):
-        idx = start + i
-        title_trunc = item["title"][:32] + ("..." if len(item["title"]) > 32 else "")
-        author_trunc = item["author"][:15]
-
-        btn_text = f"{i+1}. {title_trunc} | {author_trunc}"
-        if item.get('ext') and item['ext'] != "file":
-            btn_text += f" [{item['ext'].upper()}]"
-            
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"b_dl|{search_id}|{idx}")])
-
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("< Prev", callback_data=f"b_pg|{search_id}|{page-1}"))
-
-    nav_row.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="ignore"))
-
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next >", callback_data=f"b_pg|{search_id}|{page+1}"))
-
-    if nav_row:
-        keyboard.append(nav_row)
-
-    return InlineKeyboardMarkup(keyboard)
+def cleanup_caches():
+    """Prevents memory leaks by deleting searches older than 30 minutes."""
+    current_time = time.time()
+    expired_keys = [msg_id for msg_id, ts in CACHE_TIMESTAMPS.items() if current_time - ts > 1800]
+    for msg_id in expired_keys:
+        OPENLIB_RESULTS.pop(msg_id, None)
+        ABOOK_RESULTS.pop(msg_id, None)
+        CACHE_TIMESTAMPS.pop(msg_id, None)
 
 
 # ==========================================
-# OPEN LIBRARY (PUBLIC DOMAIN - /book)
+# DATA CLASSES (From User's Provided Code)
+# ==========================================
+@dataclass
+class BookFile:
+    extension: str
+    size: int = 0
+    url: Optional[str] = None
+    md5: Optional[str] = None
+    quality: str = "standard"
+    
+    @property
+    def size_mb(self) -> float:
+        return self.size / (1024 * 1024)
+    
+    @property
+    def is_valid(self) -> bool:
+        return True  # Validated dynamically during download to handle unknown sizes
+
+@dataclass
+class Book:
+    md5: str
+    title: str
+    author: str
+    year: str
+    publisher: str = ""
+    language: str = ""
+    pages: int = 0
+    files: List[BookFile] = field(default_factory=list)
+    cover_url: Optional[str] = None
+    description: Optional[str] = None
+    isbns: List[str] = field(default_factory=list)
+    
+    def get_available_formats(self) -> List[str]:
+        return sorted(set(f.extension.lower() for f in self.files))
+
+
+# ==========================================
+# 1. OPEN LIBRARY ENGINE (/book)
 # ==========================================
 class OpenLibraryFetcher:
     @staticmethod
-    def search_books(query: str) -> Optional[List[dict]]:
+    def search(query: str) -> Optional[List[dict]]:
         search_url = "https://openlibrary.org/search.json"
         try:
-            resp = requests.get(search_url, params={"q": query, "limit": 30}, timeout=15)
+            resp = session.get(search_url, params={"q": query, "limit": 30}, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-        except requests.exceptions.RequestException as e:
-            safe_err = str(e).replace("<", "[").replace(">", "]")
-            LOGGER.error(f"[OpenLibrary] Search failed: {safe_err}")
-            return None
-        except ValueError as e:
-            safe_err = str(e).replace("<", "[").replace(">", "]")
-            LOGGER.error(f"[OpenLibrary] Non-JSON response: {safe_err}")
-            return None
-
-        books = []
-        for doc in data.get("docs", []):
-            if doc.get("public_scan_b") and doc.get("ia"):
-                ia_id = doc.get("ia")[0]
-                title = doc.get("title", "Unknown Title")
-                authors = ", ".join(doc.get("author_name", ["Unknown Author"]))
-                cover_i = doc.get("cover_i")
-                cover_url = f"https://covers.openlibrary.org/b/id/{cover_i}-L.jpg" if cover_i else None
-
-                books.append({
-                    "ia_id": ia_id,
-                    "title": title,
-                    "author": authors,
-                    "cover": cover_url,
-                })
-        return books
-
-
-@run_async
-def book(bot: Bot, update: Update, args: List[str]):
-    msg = update.effective_message
-    query = " ".join(args).strip()
-
-    if not query:
-        msg.reply_text(
-            "Please provide a book title.\n<b>Usage:</b> <code>/book Pride and Prejudice</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    status_msg = msg.reply_text(
-        f"Searching public domain for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
-    )
-    results = OpenLibraryFetcher.search_books(query)
-
-    if results is None:
-        status_msg.edit_text("Search failed. Open Library didn't respond. Try again later.")
-        return
-    if not results:
-        status_msg.edit_text("No public domain books found for that query.")
-        return
-
-    clean_cache()
-    search_id = uuid.uuid4().hex[:8]
-    SEARCH_CACHE[search_id] = {
-        "query": query,
-        "type": "openlib",
-        "results": results,
-        "created": time.time(),
-    }
-
-    total_pages = math.ceil(len(results) / 5)
-    kb = build_keyboard(search_id, 0, total_pages)
-
-    status_msg.edit_text(
-        f"Results for <b>{html.escape(query)}</b>:\nSelect a book to download:",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-def do_openlib_download(bot: Bot, msg, item: dict):
-    ia_id = item["ia_id"]
-    title = item["title"]
-    author = item["author"]
-    cover_url = item["cover"]
-
-    try:
-        ia_meta_url = f"https://archive.org/metadata/{ia_id}"
-        ia_resp = requests.get(ia_meta_url, timeout=10)
-        ia_resp.raise_for_status()
-        files = ia_resp.json().get("files", [])
-
-        dl_url = None
-        ext = "txt"
-        for f in files:
-            if f.get("name", "").endswith(".epub"):
-                dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
-                ext = "epub"
-                break
-        if not dl_url:
-            for f in files:
-                if f.get("name", "").endswith(".pdf"):
-                    dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
-                    ext = "pdf"
-                    break
-
-        if not dl_url:
-            msg.edit_text("Could not find a downloadable EPUB or PDF for this specific edition.")
-            return
-
-        msg.edit_text("Downloading from Internet Archive...")
-        resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
-        resp.raise_for_status()
-
-        file_obj = io.BytesIO(resp.content)
-        safe_title = re.sub(r'[\\/*?:"<>|]', "", title).replace(" ", "_")
-        file_obj.name = f"{safe_title}.{ext}"
-        file_obj.seek(0)
-
-        thumb_obj = None
-        if cover_url:
-            try:
-                thumb_resp = requests.get(cover_url, timeout=10)
-                thumb_resp.raise_for_status()
-                thumb_obj = io.BytesIO(thumb_resp.content)
-                thumb_obj.name = "cover.jpg"
-                thumb_obj.seek(0)
-            except requests.exceptions.RequestException as thumb_err:
-                LOGGER.warning(f"[OpenLib] Cover fetch failed for {ia_id}: {thumb_err!r}")
-
-        msg.edit_text("Uploading file to Telegram...")
-        msg.reply_document(
-            document=file_obj,
-            thumb=thumb_obj,
-            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\n\nDownloaded via @{bot.username}",
-            parse_mode=ParseMode.HTML,
-            timeout=120,
-        )
-
-        try:
-            msg.delete()
-        except Exception as del_err:
-            LOGGER.warning(f"[OpenLib] Could not delete status message: {del_err!r}")
-
-    except Exception as e:
-        safe_err = str(e).replace("<", "[").replace(">", "]")
-        LOGGER.error(f"[OpenLib DL Error] {safe_err}")
-        msg.edit_text("Failed to process download. The file may be unavailable.")
-
-
-# ==========================================
-# PIRATEBOOK (HYBRID: OPEN LIB SEARCH + ARCHIVE BRIDGE)
-# ==========================================
-class PirateBookFetcher:
-    @staticmethod
-    def search_books(query: str) -> Optional[List[dict]]:
-        search_url = "https://openlibrary.org/search.json"
-        try:
-            resp = requests.get(search_url, params={"q": query, "limit": 30}, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            safe_err = str(e).replace("<", "[").replace(">", "]")
-            LOGGER.error(f"[PirateBook] Search failed: {safe_err}")
-            return None
-
-        books = []
-        for doc in data.get("docs", []):
-            title = doc.get("title")
-            authors = ", ".join(doc.get("author_name", ["Unknown Author"]))
-            if title:
-                books.append({
-                    "title": title,
-                    "author": authors,
-                    "ext": "epub"
-                })
-        return books
-
-
-@run_async
-def piratebook(bot: Bot, update: Update, args: List[str]):
-    msg = update.effective_message
-    query = " ".join(args).strip()
-
-    if not query:
-        msg.reply_text(
-            "Please specify a book title or author!\n<b>Usage:</b> <code>/piratebook Franz Kafka</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    status_msg = msg.reply_text(
-        f"Searching catalog for: <b>{html.escape(query)}</b>...", parse_mode=ParseMode.HTML
-    )
-    results = PirateBookFetcher.search_books(query)
-
-    if results is None:
-        status_msg.edit_text("Search failed. Catalog didn't respond. Try again later.")
-        return
-    if not results:
-        status_msg.edit_text("No books found for that query.")
-        return
-
-    clean_cache()
-    search_id = uuid.uuid4().hex[:8]
-    SEARCH_CACHE[search_id] = {
-        "query": query,
-        "results": results,
-        "type": "pirate",
-        "created": time.time(),
-    }
-
-    total_pages = math.ceil(len(results) / 5)
-    kb = build_keyboard(search_id, 0, total_pages)
-
-    status_msg.edit_text(
-        f"Results for <b>{html.escape(query)}</b>:\nSelect a book to download:",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-def do_pirate_download(bot: Bot, msg, item: dict):
-    title = item["title"]
-    author = item["author"]
-    search_query = f"{title} {author}"
-
-    try:
-        msg.edit_text("Locating file across archive mirrors...")
-        domains = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se"]
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
-        md5 = None
-        for domain in domains:
-            try:
-                search_url = f"https://{domain}/search"
-                resp = requests.get(search_url, params={"q": search_query}, headers=headers, timeout=12)
-                if resp.status_code == 200:
-                    match = re.search(r'href="/(?:md5|slow_download)/([a-fA-F0-9]{32})"', resp.text)
-                    if match:
-                        md5 = match.group(1)
-                        break
-            except Exception:
-                continue
-
-        if not md5:
-            msg.edit_text("Could not find a downloadable file hash for this book.")
-            return
-
-        dl_page_url = f"https://annas-archive.gl/slow_download/{md5}"
-        page_resp = None
-        for attempt in range(3):
-            page_resp = requests.get(dl_page_url, headers=headers, timeout=20)
-            if "Flood control exceeded" in page_resp.text or page_resp.status_code == 429:
-                if attempt < 2:
-                    time.sleep(4)
-                    continue
-            break
             
-        if page_resp is None or "Flood control exceeded" in page_resp.text:
-            raise Exception("Flood control exceeded. Please try again in a few moments.")
+            books = []
+            for doc in data.get("docs", []):
+                if doc.get("public_scan_b") and doc.get("ia"):
+                    books.append({
+                        "ia_id": doc.get("ia")[0],
+                        "title": doc.get("title", "Unknown Title"),
+                        "author": ", ".join(doc.get("author_name", ["Unknown Author"]))
+                    })
+            return books
+        except Exception as e:
+            LOGGER.error(f"[OpenLibrary] Search failed: {e}")
+            return None
+
+def build_openlib_keyboard(msg_id: int, page: int, total_pages: int, results: list) -> InlineKeyboardMarkup:
+    keyboard = []
+    start = page * 5
+    end = start + 5
+    
+    for i, item in enumerate(results[start:end]):
+        idx = start + i
+        title_trunc = item["title"][:32] + ("..." if len(item["title"]) > 32 else "")
+        author_trunc = item["author"][:15]
+        btn_text = f"{i+1}. {title_trunc} | {author_trunc}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"ol_dl_{msg_id}_{idx}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"ol_pg_{msg_id}_{page-1}"))
+    nav_row.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="ol_ignore"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"ol_pg_{msg_id}_{page+1}"))
         
-        # Strictly extract valid partner download links (preventing landing page fallbacks)
-        all_links = re.findall(r'href="(https?://[^"]+)"', page_resp.text)
-        actual_dl = None
-        for link in all_links:
-            link_lower = link.lower()
-            if any(partner in link_lower for partner in ['library.lol/main/', 'libgen.is/get', 'libgen.li', 'ipfs.io', 'cloudflare-ipfs.com', 'dl.booksdl.org']):
-                actual_dl = link
-                break
-                
-        if not actual_dl:
-            raise Exception("Could not extract a direct file mirror link from the archive page.")
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"ol_cancel_{msg_id}")])
+    
+    return InlineKeyboardMarkup(keyboard)
 
-        msg.edit_text("Downloading file to server...")
-        resp = requests.get(actual_dl, headers=headers, stream=True, timeout=45)
-        content = resp.content
-
-        # Strict Guardrail: Prevent saving HTML error pages, Cloudflare challenges, or landing pages as books
-        if content.startswith(b'<!DOCTYPE') or content.startswith(b'<html') or b'<head' in content[:100].lower() or b'captcha' in content.lower():
-            raise Exception("The mirror served an HTML landing page instead of a binary book file.")
-
-        size = len(content)
-        if size > 50 * 1024 * 1024:
-            msg.edit_text(
-                f"File size exceeds Telegram's 50MB limit.\n\n"
-                f"<b>Direct Download Link:</b> <a href='{html.escape(actual_dl)}'>Click Here</a>", 
-                parse_mode=ParseMode.HTML, 
-                disable_web_page_preview=True
-            )
-            return
-
-        # Sniff actual extension from direct link or fallback to epub
-        ext = "epub"
-        for possible_ext in ["pdf", "epub", "mobi", "azw3", "djvu"]:
-            if possible_ext in actual_dl.lower():
-                ext = possible_ext
-                break
-
-        file_obj = io.BytesIO(content)
-        safe_title = re.sub(r'[\\/*?:"<>|]', "", title).replace(" ", "_")
-        file_obj.name = f"{safe_title}.{ext}"
-        file_obj.seek(0)
-
-        msg.edit_text("Uploading book to Telegram...")
-        msg.reply_document(
-            document=file_obj,
-            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\nFormat: <code>{ext.upper()}</code>\n\nDownloaded via @{bot.username}",
-            parse_mode=ParseMode.HTML,
-            timeout=120
-        )
-        msg.delete()
-
-    except Exception as e:
-        safe_err = str(e).replace("<", "[").replace(">", "]")
-        LOGGER.error(f"[Pirate DL Error] {safe_err}")
-        msg.edit_text(
-            f"Download failed: {safe_err}\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
-            parse_mode=ParseMode.HTML, 
-            disable_web_page_preview=True
-        )
-
-
-# ==========================================
-# CALLBACK HANDLER
-# ==========================================
 @run_async
-def book_callback(bot: Bot, update: Update):
+def book_command(bot, update: Update, args):
+    """Search Open Library for public domain books."""
+    msg = update.effective_message
+    if not args:
+        msg.reply_text(
+            "📚 *Open Library Search*\n\n"
+            "Search for public domain books and classics.\n"
+            "Example: `/book Pride and Prejudice`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+        
+    cleanup_caches()
+    query = ' '.join(args).strip()
+    status_msg = msg.reply_text(f"🔍 Searching Open Library for '{query}'...")
+    
+    results = OpenLibraryFetcher.search(query)
+    if results is None:
+        status_msg.edit_text("❌ Search failed. Open Library didn't respond.")
+        return
+    if not results:
+        status_msg.edit_text("😕 No public domain books found for that query.")
+        return
+        
+    OPENLIB_RESULTS[status_msg.message_id] = {"query": query, "results": results}
+    CACHE_TIMESTAMPS[status_msg.message_id] = time.time()
+    
+    total_pages = math.ceil(len(results) / 5)
+    kb = build_openlib_keyboard(status_msg.message_id, 0, total_pages, results)
+    
+    status_msg.edit_text(
+        f"📚 *Results for '{query}'*\nSelect a book to download:",
+        reply_markup=kb,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@run_async
+def openlib_callback(bot, update: Update):
+    """Handle Open Library inline buttons."""
     query = update.callback_query
     data = query.data
-
-    if data == "ignore":
+    
+    if data == "ol_ignore":
         query.answer()
         return
-
-    parts = data.split("|")
-    if len(parts) != 3:
+        
+    parts = data.split("_")
+    action, msg_id = parts[1], int(parts[2])
+    
+    if data.startswith("ol_cancel"):
+        query.edit_message_text("❌ Search cancelled.")
         query.answer()
         return
-
-    action, search_id, param = parts
-
-    if search_id not in SEARCH_CACHE:
-        query.answer("This search has expired. Please run the command again.", show_alert=True)
+        
+    search_data = OPENLIB_RESULTS.get(msg_id)
+    if not search_data:
+        query.answer("Search expired. Please run /book again.", show_alert=True)
         return
-
-    search_data = SEARCH_CACHE[search_id]
-    search_data["created"] = time.time()  # sliding expiration refresh
-
-    if action == "b_pg":
-        query.answer()
-        page = int(param)
-        total_pages = math.ceil(len(search_data["results"]) / 5)
-        kb = build_keyboard(search_id, page, total_pages)
-
+        
+    CACHE_TIMESTAMPS[msg_id] = time.time()
+    results = search_data["results"]
+    
+    if action == "pg":
+        page = int(parts[3])
+        total_pages = math.ceil(len(results) / 5)
+        kb = build_openlib_keyboard(msg_id, page, total_pages, results)
         query.edit_message_text(
-            f"Results for <b>{html.escape(search_data['query'])}</b>:\nSelect a book to download:",
+            f"📚 *Results for '{search_data['query']}'*\nSelect a book to download:",
             reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-        )
-
-    elif action == "b_dl":
-        idx = int(param)
-        results = search_data["results"]
-        if idx < 0 or idx >= len(results):
-            query.answer("That selection is no longer valid. Please search again.", show_alert=True)
-            return
-
-        query.answer()
-        item = results[idx]
-        query.edit_message_text(
-            f"Preparing to download: <b>{html.escape(item['title'])}</b>...", parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.MARKDOWN
         )
         
-        if search_data["type"] == "openlib":
-            do_openlib_download(bot, query.message, item)
-        elif search_data["type"] == "pirate":
-            do_pirate_download(bot, query.message, item)
+    elif action == "dl":
+        idx = int(parts[3])
+        item = results[idx]
+        query.answer("Fetching metadata...")
+        
+        status_msg = query.message.edit_text(f"⬇️ Preparing '{item['title']}' from Internet Archive...")
+        
+        try:
+            ia_meta = session.get(f"https://archive.org/metadata/{item['ia_id']}", timeout=10).json()
+            files = ia_meta.get("files", [])
+            
+            dl_url, ext = None, "txt"
+            for f in files:
+                if f.get("name", "").endswith(".epub"):
+                    dl_url, ext = f"https://archive.org/download/{item['ia_id']}/{f['name']}", "epub"
+                    break
+            if not dl_url:
+                for f in files:
+                    if f.get("name", "").endswith(".pdf"):
+                        dl_url, ext = f"https://archive.org/download/{item['ia_id']}/{f['name']}", "pdf"
+                        break
+                        
+            if not dl_url:
+                status_msg.edit_text("❌ No EPUB or PDF available for this edition.")
+                return
+                
+            status_msg.edit_text("Downloading file to server...")
+            resp = session.get(dl_url, stream=True, timeout=45)
+            
+            file_obj = io.BytesIO(resp.content)
+            safe_title = re.sub(r'[\\/*?:"<>|]', "", item["title"]).replace(" ", "_")
+            file_obj.name = f"{safe_title}.{ext}"
+            file_obj.seek(0)
+            
+            status_msg.edit_text("Uploading to Telegram...")
+            bot.send_document(
+                chat_id=query.message.chat_id,
+                document=file_obj,
+                filename=file_obj.name,
+                caption=f"📚 *{item['title']}*\n✍️ *Author:* {item['author']}\n\n_Downloaded via Open Library_",
+                parse_mode=ParseMode.MARKDOWN,
+                timeout=120
+            )
+            status_msg.delete()
+            
+        except Exception as e:
+            LOGGER.error(f"[OpenLib DL Error] {e}")
+            status_msg.edit_text("❌ Download failed. The file may be unavailable.")
 
 
 # ==========================================
-# MODULE REGISTRATION
+# 2. ANNA'S ARCHIVE ENGINE (/abook)
 # ==========================================
+def search_annas_archive(query: str, format_filter: Optional[str] = None) -> List[Book]:
+    """Search Anna's Archive with HTML block parsing."""
+    params = {"q": query}
+    if format_filter:
+        params["ext"] = format_filter.lower()
+        
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    for domain in ANNAS_DOMAINS:
+        try:
+            resp = session.get(f"https://{domain}/search", params=params, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                books = []
+                seen_md5s = set()
+                
+                for match in re.finditer(r'href="/(?:md5|slow_download)/([a-fA-F0-9]{32})"', resp.text):
+                    md5 = match.group(1)
+                    if md5 in seen_md5s:
+                        continue
+                    seen_md5s.add(md5)
+                    
+                    start = max(0, match.start() - 300)
+                    end = min(len(resp.text), match.end() + 1000)
+                    block = resp.text[start:end]
+                    
+                    title = "Unknown Title"
+                    title_match = re.search(r'href="/(?:md5|slow_download)/[a-fA-F0-9]{32}"[^>]*>(.*?)</a>', block, re.DOTALL)
+                    if title_match:
+                        raw_t = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                        if raw_t and raw_t.lower() not in ["download", "slow download"]:
+                            title = raw_t
+                            
+                    author = "Unknown Author"
+                    author_match = re.search(r'<div[^>]*class="[^"]*text-gray-[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+                    if not author_match:
+                        author_match = re.search(r'<div[^>]*class="[^"]*italic[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+                    if author_match:
+                        raw_a = re.sub(r'<[^>]+>', '', author_match.group(1)).strip()
+                        if raw_a and not any(unit in raw_a.upper() for unit in ["MB", "GB", "PDF", "EPUB"]):
+                            author = raw_a
+
+                    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', block)
+                    year = year_match.group(1) if year_match else ""
+
+                    formats = set(f.lower() for f in re.findall(r'\b(pdf|epub|mobi|azw3|djvu)\b', block, re.IGNORECASE))
+                    if not formats:
+                        formats = {"epub"}
+
+                    files = [BookFile(extension=fmt) for fmt in formats]
+                    books.append(Book(md5=md5, title=title[:100], author=author[:80], year=year, files=files))
+                    
+                    if len(books) >= 20:
+                        break
+                if books:
+                    return books
+        except Exception:
+            continue
+    raise Exception("Could not reach active archive networks.")
+
+def get_abook_download_url(md5: str) -> Optional[str]:
+    """Tiered fallback extraction for mirror links."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    for domain in ANNAS_DOMAINS:
+        try:
+            resp = session.get(f"https://{domain}/slow_download/{md5}", headers=headers, timeout=15)
+            if resp.status_code == 200:
+                all_links = re.findall(r'href="(https?://[^"]+)"', resp.text)
+                for link in all_links:
+                    if any(ext in link.lower() for ext in ['.epub', '.pdf', '.mobi']) and 'annas-archive' not in link.lower():
+                        return link
+                for link in all_links:
+                    if any(kw in link.lower() for kw in ['library.lol', 'libgen', 'ipfs']) and 'annas-archive' not in link.lower():
+                        return link
+                return f"https://{domain}/md5/{md5}"
+        except Exception:
+            continue
+    return None
+
+@run_async
+def abook_command(bot, update: Update, args):
+    """Search for books on Anna's Archive."""
+    msg = update.effective_message
+    if not args:
+        msg.reply_text(
+            "📚 *Anna's Archive Search*\n\n"
+            "Search and download any book directly.\n"
+            "Example: `/abook Franz Kafka`\n\n"
+            "Filter by format:\n"
+            "`/abook Franz Kafka --format epub`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    cleanup_caches()
+    query = ' '.join(args)
+    format_filter = None
+    format_match = re.search(r'--format\s+(\w+)', query, re.IGNORECASE)
+    if format_match:
+        format_filter = format_match.group(1)
+        query = re.sub(r'--format\s+\w+', '', query).strip()
+    
+    status_msg = msg.reply_text(f"🔍 Searching Anna's Archive for '{query}'...")
+    
+    try:
+        books = search_annas_archive(query, format_filter)
+        if not books:
+            status_msg.edit_text("😕 No results found. Try different keywords.")
+            return
+        
+        ABOOK_RESULTS[status_msg.message_id] = books
+        CACHE_TIMESTAMPS[status_msg.message_id] = time.time()
+        
+        keyboard = []
+        for i, book in enumerate(books[:10]):
+            formats = book.get_available_formats()
+            format_str = ', '.join(f.upper() for f in formats[:2])
+            button_text = f"{i+1}. {book.title} | {book.author} [{format_str}]"
+            if len(button_text) > 60:
+                button_text = button_text[:57] + "..."
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"ab_opt_{status_msg.message_id}_{i}")])
+        
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="ab_cancel")])
+        
+        status_msg.edit_text(
+            f"📚 Found {len(books)} books. Select one to download:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except Exception as e:
+        LOGGER.error(f"ABook Search error: {e}")
+        status_msg.edit_text(f"❌ Error: {str(e)}")
+
+@run_async
+def abook_menu_callback(bot, update: Update):
+    """Handle Anna's Archive book selection menus."""
+    query = update.callback_query
+    
+    if query.data == "ab_cancel":
+        query.edit_message_text("❌ Search cancelled.")
+        query.answer()
+        return
+
+    # Handle Back button
+    if query.data.startswith("ab_back_"):
+        _, msg_id_str = query.data.split("_", 2)[1:]
+        msg_id = int(msg_id_str)
+        books = ABOOK_RESULTS.get(msg_id)
+        if not books:
+            query.answer("Search expired.", show_alert=True)
+            return
+            
+        keyboard = []
+        for i, book in enumerate(books[:10]):
+            formats = book.get_available_formats()
+            format_str = ', '.join(f.upper() for f in formats[:2])
+            button_text = f"{i+1}. {book.title} | {book.author} [{format_str}]"
+            if len(button_text) > 60:
+                button_text = button_text[:57] + "..."
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"ab_opt_{msg_id}_{i}")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="ab_cancel")])
+        
+        query.edit_message_text(
+            f"📚 Found {len(books)} books. Select one to download:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Handle Format Selection Menu
+    if query.data.startswith("ab_opt_"):
+        _, _, msg_id_str, idx_str = query.data.split("_", 3)
+        msg_id, idx = int(msg_id_str), int(idx_str)
+        
+        books = ABOOK_RESULTS.get(msg_id)
+        if not books or idx >= len(books):
+            query.answer("Search has expired. Please run /abook again.", show_alert=True)
+            return
+        
+        book = books[idx]
+        formats = book.get_available_formats()
+        
+        keyboard = []
+        row_btns = []
+        for fmt_idx, fmt in enumerate(formats):
+            btn = InlineKeyboardButton(f"📄 {fmt.upper()}", callback_data=f"ab_dl_{msg_id}_{idx}_{fmt_idx}")
+            row_btns.append(btn)
+            if len(row_btns) == 2:
+                keyboard.append(row_btns)
+                row_btns = []
+        if row_btns:
+            keyboard.append(row_btns)
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f"ab_back_{msg_id}")])
+        
+        query.edit_message_text(
+            f"*{book.title}*\n\n"
+            f"✍️ *Author:* {book.author}\n"
+            f"📅 *Year:* {book.year or 'N/A'}\n\n"
+            f"Select format to download:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+@run_async
+def abook_dl_callback(bot, update: Update):
+    """Handle actual download execution for Anna's Archive."""
+    query = update.callback_query
+    _, _, msg_id_str, idx_str, fmt_idx_str = query.data.split("_", 4)
+    msg_id, idx, fmt_idx = int(msg_id_str), int(idx_str), int(fmt_idx_str)
+    
+    books = ABOOK_RESULTS.get(msg_id)
+    if not books or idx >= len(books):
+        query.answer("Search expired.", show_alert=True)
+        return
+    
+    book = books[idx]
+    formats = book.get_available_formats()
+    selected_format = formats[fmt_idx]
+    
+    query.answer(f"Downloading {selected_format.upper()}...")
+    status_msg = query.message.edit_text(f"⬇️ Downloading '{book.title}' [{selected_format.upper()}] to server...")
+    
+    try:
+        download_url = get_abook_download_url(book.md5)
+        if not download_url:
+            status_msg.edit_text("❌ Failed to extract direct download link from archive.")
+            return
+            
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = session.get(download_url, headers=headers, stream=True, timeout=45)
+        content = resp.content
+
+        # Guard against HTML captchas
+        if content.startswith(b'<!DOCTYPE') or b'captcha' in content[:500].lower():
+            status_msg.edit_text(f"❌ Mirror blocked request.\n\n[Open in Browser](https://annas-archive.org/md5/{book.md5})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            return
+
+        size = len(content)
+        if size > MAX_FILE_SIZE:
+            status_msg.edit_text(f"⚠️ File exceeds Telegram's 50MB limit.\n\n[Download Directly]({download_url})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            return
+
+        status_msg.edit_text("Uploading book to Telegram...")
+        
+        file_obj = io.BytesIO(content)
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", book.title).replace(" ", "_")
+        file_obj.name = f"{safe_title}.{selected_format}"
+        file_obj.seek(0)
+        
+        bot.send_document(
+            chat_id=query.message.chat_id,
+            document=file_obj,
+            filename=file_obj.name,
+            caption=f"📚 *{book.title}*\n✍️ *Author:* {book.author}\n📄 *Format:* {selected_format.upper()}",
+            parse_mode=ParseMode.MARKDOWN,
+            timeout=120
+        )
+        status_msg.delete()
+        
+    except Exception as e:
+        LOGGER.error(f"[ABook DL Error] {e}")
+        status_msg.edit_text(f"❌ Download stream failed.\n\n[Mirror Link](https://annas-archive.org/md5/{book.md5})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+
+# ==========================================
+# MODULE REGISTRATION & HANDLERS
+# ==========================================
+# /book Handlers
+BOOK_HANDLER = DisableAbleCommandHandler("book", book_command, pass_args=True)
+OPENLIB_CB_HANDLER = CallbackQueryHandler(openlib_callback, pattern=r"^ol_")
+
+# /abook Handlers
+ABOOK_HANDLER = DisableAbleCommandHandler("abook", abook_command, pass_args=True)
+ABOOK_MENU_HANDLER = CallbackQueryHandler(abook_menu_callback, pattern=r"^ab_(opt|cancel|back)_")
+ABOOK_DL_HANDLER = CallbackQueryHandler(abook_dl_callback, pattern=r"^ab_dl_")
+
+# Dispatcher Registration
+dispatcher.add_handler(BOOK_HANDLER)
+dispatcher.add_handler(OPENLIB_CB_HANDLER)
+dispatcher.add_handler(ABOOK_HANDLER)
+dispatcher.add_handler(ABOOK_MENU_HANDLER)
+dispatcher.add_handler(ABOOK_DL_HANDLER)
 
 __help__ = """
-Download ebooks directly to Telegram.
+📚 *Book Downloader Hub*
 
-*Available commands:*
- - /book <title or author>: Searches Open Library public domain scans with interactive selection.
- - /piratebook <title or author>: Hybrid search with strict partner mirror extraction and binary file validation.
+*Public Domain Library:*
+- `/book <title>`: Search and download public domain books & classics safely.
+
+*Anna's Archive Network:*
+- `/abook <title>`: Search the global archive network.
+- `/abook <title> --format epub`: Filter specific formats.
 """
 
 __mod_name__ = "Books"
 
-BOOK_HANDLER = DisableAbleCommandHandler("book", book, pass_args=True)
-PIRATEBOOK_HANDLER = DisableAbleCommandHandler("piratebook", piratebook, pass_args=True)
-BOOK_BTN_HANDLER = CallbackQueryHandler(book_callback, pattern=r'^b_(pg|dl)\|')
-
-dispatcher.add_handler(BOOK_HANDLER)
-dispatcher.add_handler(PIRATEBOOK_HANDLER)
-dispatcher.add_handler(BOOK_BTN_HANDLER)
+LOGGER.info("Books module loaded successfully!")
