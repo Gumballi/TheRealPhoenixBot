@@ -75,7 +75,7 @@ def start(bot: Bot, update: Update):
             [
                 InlineKeyboardButton(
                     text=f"Add {bot_name} to your group.",
-                    url="http://t.me/TheRealPhoenixRestoredbot?startgroup=botstart"
+                    url="http://t.me/ThyRealPhoenixBot?startgroup=botstart"
                 )
             ]
         ]
