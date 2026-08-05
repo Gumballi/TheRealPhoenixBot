@@ -197,7 +197,6 @@ def bookinfo_callback(bot, update: Update):
         query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         
     elif action == "dl":
-        # THE BRIDGE: Sends the BookInfo metadata straight into the LibGen engine
         book = results[idx]
         search_query = f"{book['title']} {book['author']}"
         query.answer("Searching LibGen...")
@@ -352,7 +351,8 @@ def openlib_callback(bot, update: Update):
             resp = session.get(dl_url, stream=True, timeout=45)
             
             file_obj = io.BytesIO(resp.content)
-            file_obj.name = f"{re.sub(r'[\\/*?:<>|]', '', item['title']).replace(' ', '_')}.{ext}"
+            safe_title = re.sub(r'[\\/*?:<>|]', '', item['title']).replace(' ', '_')
+            file_obj.name = f"{safe_title}.{ext}"
             file_obj.seek(0)
             
             status_msg.edit_text("Uploading to Telegram...")
@@ -603,6 +603,7 @@ def abook_dl_callback(bot, update: Update):
             status_msg.delete()
             
         except Exception as e:
+            LOGGER.error(f"Download stream error: {e}")
             status_msg.edit_text(f"❌ Download failed.\n\n[Try Direct Link]({download_url})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
             
     except Exception as e:
@@ -647,4 +648,4 @@ __help__ = """
 
 __mod_name__ = "Books"
 
-LOGGER.info("Books module loaded successfully (LibGen + BookInfo Engine Active)!")
+LOGGER.info("Books module loaded successfully!")
