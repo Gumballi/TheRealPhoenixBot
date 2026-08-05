@@ -24,6 +24,7 @@ CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
 CACHE_MAX_ENTRIES = 500
 
 def clean_cache():
+    """Evict expired entries individually instead of wiping everyone's session at once."""
     now = time.time()
     expired = [sid for sid, data in SEARCH_CACHE.items() if now - data["created"] > CACHE_TTL_SECONDS]
     for sid in expired:
@@ -167,7 +168,6 @@ def do_openlib_download(bot: Bot, msg, item: dict):
         dl_url = None
         ext = "txt"
         
-        # Prioritize epub, fallback to pdf, forcing load-balanced base router to prevent 500 node errors
         for f in files:
             if f.get("name", "").endswith(".epub"):
                 dl_url = f"https://archive.org/download/{ia_id}/{f['name']}"
@@ -225,12 +225,11 @@ def do_openlib_download(bot: Bot, msg, item: dict):
 
 
 # ==========================================
-# ANNA'S ARCHIVE (ACTIVE DOMAINS ROTATION)
+# ANNA'S ARCHIVE (SHADOW LIBRARY)
 # ==========================================
 class AnnasArchiveFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[List[dict]]:
-        # Using working active domains to bypass the dead .org domainHold status
         domains = ["annas-archive.gl", "annas-archive.pk", "annas-archive.gd", "annas-archive.se"]
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         
@@ -254,10 +253,21 @@ class AnnasArchiveFetcher:
                     if not clean_title or len(clean_title) < 2:
                         clean_title = query
                         
+                    # Dynamically extract author text from the snippet following the title link
+                    start_pos = item.end()
+                    snippet = resp.text[start_pos:start_pos + 400]
+                    
+                    author = "Unknown Author"
+                    author_match = re.search(r'<div[^>]*class="[^"]*text-gray-[^"]*"[^>]*>(.*?)</div>', snippet, re.DOTALL)
+                    if author_match:
+                        raw_author = re.sub(r'<[^>]+>', '', author_match.group(1)).strip()
+                        if raw_author and len(raw_author) < 80:
+                            author = raw_author
+                            
                     books.append({
                         "md5": md5,
                         "title": clean_title[:100],
-                        "author": "Unknown Author",
+                        "author": author,
                         "ext": "epub"
                     })
                     if len(books) >= 25:
@@ -327,7 +337,17 @@ def do_annas_download(bot: Bot, msg, item: dict):
         dl_url = f"https://annas-archive.gl/slow_download/{md5}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
-        page_resp = requests.get(dl_url, headers=headers, timeout=20)
+        page_resp = None
+        for attempt in range(3):
+            page_resp = requests.get(dl_url, headers=headers, timeout=20)
+            if "Flood control exceeded" in page_resp.text or page_resp.status_code == 429:
+                if attempt < 2:
+                    time.sleep(4)
+                    continue
+            break
+            
+        if page_resp is None or "Flood control exceeded" in page_resp.text:
+            raise Exception("Flood control exceeded. Please try again in a few moments.")
         
         file_link_match = re.search(r'href="(https?://[^"]+)"[^>]*>Download pilihan|href="(https?://[^"]+\.(epub|pdf|mobi)[^"]*)"', page_resp.text, re.IGNORECASE)
         if not file_link_match:
@@ -370,7 +390,7 @@ def do_annas_download(bot: Bot, msg, item: dict):
         safe_err = str(e).replace("<", "[").replace(">", "]")
         LOGGER.error(f"[Annas DL Error] {safe_err}")
         msg.edit_text(
-            f"Direct download stream failed.\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
+            f"Direct download stream failed due to rate limiting.\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
             parse_mode=ParseMode.HTML, 
             disable_web_page_preview=True
         )
