@@ -229,7 +229,6 @@ def do_openlib_download(bot: Bot, msg, item: dict):
 class PirateBookFetcher:
     @staticmethod
     def search_books(query: str) -> Optional[List[dict]]:
-        # Uses Open Library unrestricted JSON API for 100% reliable titles and authors
         search_url = "https://openlibrary.org/search.json"
         try:
             resp = requests.get(search_url, params={"q": query, "limit": 30}, timeout=15)
@@ -248,7 +247,7 @@ class PirateBookFetcher:
                 books.append({
                     "title": title,
                     "author": authors,
-                    "ext": "file"
+                    "ext": "epub"
                 })
         return books
 
@@ -307,7 +306,6 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         
         md5 = None
-        block = ""
         for domain in domains:
             try:
                 search_url = f"https://{domain}/search"
@@ -316,9 +314,6 @@ def do_pirate_download(bot: Bot, msg, item: dict):
                     match = re.search(r'href="/(?:md5|slow_download)/([a-fA-F0-9]{32})"', resp.text)
                     if match:
                         md5 = match.group(1)
-                        start = max(0, match.start() - 200)
-                        end = min(len(resp.text), match.end() + 600)
-                        block = resp.text[start:end]
                         break
             except Exception:
                 continue
@@ -327,24 +322,10 @@ def do_pirate_download(bot: Bot, msg, item: dict):
             msg.edit_text("Could not find a downloadable file hash for this book.")
             return
 
-        # Dynamically detect format from Anna's Archive result block during download
-        ext = "epub"
-        block_lower = block.lower()
-        if "pdf" in block_lower:
-            ext = "pdf"
-        elif "mobi" in block_lower:
-            ext = "mobi"
-        elif "azw3" in block_lower:
-            ext = "azw3"
-        elif "djvu" in block_lower:
-            ext = "djvu"
-        elif "epub" in block_lower:
-            ext = "epub"
-
-        dl_url = f"https://annas-archive.gl/slow_download/{md5}"
+        dl_page_url = f"https://annas-archive.gl/slow_download/{md5}"
         page_resp = None
         for attempt in range(3):
-            page_resp = requests.get(dl_url, headers=headers, timeout=20)
+            page_resp = requests.get(dl_page_url, headers=headers, timeout=20)
             if "Flood control exceeded" in page_resp.text or page_resp.status_code == 429:
                 if attempt < 2:
                     time.sleep(4)
@@ -354,23 +335,25 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         if page_resp is None or "Flood control exceeded" in page_resp.text:
             raise Exception("Flood control exceeded. Please try again in a few moments.")
         
+        # Strictly extract valid partner download links (preventing landing page fallbacks)
         all_links = re.findall(r'href="(https?://[^"]+)"', page_resp.text)
         actual_dl = None
         for link in all_links:
-            if any(partner in link.lower() for partner in ['library.lol', 'libgen', 'ipfs', 'cloudflare', 'booksdl', 'b-ok']):
+            link_lower = link.lower()
+            if any(partner in link_lower for partner in ['library.lol/main/', 'libgen.is/get', 'libgen.li', 'ipfs.io', 'cloudflare-ipfs.com', 'dl.booksdl.org']):
                 actual_dl = link
                 break
                 
         if not actual_dl:
-            actual_dl = f"https://annas-archive.gl/md5/{md5}"
+            raise Exception("Could not extract a direct file mirror link from the archive page.")
 
         msg.edit_text("Downloading file to server...")
         resp = requests.get(actual_dl, headers=headers, stream=True, timeout=45)
         content = resp.content
 
-        # Content guardrail against HTML error pages or captchas
-        if content.startswith(b'<!DOCTYPE') or content.startswith(b'<html') or b'captcha' in content.lower():
-            raise Exception("Mirror served an error page or CAPTCHA instead of the book.")
+        # Strict Guardrail: Prevent saving HTML error pages, Cloudflare challenges, or landing pages as books
+        if content.startswith(b'<!DOCTYPE') or content.startswith(b'<html') or b'<head' in content[:100].lower() or b'captcha' in content.lower():
+            raise Exception("The mirror served an HTML landing page instead of a binary book file.")
 
         size = len(content)
         if size > 50 * 1024 * 1024:
@@ -381,6 +364,13 @@ def do_pirate_download(bot: Bot, msg, item: dict):
                 disable_web_page_preview=True
             )
             return
+
+        # Sniff actual extension from direct link or fallback to epub
+        ext = "epub"
+        for possible_ext in ["pdf", "epub", "mobi", "azw3", "djvu"]:
+            if possible_ext in actual_dl.lower():
+                ext = possible_ext
+                break
 
         file_obj = io.BytesIO(content)
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title).replace(" ", "_")
@@ -400,7 +390,7 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         safe_err = str(e).replace("<", "[").replace(">", "]")
         LOGGER.error(f"[Pirate DL Error] {safe_err}")
         msg.edit_text(
-            f"Download stream failed or mirror blocked the request.\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
+            f"Download failed: {safe_err}\n\n<b>Mirror Link:</b> <a href='https://annas-archive.gl/md5/{md5}'>Open on Anna's Archive</a>", 
             parse_mode=ParseMode.HTML, 
             disable_web_page_preview=True
         )
@@ -472,7 +462,7 @@ Download ebooks directly to Telegram.
 
 *Available commands:*
  - /book <title or author>: Searches Open Library public domain scans with interactive selection.
- - /piratebook <title or author>: Hybrid search using Open Library for clean titles/authors and archive bridge for downloads.
+ - /piratebook <title or author>: Hybrid search with strict partner mirror extraction and binary file validation.
 """
 
 __mod_name__ = "Books"
