@@ -225,7 +225,7 @@ def do_openlib_download(bot: Bot, msg, item: dict):
 
 
 # ==========================================
-# ANNA'S ARCHIVE (SHADOW LIBRARY)
+# ANNA'S ARCHIVE (ROBUST BLOCK WINDOW SCRAPER)
 # ==========================================
 class AnnasArchiveFetcher:
     @staticmethod
@@ -243,31 +243,48 @@ class AnnasArchiveFetcher:
                 books = []
                 seen_md5s = set()
                 
-                for item in re.finditer(r'href="/(md5|slow_download)/([a-fA-F0-9]{32})"[^>]*>(.*?)</a>', resp.text, re.DOTALL):
-                    _, md5, raw_title_html = item.groups()
+                # Scan for MD5 links and extract local context blocks
+                for match in re.finditer(r'href="/(?:md5|slow_download)/([a-fA-F0-9]{32})"', resp.text):
+                    md5 = match.group(1)
                     if md5 in seen_md5s:
                         continue
                     seen_md5s.add(md5)
                     
-                    clean_title = re.sub(r'<[^>]+>', '', raw_title_html).strip()
-                    if not clean_title or len(clean_title) < 2:
-                        clean_title = query
-                        
-                    # Dynamically extract author text from the snippet following the title link
-                    start_pos = item.end()
-                    snippet = resp.text[start_pos:start_pos + 400]
+                    # Extract local HTML window around this match
+                    start = max(0, match.start() - 400)
+                    end = min(len(resp.text), match.end() + 1200)
+                    block = resp.text[start:end]
                     
+                    # Extract Title safely from link or heading inside the block
+                    title = "Unknown Title"
+                    title_match = re.search(r'href="/(?:md5|slow_download)/[a-fA-F0-9]{32}"[^>]*>(.*?)</a>', block, re.DOTALL)
+                    if title_match:
+                        raw_t = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                        if raw_t and len(raw_t) > 1 and not raw_t.lower() in ["download", "slow download", "fast download"]:
+                            title = raw_t
+                            
+                    if title == "Unknown Title":
+                        h_match = re.search(r'<h[234][^>]*>(.*?)</h[234]>', block, re.DOTALL)
+                        if h_match:
+                            raw_h = re.sub(r'<[^>]+>', '', h_match.group(1)).strip()
+                            if raw_h and len(raw_h) > 1:
+                                title = raw_h
+
+                    # Extract Author safely from styling classes within the block
                     author = "Unknown Author"
-                    author_match = re.search(r'<div[^>]*class="[^"]*text-gray-[^"]*"[^>]*>(.*?)</div>', snippet, re.DOTALL)
+                    author_match = re.search(r'<div[^>]*class="[^"]*text-gray-[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+                    if not author_match:
+                        author_match = re.search(r'<div[^>]*class="[^"]*italic[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+                        
                     if author_match:
-                        raw_author = re.sub(r'<[^>]+>', '', author_match.group(1)).strip()
-                        if raw_author and len(raw_author) < 80:
-                            author = raw_author
+                        raw_a = re.sub(r'<[^>]+>', '', author_match.group(1)).strip()
+                        if raw_a and len(raw_a) < 100 and not "MB" in raw_a and not "GB" in raw_a:
+                            author = raw_a
                             
                     books.append({
                         "md5": md5,
-                        "title": clean_title[:100],
-                        "author": author,
+                        "title": title[:100],
+                        "author": author[:80],
                         "ext": "epub"
                     })
                     if len(books) >= 25:
@@ -290,7 +307,7 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
 
     if not query:
         msg.reply_text(
-            "Please specify a book title.\n<b>Usage:</b> <code>/piratebook 1984 George Orwell</code>",
+            "Please specify a book title or author!\n<b>Usage:</b> <code>/piratebook Franz Kafka</code>",
             parse_mode=ParseMode.HTML,
         )
         return
