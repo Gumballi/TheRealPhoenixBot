@@ -299,7 +299,6 @@ def piratebook(bot: Bot, update: Update, args: List[str]):
 def do_pirate_download(bot: Bot, msg, item: dict):
     title = item["title"]
     author = item["author"]
-    ext = item["ext"]
     search_query = f"{title} {author}"
 
     try:
@@ -337,16 +336,23 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         if page_resp is None or "Flood control exceeded" in page_resp.text:
             raise Exception("Flood control exceeded. Please try again in a few moments.")
         
-        file_link_match = re.search(r'href="(https?://[^"]+)"[^>]*>Download pilihan|href="(https?://[^"]+\.(epub|pdf|mobi)[^"]*)"', page_resp.text, re.IGNORECASE)
+        # Dynamically detect real extension from Anna's Archive download page link
+        ext = "epub" # default fallback
+        file_link_match = re.search(r'href="(https?://[^"]+)"[^>]*>Download pilihan|href="(https?://[^"]+\.(epub|pdf|mobi|azw3|djvu)[^"]*)"', page_resp.text, re.IGNORECASE)
         if not file_link_match:
             file_link_match = re.search(r'href="(https?://(gen\.lib\.rus\.ec|library\.lol|dl\.booksdl\.org|cloudflare-ipfs\.com)[^"]+)"', page_resp.text)
             
         if file_link_match:
             actual_dl = [g for g in file_link_match.groups() if g and g.startswith('http')][0]
+            # Sniff extension from the target URL string if present
+            for possible_ext in ["pdf", "epub", "mobi", "azw3", "djvu"]:
+                if possible_ext in actual_dl.lower():
+                    ext = possible_ext
+                    break
         else:
             actual_dl = f"https://annas-archive.gl/md5/{md5}"
 
-        msg.edit_text("Downloading file to server...")
+        msg.edit_text(f"Downloading [{ext.upper()}] file to server...")
         resp = requests.get(actual_dl, headers=headers, stream=True, timeout=45)
         
         size = int(resp.headers.get("Content-Length", 0))
@@ -368,7 +374,7 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         msg.edit_text("Uploading book to Telegram...")
         msg.reply_document(
             document=file_obj,
-            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\n\nDownloaded via @{bot.username}",
+            caption=f"<b>{html.escape(title)}</b>\nAuthor: {html.escape(author)}\nFormat: <code>{ext.upper()}</code>\n\nDownloaded via @{bot.username}",
             parse_mode=ParseMode.HTML,
             timeout=120
         )
@@ -378,7 +384,6 @@ def do_pirate_download(bot: Bot, msg, item: dict):
         safe_err = str(e).replace("<", "[").replace(">", "]")
         LOGGER.error(f"[Pirate DL Error] {safe_err}")
         msg.edit_text("Download stream failed. The archive mirror may be experiencing high traffic.")
-
 
 # ==========================================
 # CALLBACK HANDLER
