@@ -28,143 +28,183 @@ LOGGER = logging.getLogger(__name__)
 NIGHT_API_KEY = os.environ.get("NIGHT_API_KEY")
 NIGHT_API_URL = "https://api.night-api.com/images/nsfw"
 
-# ==========================================
-# ADVANCED TAG ALL DATABASE (Thread-Safe)
-# ==========================================
-TAG_DB_PATH = "tagall_cache.db"
-CACHE_TIMEOUT_DAYS = 7  # Remove users not seen in 7 days
-
-class TagDB:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._init_db()
-    
-    def _init_db(self):
-        with self._get_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS chat_users (
-                    chat_id INTEGER,
-                    user_id INTEGER,
-                    first_name TEXT,
-                    username TEXT,
-                    last_seen TIMESTAMP,
-                    PRIMARY KEY (chat_id, user_id)
-                )
-            """)
-            # Cache for fast lookup
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_users ON chat_users(chat_id)")
-            conn.commit()
-    
-    def _get_conn(self):
-        return sqlite3.connect(TAG_DB_PATH, timeout=10)
-    
-    def add_user(self, chat_id: int, user_id: int, first_name: str, username: str = None):
-        """Add or update a user."""
-        with self._lock:
-            with self._get_conn() as conn:
-                conn.execute(
-                    """INSERT OR REPLACE INTO chat_users 
-                       (chat_id, user_id, first_name, username, last_seen) 
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (chat_id, user_id, first_name[:50], username, datetime.now())
-                )
-                conn.commit()
-    
-    def add_users_batch(self, chat_id: int, users: List[Tuple[int, str, str]]):
-        """Add multiple users at once (e.g., when bot joins group)."""
-        with self._lock:
-            with self._get_conn() as conn:
-                for user_id, first_name, username in users:
-                    conn.execute(
-                        """INSERT OR REPLACE INTO chat_users 
-                           (chat_id, user_id, first_name, username, last_seen) 
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (chat_id, user_id, first_name[:50], username, datetime.now())
-                    )
-                conn.commit()
-    
-    def get_users(self, chat_id: int) -> List[Tuple[int, str]]:
-        """Get all active users in a chat."""
-        with self._lock:
-            with self._get_conn() as conn:
-                cutoff = datetime.now() - timedelta(days=CACHE_TIMEOUT_DAYS)
-                cursor = conn.execute(
-                    """SELECT user_id, first_name FROM chat_users 
-                       WHERE chat_id = ? AND last_seen > ?
-                       ORDER BY last_seen DESC""",
-                    (chat_id, cutoff)
-                )
-                return cursor.fetchall()
-    
-    def cleanup(self):
-        """Remove users inactive for CACHE_TIMEOUT_DAYS."""
-        with self._lock:
-            with self._get_conn() as conn:
-                cutoff = datetime.now() - timedelta(days=CACHE_TIMEOUT_DAYS)
-                conn.execute("DELETE FROM chat_users WHERE last_seen < ?", (cutoff,))
-                conn.commit()
-
-db = TagDB()
-
-TAGGING_STATE = {}
-CHUNK_SIZE = 5
-CHUNK_DELAY = 2.5
-
-
-# ==========================================
-# CONSTANTS & LISTS
-# ==========================================
 SHRUGS = (
-    "┐(´д｀)┌", "┐(´～｀)┌", "┐(´ー｀)┌", "┐(￣ヘ￣)┌", "╮(╯∀╰)╭",
-    "╮(╯_╰)╭", "┐(´д`)┌", "┐(´∀｀)┌", "ʅ(́◡◝)ʃ", "┐(ﾟ～ﾟ)┌",
-    "┐('д')┌", "┐(‘～`;)┌", "ヘ(´－｀;)ヘ", "┐( -“-)┌", "ʅ（´◔౪◔）ʃ",
-    r"¯\_(ツ)_/¯", r"¯\_(⊙_ʖ⊙)_/¯", r"¯\_༼ ಥ ‿ ಥ ༽_/¯", "乁( ⁰͡  Ĺ̯ ⁰͡ ) ㄏ",
+    "┐(´д｀)┌",
+    "┐(´～｀)┌",
+    "┐(´ー｀)┌",
+    "┐(￣ヘ￣)┌",
+    "╮(╯∀╰)╭",
+    "╮(╯_╰)╭",
+    "┐(´д`)┌",
+    "┐(´∀｀)┌",
+    "ʅ(́◡◝)ʃ",
+    "┐(ﾟ～ﾟ)┌",
+    "┐('д')┌",
+    "┐(‘～`;)┌",
+    "ヘ(´－｀;)ヘ",
+    "┐( -“-)┌",
+    "ʅ（´◔౪◔）ʃ",
+    "ヽ(゜～゜o)ノ",
+    "ヽ(~～~ )ノ",
+    "┐(~ー~;)┌",
+    "┐(-。ー;)┌",
+    r"¯\_(ツ)_/¯",
+    r"¯\_(⊙_ʖ⊙)_/¯",
+    r"¯\_༼ ಥ ‿ ಥ ༽_/¯",
+    "乁( ⁰͡  Ĺ̯ ⁰͡ ) ㄏ",
 )
 
 HUGS = (
-    "⊂(・﹏・⊂)", "⊂(・ヮ・⊂)", "⊂(・▽・⊂)", "(っಠ‿ಠ)っ", "ʕっ•ᴥ•ʔっ",
-    "（っ・∀・）っ", "(っ⇀⑃↼)っ", "(つ´∀｀)つ", "(.づσ▿σ)づ.",
-    "⊂(´・ω・｀⊂)", "(づ￣ ³￣)づ", "(.づ◡﹏◡)づ.",
+"⊂(・﹏・⊂)",
+"⊂(・ヮ・⊂)",
+"⊂(・▽・⊂)",
+"(っಠ‿ಠ)っ",
+"ʕっ•ᴥ•ʔっ",
+"（っ・∀・）っ",
+"(っ⇀⑃↼)っ",
+"(つ´∀｀)つ",
+"(.づσ▿σ)づ.",
+"⊂(´・ω・｀⊂)",
+"(づ￣ ³￣)づ",
+"(.づ◡﹏◡)づ.",
 )
 
-TOSS = ("The coin landed on heads.", "The coin landed on tails.")
+TOSS = (
+"The coin landed on heads.",
+"The coin landed on tails."
+)
 
 REACTS = (
-    "ʘ‿ʘ", "ヾ(-_- )ゞ", "(っ˘ڡ˘ς)", "(´ж｀ς)", "( ಠ ʖ̯ ಠ)",
-    "(° ͜ʖ͡°)╭∩╮", "(ᵟຶ︵ ᵟຶ)", "(งツ)ว", "ʚ(•｀", "(っ▀¯▀)つ",
-    "(◠﹏◠)", "( ͡ಠ ʖ̯ ͡ಠ)", "( ఠ ͟ʖ ఠ)", "(∩｀-´)⊃━☆ﾟ.*･｡ﾟ",
-    "(⊃｡•́‿•̀｡)⊃", "(._.)", "{•̃_•̃}", "(ᵔᴥᵔ)", "♨_♨",
-    "(☞ﾟヮﾟ)☞", "[¬º-°]¬", "(Ծ‸ Ծ)", "(•̀ᴗ•́)و ̑̑", "ヾ(´〇`)ﾉ♪♪♪",
-    "ಠ_ಠ", "(´･_･`)", "ᕦ(ò_óˇ)ᕤ", "⊙﹏⊙", "(╯°□°）╯︵ ┻━┻",
-    r"¯\_(⊙︿⊙)_/¯", "٩◔̯◔۶", "°‿‿°", "ᕙ(⇀‸↼‶)ᕗ", "⊂(◉‿◉)つ",
-    "( ͡° ͜ʖ ͡°)", "┬─┬﻿ ノ( ゜-゜ノ)", "ヽ(´ー｀)ノ", "☜(⌒▽⌒)☞",
+    "ʘ‿ʘ",
+    "ヾ(-_- )ゞ",
+    "(っ˘ڡ˘ς)",
+    "(´ж｀ς)",
+    "( ಠ ʖ̯ ಠ)",
+    "(° ͜ʖ͡°)╭∩╮",
+    "(ᵟຶ︵ ᵟຶ)",
+    "(งツ)ว",
+    "ʚ(•｀",
+    "(っ▀¯▀)つ",
+    "(◠﹏◠)",
+    "( ͡ಠ ʖ̯ ͡ಠ)",
+    "( ఠ ͟ʖ ఠ)",
+    "(∩｀-´)⊃━☆ﾟ.*･｡ﾟ",
+    "(⊃｡•́‿•̀｡)⊃",
+    "(._.)",
+    "{•̃_•̃}",
+    "(ᵔᴥᵔ)",
+    "♨_♨",
+    "⥀.⥀",
+    "ح˚௰˚づ ",
+    "(҂◡_◡)",
+    "ƪ(ړײ)‎ƪ​​",
+    "(っ•́｡•́)♪♬",
+    "◖ᵔᴥᵔ◗ ♪ ♫ ",
+    "(☞ﾟヮﾟ)☞",
+    "[¬º-°]¬",
+    "(Ծ‸ Ծ)",
+    "(•̀ᴗ•́)و ̑̑",
+    "ヾ(´〇`)ﾉ♪♪♪",
+    "(ง'̀-'́)ง",
+    "ლ(•́•́ლ)",
+    "ʕ •́؈•̀ ₎",
+    "♪♪ ヽ(ˇ∀ˇ )ゞ",
+    "щ（ﾟДﾟщ）",
+    "( ˇ෴ˇ )",
+    "눈_눈",
+    "(๑•́ ₃ •̀๑) ",
+    "( ˘ ³˘)♥ ",
+    "ԅ(≖‿≖ԅ)",
+    "♥‿♥",
+    "◔_◔",
+    "⁽⁽ଘ( ˊᵕˋ )ଓ⁾⁾",
+    "乁( ◔ ౪◔)「     ┑(￣Д ￣)┍",
+    "( ఠൠఠ )ﾉ",
+    "٩(๏_๏)۶",
+    "┌(ㆆ㉨ㆆ)ʃ",
+    "ఠ_ఠ",
+    "(づ｡◕‿‿◕｡)づ",
+    "(ノಠ ∩ಠ)ノ彡( \\o°o)\\",
+    "“ヽ(´▽｀)ノ”",
+    "༼ ༎ຶ ෴ ༎ຶ༽",
+    "｡ﾟ( ﾟஇ‸இﾟ)ﾟ｡",
+    "(づ￣ ³￣)づ",
+    "(⊙.☉)7",
+    "ᕕ( ᐛ )ᕗ",
+    "t(-_-t)",
+    "(ಥ⌣ಥ)",
+    "ヽ༼ ಠ益ಠ ༽ﾉ",
+    "༼∵༽ ༼⍨༽ ༼⍢༽ ༼⍤༽",
+    "ミ●﹏☉ミ",
+    "(⊙_◎)",
+    "¿ⓧ_ⓧﮌ",
+    "ಠ_ಠ",
+    "(´･_･`)",
+    "ᕦ(ò_óˇ)ᕤ",
+    "⊙﹏⊙",
+    "(╯°□°）╯︵ ┻━┻",
+    r"¯\_(⊙︿⊙)_/¯",
+    "٩◔̯◔۶",
+    "°‿‿°",
+    "ᕙ(⇀‸↼‶)ᕗ",
+    "⊂(◉‿◉)つ",
+    "V•ᴥ•V",
+    "q(❂‿❂)p",
+    "ಥ_ಥ",
+    "ฅ^•ﻌ•^ฅ",
+    "ಥ﹏ಥ",
+    "（ ^_^）o自自o（^_^ ）",
+    "ಠ‿ಠ",
+    "ヽ(´▽`)/",
+    "ᵒᴥᵒ#",
+    "( ͡° ͜ʖ ͡°)",
+    "┬─┬﻿ ノ( ゜-゜ノ)",
+    "ヽ(´ー｀)ノ",
+    "☜(⌒▽⌒)☞",
+    "ε=ε=ε=┌(;*´Д`)ﾉ",
+    "(╬ ಠ益ಠ)",
+    "┬─┬⃰͡ (ᵔᵕᵔ͜ )",
+    "┻━┻ ︵ヽ(`Д´)ﾉ︵﻿ ┻━┻",
+    "ʕᵔᴥᵔʔ",
+    "(`･ω･´)",
+    "ʕ•ᴥ•ʔ",
+    "ლ(｀ー´ლ)",
+    "ʕʘ̅͜ʘ̅ʔ",
+    "（ ﾟДﾟ）",
+    r"¯\(°_o)/¯",
+    "(｡◕‿◕｡)",
 )
 
 normiefont = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z']
 weebyfont = ['卂','乃','匚','刀','乇','下','厶','卄','工','丁','长','乚','从','𠘨','口','尸','㔿','尺','丂','丅','凵','リ','山','乂','丫','乙']
 
-# ==========================================
-# EXTRAS HANDLERS
-# ==========================================
+
 @run_async
 def shrug(bot: Bot, update: Update):
+    # reply to correct message 
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
     reply_text(random.choice(SHRUGS))
 
+
 @run_async
 def hug(bot: Bot, update: Update):
+    # reply to correct message 
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
     reply_text(random.choice(HUGS))
+    
     
 @run_async
 def toss(bot: Bot, update: Update):
      update.effective_message.reply_text(random.choice(TOSS))
 
+
 @run_async
 def react(bot: Bot, update: Update):
+     # reply to correct message 
     reply_text = update.effective_message.reply_to_message.reply_text if update.effective_message.reply_to_message else update.effective_message.reply_text
     reply_text(random.choice(REACTS))
     
+
 @run_async
 def shout(bot: Bot, update: Update, args):
     msg = "```"
@@ -180,6 +220,7 @@ def shout(bot: Bot, update: Update, args):
     msg = "```\n" + result + "```"
     return update.effective_message.reply_text(msg, parse_mode="MARKDOWN")
 
+
 @run_async
 def pat(bot: Bot, update: Update):
     chat_id = update.effective_chat.id
@@ -191,13 +232,15 @@ def pat(bot: Bot, update: Update):
     msg_id = update.effective_message.reply_to_message.message_id if update.effective_message.reply_to_message else update.effective_message.message_id
     pats = []
     pats = json.loads(urllib.request.urlopen(urllib.request.Request(
-    '[http://headp.at/js/pats.json](http://headp.at/js/pats.json)',
-    headers={'User-Agent': 'Mozilla/5.0 (X11; U; Linux i686) Gecko/20071127 Firefox/2.0.0.11'}
+    'http://headp.at/js/pats.json',
+    headers={'User-Agent': 'Mozilla/5.0 (X11; U; Linux i686) '
+         'Gecko/20071127 Firefox/2.0.0.11'}
     )).read().decode('utf-8'))
     if "@" in msg and len(msg) > 5:
         bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', caption=msg)
     else:
         bot.send_photo(chat_id, f'https://headp.at/pats/{urllib.parse.quote(random.choice(pats))}', reply_to_message_id=msg_id)
+
 
 @run_async
 def spank(bot: Bot, update: Update):
@@ -205,10 +248,12 @@ def spank(bot: Bot, update: Update):
     msg = update.effective_message
     sender = update.effective_user.first_name
     
+    # Identify target (either who we are replying to or who is mentioned)
     target = ""
     if msg.reply_to_message:
         target = msg.reply_to_message.from_user.first_name
     else:
+        # Check for arguments/tags following /spank
         args = msg.text.split(" ", 1)
         if len(args) > 1:
             target = args[1].strip()
@@ -216,7 +261,7 @@ def spank(bot: Bot, update: Update):
     try:
         req = urllib.request.Request(
             'https://nekos.best/api/v2/slap',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0'}
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -228,12 +273,23 @@ def spank(bot: Bot, update: Update):
         msg.reply_text("Failed to fetch a reaction GIF from the web API. Try again shortly!")
         return
 
-    caption = f"⚡ *{sender}* spanked *{target}*!" if target else f"*{sender}* is looking around for someone to spank..."
+    # Build dynamic message
+    if target:
+        caption = f"⚡ *{sender}* spanked *{target}*!"
+    else:
+        caption = f"*{sender}* is looking around for someone to spank..."
+
+    # If replying, match the structure and target reply_to_message_id
     msg_id = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
     
     bot.send_document(
-        chat_id=chat_id, document=gif_url, caption=caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=msg_id
+        chat_id=chat_id,
+        document=gif_url,
+        caption=caption,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_to_message_id=msg_id
     )
+
 
 @run_async
 def cuddle(bot: Bot, update: Update):
@@ -241,6 +297,7 @@ def cuddle(bot: Bot, update: Update):
     msg = update.effective_message
     sender = update.effective_user.first_name
 
+    # Identify target (either who we are replying to or who is mentioned)
     target = ""
     if msg.reply_to_message:
         target = msg.reply_to_message.from_user.first_name
@@ -249,10 +306,11 @@ def cuddle(bot: Bot, update: Update):
         if len(args) > 1:
             target = args[1].strip()
 
+    # Call Nekos.best API to fetch a random cuddle GIF
     try:
         req = urllib.request.Request(
             'https://nekos.best/api/v2/cuddle',
-            headers={'User-Agent': 'TheRealPhoenixBot/1.0'}
+            headers={'User-Agent': 'TheRealPhoenixBot/1.0 (https://github.com/Gumballi/TheRealPhoenixBot-Restored)'}
         )
         res = urllib.request.urlopen(req, timeout=8)
         if res.status != 200:
@@ -264,11 +322,20 @@ def cuddle(bot: Bot, update: Update):
         msg.reply_text("Failed to fetch a cuddle GIF from the web API. Try again shortly!")
         return
 
-    caption = f"🤗 *{sender}* cuddled *{target}*!" if target else f"*{sender}* is looking around for someone to cuddle..."
+    # Build dynamic message
+    if target:
+        caption = f"🤗 *{sender}* cuddled *{target}*!"
+    else:
+        caption = f"*{sender}* is looking around for someone to cuddle..."
+
     msg_id = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
 
     bot.send_document(
-        chat_id=chat_id, document=gif_url, caption=caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=msg_id
+        chat_id=chat_id,
+        document=gif_url,
+        caption=caption,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_to_message_id=msg_id
     )
 
 @run_async
@@ -310,7 +377,8 @@ def kiss(bot: Bot, update: Update):
         return
 
     try:
-        api_url = "https://api.gifukai.com/kiss?type=mouth&pairing=fm" 
+        api_url = "https://api.gifukai.com/kiss?type=mouth&pairing=fm"
+        
         req = requests.get(api_url, timeout=8)
         if req.status_code == 200:
             data = req.json()
@@ -331,36 +399,48 @@ def kiss(bot: Bot, update: Update):
             msg_id = msg.reply_to_message.message_id if msg.reply_to_message else msg.message_id
 
             bot.send_animation(
-                chat_id=chat_id, animation=gif_url, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=msg_id
+                chat_id=chat_id,
+                animation=gif_url,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=msg_id
             )
         else:
             msg.reply_text("The API is currently unresponsive.")
     except Exception as e:
+        print(f"Kiss Command Error: {e}")
         msg.reply_text("An error occurred while fetching the animation.")
 
 @run_async
 def wiki(bot: Bot, update: Update):
-    msg = update.effective_message.reply_to_message if update.effective_message.reply_to_message else update.effective_message
+    msg = update.effective_message
     res = ""
     
-    if msg == update.effective_message:
+    # Check if replying to a message
+    if msg.reply_to_message:
+        search = msg.reply_to_message.text
+    else:
         parts = msg.text.split(" ", maxsplit=1)
         if len(parts) < 2:
             update.effective_message.reply_text("Please provide a search term! Example: /wiki Python (programming language)")
             return
         search = parts[1]
-    else:
-        search = msg.text
 
     try:
-        res = wikipedia.summary(search, sentences=3) 
+        res = wikipedia.summary(search, sentences=3)
     except DisambiguationError as e:
-        update.effective_message.reply_text(f"<b>Disambiguation found!</b> Adjust your query accordingly:\n\n<i>{e.options[:5]}</i>", parse_mode=ParseMode.HTML)
+        update.effective_message.reply_text(
+            f"<b>Disambiguation found!</b> Adjust your query accordingly:\n\n<i>{', '.join(e.options[:5])}</i>",
+            parse_mode=ParseMode.HTML
+        )
         return
     except PageError as e:
         suggestions = wikipedia.search(search)
         if suggestions:
-            update.effective_message.reply_text(f"Page not found. Did you mean one of these?\n• <code>" + "</code>\n• <code>".join(suggestions[:5]) + "</code>", parse_mode=ParseMode.HTML)
+            update.effective_message.reply_text(
+                f"Page not found. Did you mean one of these?\n• <code>" + "</code>\n• <code>".join(suggestions[:5]) + "</code>", 
+                parse_mode=ParseMode.HTML
+            )
         else:
             update.effective_message.reply_text(f"❌ Page not found for: <code>{search}</code>", parse_mode=ParseMode.HTML)
         return
@@ -369,29 +449,37 @@ def wiki(bot: Bot, update: Update):
         return
 
     if res:
-        result = f"<b>{search.title()}</b>\n\n<i>{res}</i>\n\n<a href=\"https://en.wikipedia.org/wiki/{urllib.parse.quote(search)}\">Read more...</a>"
+        result = f"<b>{search.title()}</b>\n\n"
+        result += f"<i>{res}</i>\n\n"
+        result += f"""<a href="https://en.wikipedia.org/wiki/{urllib.parse.quote(search)}">Read more...</a>"""
         
         if len(result) > 4000:
             with open("result.txt", 'w', encoding='utf-8') as f:
                 f.write(result)
             with open("result.txt", 'rb') as f:
                 bot.send_document(
-                    document=f, filename="wiki_result.txt", reply_to_message_id=update.effective_message.message_id, chat_id=update.effective_chat.id
+                    document=f, 
+                    filename="wiki_result.txt",
+                    reply_to_message_id=update.effective_message.message_id, 
+                    chat_id=update.effective_chat.id
                 )
         else:
             update.effective_message.reply_text(result, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+
 
 @run_async
 def judge(bot: Bot, update: Update):
     judger = ["<b>is lying!</b>", "<b>is telling the truth!</b>"]
     rep = update.effective_message
+    msg = ""
     msg = update.effective_message.reply_to_message
     if not msg:
         rep.reply_text("Reply to someone's message to judge them!")
     else:
         user = msg.from_user.first_name
-        res = random.choice(judger)
-        msg.reply_text(f"{user} {res}", parse_mode=ParseMode.HTML)
+    res = random.choice(judger)
+    msg.reply_text(f"{user} {res}", parse_mode=ParseMode.HTML)
+
 
 @run_async
 def weebify(bot: Bot, update: Update, args):
@@ -414,33 +502,50 @@ def weebify(bot: Bot, update: Update, args):
     else:
         msg.reply_text(string)
 
+
 @run_async
 def night_api_nsfw(bot: Bot, update: Update, args):
     msg = update.effective_message
+    
     if not NIGHT_API_KEY:
         msg.reply_text("❌ The bot owner has not configured the `NIGHT_API_KEY`.", parse_mode=ParseMode.MARKDOWN)
         return
 
+    # Default to 'hentai' if the user doesn't provide a specific argument
     category = args[0].lower() if args else "hentai"
+    
+    # Common categories for Night API
     valid_categories = ["hentai", "boobs", "pussy", "ass", "feet"]
     
     if category not in valid_categories:
         msg.reply_text(f"⚠️ Invalid category! Available options:\n`{', '.join(valid_categories)}`", parse_mode=ParseMode.MARKDOWN)
         return
 
+    # Send a typing action since external API calls can take a second to resolve
     bot.send_chat_action(chat_id=msg.chat_id, action="upload_photo")
-    headers = {"Authorization": f"{NIGHT_API_KEY}"}
+
+    headers = {
+        "Authorization": NIGHT_API_KEY
+    }
     
     try:
         response = requests.get(f"{NIGHT_API_URL}/{category}", headers=headers, timeout=10)
+        
+        # Check HTTP network status
         if response.status_code == 200:
             data = response.json()
-            if data.get("status") == 400:
-                msg.reply_text(f"❌ API Error: {data.get('content', 'Invalid request')}")
+            
+            # Check internal API status (Night-API sometimes returns HTTP 200 for internal 400 errors)
+            api_status = data.get("status")
+            if api_status == 400:
+                error_msg = data.get("content", "Invalid request")
+                msg.reply_text(f"❌ API Error: {error_msg}")
                 return
             
+            # Safely extract the image URL based on the data type
             image_url = None
             content = data.get("content")
+            
             if isinstance(content, dict):
                 image_url = content.get("url")
             elif isinstance(content, str) and content.startswith("http"):
@@ -464,12 +569,84 @@ def night_api_nsfw(bot: Bot, update: Update, args):
         LOGGER.error(f"[Night-API] Request failed: {e}")
         msg.reply_text("❌ An error occurred while communicating with the Night API servers.")
 
+# ==========================================
+# ADVANCED TAG ALL DATABASE (Thread-Safe)
+# ==========================================
+TAG_DB_PATH = "tagall_cache.db"
+CACHE_TIMEOUT_DAYS = 7  # Remove users not seen in 7 days
 
-# ==========================================
-# ADVANCED @ALL / TAG ALL LOGIC
-# ==========================================
+class TagDB:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._init_db()
+    
+    def _init_db(self):
+        with self._get_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_users (
+                    chat_id INTEGER,
+                    user_id INTEGER,
+                    first_name TEXT,
+                    username TEXT,
+                    last_seen TIMESTAMP,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_users ON chat_users(chat_id)")
+            conn.commit()
+    
+    def _get_conn(self):
+        return sqlite3.connect(TAG_DB_PATH, timeout=10)
+    
+    def add_user(self, chat_id: int, user_id: int, first_name: str, username: str = None):
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO chat_users 
+                       (chat_id, user_id, first_name, username, last_seen) 
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (chat_id, user_id, first_name[:50], username, datetime.now())
+                )
+                conn.commit()
+    
+    def add_users_batch(self, chat_id: int, users: List[Tuple[int, str, str]]):
+        with self._lock:
+            with self._get_conn() as conn:
+                for user_id, first_name, username in users:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO chat_users 
+                           (chat_id, user_id, first_name, username, last_seen) 
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (chat_id, user_id, first_name[:50], username, datetime.now())
+                    )
+                conn.commit()
+    
+    def get_users(self, chat_id: int) -> List[Tuple[int, str]]:
+        with self._lock:
+            with self._get_conn() as conn:
+                cutoff = datetime.now() - timedelta(days=CACHE_TIMEOUT_DAYS)
+                cursor = conn.execute(
+                    """SELECT user_id, first_name FROM chat_users 
+                       WHERE chat_id = ? AND last_seen > ?
+                       ORDER BY last_seen DESC""",
+                    (chat_id, cutoff)
+                )
+                return cursor.fetchall()
+    
+    def cleanup(self):
+        with self._lock:
+            with self._get_conn() as conn:
+                cutoff = datetime.now() - timedelta(days=CACHE_TIMEOUT_DAYS)
+                conn.execute("DELETE FROM chat_users WHERE last_seen < ?", (cutoff,))
+                conn.commit()
+
+db = TagDB()
+
+TAGGING_STATE = {}
+CHUNK_SIZE = 5
+CHUNK_DELAY = 2.5
+
 def is_admin(chat: Chat, user_id: int) -> bool:
-    """Check if user is admin with error handling."""
     if chat.type == 'private':
         return True
     try:
@@ -479,7 +656,6 @@ def is_admin(chat: Chat, user_id: int) -> bool:
         return False
 
 def tag_worker(bot, chat_id: int, users: List[Tuple[int, str]], message: str):
-    """Background thread for tagging."""
     total = len(users)
     sent = 0
     
@@ -517,7 +693,6 @@ def tag_worker(bot, chat_id: int, users: List[Tuple[int, str]], message: str):
 
 @run_async
 def track_user(bot, update: Update):
-    """Track users when they send messages."""
     if not update.effective_user or not update.effective_chat:
         return
     
@@ -531,7 +706,6 @@ def track_user(bot, update: Update):
 
 @run_async
 def cache_all_on_join(bot, update: Update):
-    """When bot joins a group, cache all members immediately. Also caches new users as they join."""
     chat = update.effective_chat
     if chat.type == 'private':
         return
@@ -539,7 +713,6 @@ def cache_all_on_join(bot, update: Update):
     new_members = update.effective_message.new_chat_members
     is_bot_added = any(member.id == bot.id for member in new_members)
 
-    # If the bot itself was added to the group, try to scrape the existing members
     if is_bot_added:
         LOGGER.info(f"Caching members for {chat.id}...")
         users_to_cache = []
@@ -552,7 +725,6 @@ def cache_all_on_join(bot, update: Update):
                     users_to_cache.append((user.id, user.first_name, user.username))
             
             try:
-                # Fallback for old libraries to grab recent chatters
                 recent_messages = bot.get_chat_history(chat.id, limit=100)
                 for msg in recent_messages:
                     if msg.from_user and not msg.from_user.is_bot:
@@ -567,14 +739,12 @@ def cache_all_on_join(bot, update: Update):
         except Exception as e:
             LOGGER.error(f"Failed to cache users on join: {e}")
     else:
-        # If regular users joined the group, add them to the cache directly
         for member in new_members:
             if not member.is_bot:
                 db.add_user(chat.id, member.id, member.first_name, member.username)
 
 @run_async
 def tag_all(bot, update: Update, args: List[str] = None):
-    """Tag all users in the group."""
     chat = update.effective_chat
     user = update.effective_user
     msg = update.effective_message
@@ -618,7 +788,6 @@ def tag_all(bot, update: Update, args: List[str] = None):
 
 @run_async
 def tag_all_regex(bot, update: Update):
-    """Catches @all triggers to activate tag_all."""
     msg_text = update.effective_message.text
     match = re.match(r"(?i)^@all(.*)", msg_text)
     if match:
@@ -628,7 +797,6 @@ def tag_all_regex(bot, update: Update):
 
 @run_async
 def cancel_tag(bot, update: Update):
-    """Cancel active tagging."""
     chat = update.effective_chat
     user = update.effective_user
     
@@ -648,7 +816,6 @@ def cancel_tag(bot, update: Update):
 
 @run_async
 def cache_status(bot, update: Update):
-    """Check cache status."""
     chat = update.effective_chat
     if chat.type == 'private':
         return
@@ -662,10 +829,6 @@ def cache_status(bot, update: Update):
         parse_mode=ParseMode.MARKDOWN
     )
 
-
-# ==========================================
-# HELP MENU & REGISTRATIONS
-# ==========================================
 __help__ = """
  - /shg or /shrug: pretty self-explanatory.
  - /hug: give a hug and spread the love :)
@@ -684,11 +847,10 @@ __help__ = """
  - `@all <message>` or `/all <message>`: Tag all cached users.
  - `/cancelall`: Stop an active tagging process.
  - `/cachestatus`: Check how many users are cached for this group.
- 
- _Note: Inactive users are automatically removed from the tag list after 7 days._
 """
 
 __mod_name__ = "Extras"
+
 
 SHRUG_HANDLER = DisableAbleCommandHandler(["shrug", "shg"], shrug)
 HUG_HANDLER = DisableAbleCommandHandler("hug", hug)
@@ -706,7 +868,6 @@ NSFW_HANDLER = DisableAbleCommandHandler("nsfw", night_api_nsfw, pass_args=True)
 
 # Tag All Handlers
 TRACKER = MessageHandler(Filters.all & Filters.group, track_user)
-# Replaced ChatMemberHandler with standard MessageHandler looking for new_chat_members
 JOIN_HANDLER = MessageHandler(Filters.status_update.new_chat_members, cache_all_on_join)
 TAG_ALL = DisableAbleCommandHandler(["all", "tagall"], tag_all, pass_args=True)
 TAGALL_REGEX = MessageHandler(Filters.regex(r"(?i)^@all(.*)"), tag_all_regex)
