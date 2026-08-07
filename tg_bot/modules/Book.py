@@ -39,6 +39,9 @@ GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY")
 # index.php?req= for search, /ads.php?md5= for the download page and
 # get.php?md5=...&key= for the actual file. Rotate through the live ones.
 LIBGEN_DOMAINS = ["libgen.li", "libgen.la", "libgen.gl", "libgen.bz", "libgen.vg"]
+# Anna's Archive mirrors. .org is unreachable from some hosts; .gl serves real
+# search results without a JS challenge and is used as the primary fallback.
+ANNA_MIRRORS = ["annas-archive.org", "annas-archive.gl", "annas-archive.se"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 session = requests.Session()
@@ -56,6 +59,7 @@ session.mount("https://", adapter)
 OPENLIB_RESULTS = {}
 ABOOK_RESULTS = {}
 BOOKINFO_RESULTS = {}
+AABOOK_RESULTS = {}
 CACHE_TIMESTAMPS = {}
 
 def cleanup_caches():
@@ -66,6 +70,7 @@ def cleanup_caches():
         OPENLIB_RESULTS.pop(msg_id, None)
         ABOOK_RESULTS.pop(msg_id, None)
         BOOKINFO_RESULTS.pop(msg_id, None)
+        AABOOK_RESULTS.pop(msg_id, None)
         CACHE_TIMESTAMPS.pop(msg_id, None)
 
 
@@ -144,6 +149,215 @@ def _parse_libgen_rows(page: str, domain: str) -> List[Book]:
             files=[BookFile(extension=ext, size=size, md5=md5)]
         ))
     return books
+
+
+# ==========================================
+# 4. ANNA'S ARCHIVE ENGINE (/aabook)
+# ==========================================
+def _parse_annas_rows(page: str) -> List[dict]:
+    """Parse Anna's Archive search results (one flex row per book)."""
+    books = []
+    for seg in re.split(r'(?=<div class="flex\s+pt-3 pb-3 border-b)', page):
+        md5_match = re.search(r'/md5/([a-f0-9]{32})', seg)
+        if not md5_match:
+            continue
+        md5 = md5_match.group(1)
+
+        title_match = re.search(r'class="[^"]*js-vim-focus[^"]*"[^>]*>(.*?)</a>', seg, re.S)
+        title = _strip_html(title_match.group(1)) if title_match else "Unknown"
+
+        author_match = re.search(r'icon-\[mdi--user-edit\][^>]*></span>\s*(.*?)</a>', seg, re.S)
+        author = _strip_html(author_match.group(1)) if author_match else "Unknown"
+
+        meta_match = re.search(r'class="text-gray-800[^"]*mt-2">(.*?)(?:\s*<a href="#"|</div>)', seg, re.S)
+        meta = _strip_html(meta_match.group(1)) if meta_match else ""
+
+        parts = [p.strip() for p in meta.split('·')]
+        ext = next((t for t in parts if re.fullmatch(r'[A-Za-z0-9]{3,5}', t)), "").lower()
+        year = next((t for t in parts if re.fullmatch(r'\d{4}', t)), "")
+        lang = parts[0].replace('✅', '').replace('❌', '').strip() if parts else ""
+
+        books.append({
+            "md5": md5,
+            "title": title[:100],
+            "author": author[:80],
+            "year": year,
+            "ext": ext,
+            "size": _parse_size(meta),
+            "lang": lang
+        })
+    return books
+
+def search_annas_archive(query: str) -> Optional[List[dict]]:
+    """Search Anna's Archive (indexes LibGen, Z-Library, IA, Sci-Hub & more)."""
+    for domain in ANNA_MIRRORS:
+        try:
+            resp = session.get(f"https://{domain}/search", params={"q": query, "lang": "en"}, timeout=20)
+            if resp.status_code != 200:
+                continue
+            if "cloudflare" in resp.text.lower() or "just a moment" in resp.text.lower():
+                continue
+            books = _parse_annas_rows(resp.text)
+            if books:
+                return books
+            return []
+        except Exception as e:
+            LOGGER.debug(f"[AnnasArchive] {domain} failed: {e}")
+            continue
+    raise Exception("Could not reach Anna's Archive. They may be temporarily down.")
+
+def get_ia_download_url(md5: str) -> Optional[str]:
+    """Resolve an Internet Archive download link for an Anna's Archive record."""
+    try:
+        resp = session.get(f"https://{ANNA_MIRRORS[0]}/md5/{md5}", timeout=20)
+        if resp.status_code != 200:
+            return None
+        ia_ids = re.findall(r'https://archive\.org/details/([A-Za-z0-9_.-]+)', resp.text)
+        for ia_id in dict.fromkeys(ia_ids):
+            try:
+                meta = session.get(f"https://archive.org/metadata/{ia_id}", timeout=10).json()
+                # Lending-only items return 403 on direct file download — skip them
+                if meta.get("metadata", {}).get("access-restricted-item") == "true":
+                    continue
+                for f in meta.get("files", []):
+                    name = f.get("name", "")
+                    if name.lower().endswith(".epub"):
+                        return f"https://archive.org/download/{ia_id}/{name}"
+                for f in meta.get("files", []):
+                    name = f.get("name", "")
+                    if name.lower().endswith(".pdf") and "encrypted" not in name.lower():
+                        return f"https://archive.org/download/{ia_id}/{name}"
+            except Exception:
+                continue
+    except Exception as e:
+        LOGGER.error(f"[AnnasArchive IA resolver] {e}")
+    return None
+
+def build_aabook_keyboard(msg_id: int, results: list) -> InlineKeyboardMarkup:
+    keyboard = []
+    for i, book in enumerate(results[:10]):
+        title = book["title"][:25] + "..." if len(book["title"]) > 25 else book["title"]
+        author = book["author"][:15] + "..." if len(book["author"]) > 15 else book["author"]
+        ext_str = book["ext"].upper() if book["ext"] else "?"
+        keyboard.append([InlineKeyboardButton(f"{i+1}. {title} — {author} [{ext_str}]", callback_data=f"aa_opt_{msg_id}_{i}")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="aa_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+def _send_book_file(bot, chat_id: int, status_msg, content: bytes, filename: str,
+                    title: str, author: str, ext: str, source_note: str):
+    file_obj = io.BytesIO(content)
+    file_obj.name = filename
+    bot.send_document(
+        chat_id=chat_id,
+        document=file_obj,
+        filename=filename,
+        caption=f"📚 *{title}*\n✍️ *Author:* {author}\n📄 *Format:* {ext.upper()}\n\n_{source_note}_",
+        parse_mode=ParseMode.MARKDOWN,
+        timeout=120
+    )
+    status_msg.delete()
+
+@run_async
+def aabook_command(bot, update: Update, args):
+    msg = update.effective_message
+    if not args:
+        msg.reply_text("📚 *Anna's Archive Search*\n\nA mega-index covering LibGen, Z-Library, Internet Archive & more.\nExample: `/aabook Stephen Hawking`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    cleanup_caches()
+    query = ' '.join(args).strip()
+    status_msg = msg.reply_text(f"🔍 Searching Anna's Archive for '{query}'...")
+
+    try:
+        results = search_annas_archive(query)
+        if not results:
+            status_msg.edit_text("😕 No results found on Anna's Archive.")
+            return
+
+        AABOOK_RESULTS[status_msg.message_id] = results
+        CACHE_TIMESTAMPS[status_msg.message_id] = time.time()
+
+        status_msg.edit_text(f"📚 *Results from Anna's Archive ({len(results)} found)*\nSelect a book to download:",
+                             reply_markup=build_aabook_keyboard(status_msg.message_id, results),
+                             parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        status_msg.edit_text(f"❌ Search failed: {str(e)}")
+
+@run_async
+def aabook_callback(bot, update: Update):
+    query = update.callback_query
+    data = query.data
+
+    if data == "aa_cancel":
+        query.edit_message_text("❌ Search cancelled.")
+        query.answer()
+        return
+
+    if data.startswith("aa_opt_"):
+        parts = data.split("_")
+        _, _, msg_id_str, idx_str = parts
+        msg_id, idx = int(msg_id_str), int(idx_str)
+
+        results = AABOOK_RESULTS.get(msg_id)
+        if not results or idx >= len(results):
+            query.answer("Search expired. Please run /aabook again.", show_alert=True)
+            return
+
+        book = results[idx]
+        md5 = book["md5"]
+        chat_id = query.message.chat_id
+
+        query.answer("Fetching download...")
+        status_msg = query.message.edit_text(f"⬇️ Locating '{book['title']}'...")
+
+        # 1) LibGen CDN first — fastest, works for all libgen-sourced files
+        download_url = get_libgen_download_url(md5)
+        if download_url:
+            try:
+                status_msg.edit_text("⬇️ Downloading from LibGen mirror...")
+                resp = session.get(download_url, stream=True, timeout=60, verify=False)
+                resp.raise_for_status()
+                content_length = int(resp.headers.get('content-length', 0))
+                if content_length > MAX_FILE_SIZE:
+                    status_msg.edit_text(f"⚠️ File exceeds Telegram's 50MB limit.\n\n[Download Directly]({download_url})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+                    return
+                content = resp.content
+                if not (content.startswith(b'<!DOCTYPE') or b'<html' in content[:50]):
+                    status_msg.edit_text("📤 Uploading book to Telegram...")
+                    safe_title = re.sub(r'[\\/*?:"<>|]', '_', book['title'])
+                    _send_book_file(bot, chat_id, status_msg, content, f"{safe_title}.{book['ext']}",
+                                    book['title'], book['author'], book['ext'], "Downloaded via Anna's Archive (LibGen)")
+                    return
+            except Exception as e:
+                LOGGER.error(f"[AA LibGen DL] {e}")
+
+        # 2) Internet Archive — covers IA-scanned books missing from LibGen
+        ia_url = get_ia_download_url(md5)
+        if ia_url:
+            try:
+                status_msg.edit_text("⬇️ Downloading from Internet Archive...")
+                resp = session.get(ia_url, stream=True, timeout=45)
+                resp.raise_for_status()
+                content_length = int(resp.headers.get('content-length', 0))
+                if content_length > MAX_FILE_SIZE:
+                    status_msg.edit_text(f"⚠️ File exceeds Telegram's 50MB limit.\n\n[Download Directly]({ia_url})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+                    return
+                content = resp.content
+                if not (content.startswith(b'<!DOCTYPE') or b'<html' in content[:50]):
+                    status_msg.edit_text("📤 Uploading book to Telegram...")
+                    safe_title = re.sub(r'[\\/*?:"<>|]', '_', book['title'])
+                    ext = ia_url.rsplit('.', 1)[-1].split('?')[0]
+                    _send_book_file(bot, chat_id, status_msg, content, f"{safe_title}.{ext}",
+                                    book['title'], book['author'], ext, "Downloaded via Anna's Archive (Internet Archive)")
+                    return
+            except Exception as e:
+                LOGGER.error(f"[AA IA DL] {e}")
+
+        status_msg.edit_text(
+            f"❌ Could not resolve a direct download link.\n\n"
+            f"[Open on Anna's Archive](https://annas-archive.gl/md5/{md5})",
+            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+        )
 
 
 # ==========================================
@@ -691,6 +905,9 @@ ABOOK_HANDLER = DisableAbleCommandHandler("abook", abook_command, pass_args=True
 ABOOK_MENU_HANDLER = CallbackQueryHandler(abook_menu_callback, pattern=r"^ab_(opt|cancel|back)_")
 ABOOK_DL_HANDLER = CallbackQueryHandler(abook_dl_callback, pattern=r"^ab_dl_")
 
+AABOOK_HANDLER = DisableAbleCommandHandler("aabook", aabook_command, pass_args=True)
+AABOOK_CB_HANDLER = CallbackQueryHandler(aabook_callback, pattern=r"^aa_")
+
 dispatcher.add_handler(BOOKINFO_HANDLER)
 dispatcher.add_handler(BOOKINFO_CB_HANDLER)
 dispatcher.add_handler(BOOK_HANDLER)
@@ -698,6 +915,8 @@ dispatcher.add_handler(OPENLIB_CB_HANDLER)
 dispatcher.add_handler(ABOOK_HANDLER)
 dispatcher.add_handler(ABOOK_MENU_HANDLER)
 dispatcher.add_handler(ABOOK_DL_HANDLER)
+dispatcher.add_handler(AABOOK_HANDLER)
+dispatcher.add_handler(AABOOK_CB_HANDLER)
 
 __help__ = """
 📚 *Book Hub*
@@ -706,8 +925,11 @@ __help__ = """
 - `/bookinfo <query>`: Semantic search for book summaries and recommendations (e.g., "books about time travel").
 
 *Library Search:*
-- `/abook <title>`: Search and download books directly.
+- `/abook <title>`: Search and download books directly from Library Genesis.
 - `/abook <title> --format epub`: Filter specific formats.
+
+*Mega Search:*
+- `/aabook <title>`: Search Anna's Archive (LibGen + Z-Library + Internet Archive + more) and download.
 
 *Public Domain Library:*
 - `/book <title>`: Download public domain books & classics safely.
