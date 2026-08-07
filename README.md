@@ -1,5 +1,7 @@
 # ⚡ Pɧơɛnıх (Phoenix)
 
+<video src="https://telegra.ph/file/93612a540608640355f20.mp4" controls="controls"></video>
+
 <p align="center">
   <a href="https://t.me/ThyRealPhoenixBot"><img src="https://img.shields.io/badge/Telegram-%40ThyRealPhoenixBot-2CA5E0?logo=telegram&logoColor=white" alt="Telegram Bot"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white" alt="Python 3.11+"></a>
@@ -13,6 +15,7 @@
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/network"><img src="https://img.shields.io/github/forks/Gumballi/TheRealPhoenixBot?style=social" alt="GitHub Forks"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/issues"><img src="https://img.shields.io/github/issues/Gumballi/TheRealPhoenixBot" alt="GitHub Issues"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/pulls"><img src="https://img.shields.io/github/issues-pr/Gumballi/TheRealPhoenixBot" alt="Pull Requests"></a>
+  <a href="https://github.com/Gumballi/TheRealPhoenixBot/graphs/contributors"><img src="https://img.shields.io/github/contributors/Gumballi/TheRealPhoenixBot" alt="Contributors"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/commits/master"><img src="https://img.shields.io/github/last-commit/Gumballi/TheRealPhoenixBot" alt="Last Commit"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot"><img src="https://img.shields.io/github/repo-size/Gumballi/TheRealPhoenixBot" alt="Repo Size"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot"><img src="https://img.shields.io/badge/Maintained-yes-green.svg" alt="Maintained"></a>
@@ -20,13 +23,12 @@
 
 A **modular Telegram group-management bot** running on Python 3 with a SQLAlchemy-powered PostgreSQL database.
 
-Originally a **Marie fork**, Phoenix was created for personal use by [TheRealPhoenix](https://t.me/TheRealPhoenix) and is now maintained by [Gumballization](https://t.me/Gumballization). Feel free to add it to your groups — it is available on Telegram as [@ThyRealPhoenixBot](https://t.me/ThyRealPhoenixBot).
+Originally a **Marie fork**, Phoenix was created for personal use by [TheRealPhoenix](https://t.me/TheRealPhoenix) and is now maintained by [Gumball](https://t.me/Gumballization). Feel free to add it to your groups — it is available on Telegram as [@ThyRealPhoenixBot](https://t.me/ThyRealPhoenixBot).
 
 ---
 
 ## 📑 Table of Contents
 
-- [Pɧơɛnıх](#-pɧơɛnıх)
 - [Features](#-features)
 - [Getting Started](#-getting-started)
 - [Commands](#-commands)
@@ -37,12 +39,6 @@ Originally a **Marie fork**, Phoenix was created for personal use by [TheRealPho
 - [FAQ](#-faq)
 - [Credits](#-credits)
 - [License](#-license)
-
----
-
-## 🎬 Pɧơɛnıх
-
-<video src="https://telegra.ph/file/93612a540608640355f20.mp4" controls="controls"></video>
 
 ---
 
