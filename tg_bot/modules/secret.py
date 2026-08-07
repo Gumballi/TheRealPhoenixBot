@@ -2,8 +2,13 @@ import uuid
 import re
 import html
 import time
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler, MessageHandler, Filters
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+)
+from telegram.ext import CallbackQueryHandler, MessageHandler, Filters, InlineQueryHandler
 from telegram.ext.dispatcher import run_async
 
 from tg_bot import dispatcher, LOGGER
@@ -32,8 +37,119 @@ def _truncate_for_alert(text, limit=190):
     return encoded[:limit].decode("utf-8", errors="ignore") + "..."
 
 
+def _build_envelope(target_username, target_user_id, secret_id):
+    """Build the envelope message + reveal button (used by both inline and message paths)."""
+    keyboard = [[InlineKeyboardButton(text="Reveal Anonymous Secret", callback_data="anonsecret_{}".format(secret_id))]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # HTML + tg://user link: robust against underscores/formatting chars in usernames
+    safe_name = html.escape(target_username, quote=True)
+    text = (
+        "<b>An Anonymous Secret Message Has Arrived!</b>\n\n"
+        "<b>For:</b> <a href=\"tg://user?id={target_id}\">@{safe}</a>\n\n"
+        "<i>Only the designated recipient can open this text frame.</i>"
+    ).format(target_id=target_user_id, safe=safe_name)
+
+    return text, reply_markup
+
+
+def _answer_inline(bot, inline_query_id, title, description, text, reply_markup=None):
+    article = InlineQueryResultArticle(
+        id=str(uuid.uuid4())[:8],
+        title=title,
+        description=description,
+        input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+        reply_markup=reply_markup,
+    )
+    bot.answer_inline_query(inline_query_id, results=[article], cache_time=0)
+
+
+@run_async
+def inline_secret_query(bot, update):
+    """Handles inline mode: 'type @botname @target secret...' triggers this."""
+    iq = update.inline_query
+    if not iq or not iq.query:
+        return
+
+    bot_username = getattr(bot, "username", None) or "bot"
+    query_text = iq.query.strip()
+
+    # Query format (bot's username is stripped by Telegram, the rest arrives here):
+    #   @TargetUsername <secret text>
+    match = re.match(r"^@([A-Za-z0-9_]{5,32})(?:\s+(.+))?$", query_text, re.IGNORECASE | re.DOTALL)
+
+    if not match:
+        _answer_inline(
+            bot, iq.id,
+            "🔒 Send an anonymous secret",
+            "Type: @{bot} @username your hidden message".format(bot=bot_username),
+            "<b>How it works</b>\n\n"
+            "Type <code>@{bot} @username your hidden message</code> and pick the result. "
+            "Only the recipient can open the secret - nobody else can see it.".format(bot=bot_username),
+        )
+        return
+
+    target_username = match.group(1)
+    secret_text = (match.group(2) or "").strip()
+
+    if not secret_text:
+        _answer_inline(
+            bot, iq.id,
+            "Add your hidden message",
+            "Type: @{bot} @username your secret text".format(bot=bot_username),
+            "<b>Almost there!</b>\n\nAdd your secret text after the username.",
+        )
+        return
+
+    target_user_id = get_user_id(target_username.lower())
+
+    if not target_user_id:
+        _answer_inline(
+            bot, iq.id,
+            "User not found",
+            "@{target} hasn't messaged the bot yet".format(target=target_username),
+            "<b>Error:</b> Could not find user <code>@{target}</code>.\n"
+            "They must send at least one message to the bot first.".format(target=target_username),
+        )
+        return
+
+    if target_user_id == iq.from_user.id:
+        _answer_inline(
+            bot, iq.id,
+            "Can't send to yourself",
+            "Pick a different recipient",
+            "You can't send an anonymous secret message to yourself!",
+        )
+        return
+
+    _prune_expired()
+
+    # Generate a unique key for this secret instance
+    secret_id = str(uuid.uuid4())[:8]
+
+    ANON_SECRET_DB[secret_id] = {
+        "text": secret_text,
+        "target_id": target_user_id,
+        "sender_id": iq.from_user.id,
+        "created_at": time.time(),
+        "revealed": False,
+    }
+
+    envelope, reply_markup = _build_envelope(target_username, target_user_id, secret_id)
+
+    # The picked result IS the envelope: message text has no secret, button carries the key.
+    _answer_inline(
+        bot, iq.id,
+        "🔒 Send anonymous secret to @{target}".format(target=target_username),
+        "Only @{target} can open it - everyone else sees a locked envelope.".format(target=target_username),
+        envelope,
+        reply_markup=reply_markup,
+    )
+
+
 @run_async
 def anonymous_secret_trigger(bot, update):
+    """Fallback for when inline mode is disabled: '@botname @target secret' as a plain message."""
     message = update.effective_message
     if not message or not message.text:
         return
@@ -73,10 +189,7 @@ def anonymous_secret_trigger(bot, update):
 
     _prune_expired()
 
-    # Generate a unique key for this secret instance
     secret_id = str(uuid.uuid4())[:8]
-
-    # Store the payload details
     ANON_SECRET_DB[secret_id] = {
         "text": secret_text,
         "target_id": target_user_id,
@@ -85,19 +198,8 @@ def anonymous_secret_trigger(bot, update):
         "revealed": False,
     }
 
-    # Build the interaction layout button
-    keyboard = [[InlineKeyboardButton(text="Reveal Anonymous Secret", callback_data="anonsecret_{}".format(secret_id))]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # HTML + tg://user link: robust against underscores/formatting chars in usernames
-    safe_name = html.escape(target_username, quote=True)
-    text = (
-        "<b>An Anonymous Secret Message Has Arrived!</b>\n\n"
-        "<b>For:</b> <a href=\"tg://user?id={target_id}\">@{safe}</a>\n\n"
-        "<i>Only the designated recipient can open this text frame.</i>"
-    ).format(target_id=target_user_id, safe=safe_name)
-
-    bot.send_message(message.chat.id, text=text, reply_markup=reply_markup, parse_mode="HTML")
+    envelope, reply_markup = _build_envelope(target_username, target_user_id, secret_id)
+    bot.send_message(message.chat.id, text=envelope, reply_markup=reply_markup, parse_mode="HTML")
 
     # Delete the triggering command so the raw text vanishes from the chat log
     try:
@@ -154,7 +256,9 @@ def read_anonymous_secret(bot, update):
     secret_data["revealed"] = True
 
 
-# Register handlers without run_async in the constructor (handled by the @run_async decorator above)
+# Inline mode is on (enabled via BotFather), so the primary path is the inline query handler.
+# The message handler below is kept as a fallback for when inline mode is turned off.
+dispatcher.add_handler(InlineQueryHandler(inline_secret_query))
 dispatcher.add_handler(
     MessageHandler(
         Filters.text & Filters.group,
@@ -172,8 +276,13 @@ __mod_name__ = "Anonymous Secrets"
 __help__ = """
 Send anonymous secret messages to users in a group using a mention trigger.
 
-Usage:
-`@{bot_username} @username <your hidden text>`: Send an anonymous secret message to a user by username.
+Usage (inline mode):
+`@{bot_username} @username <your hidden text>`: start typing in the chat, then pick the
+"Send anonymous secret" result. The envelope is posted with a reveal button - only the
+recipient can open it.
+
+Usage (inline mode disabled):
+`@{bot_username} @username <your hidden text>`: sent as a normal message.
 
 Notes:
 - The recipient must have sent at least one message to the bot so the bot can look them up.
