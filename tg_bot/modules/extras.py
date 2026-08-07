@@ -573,7 +573,11 @@ def night_api_nsfw(bot: Bot, update: Update, args):
 # ADVANCED TAG ALL DATABASE (Thread-Safe)
 # ==========================================
 TAG_DB_PATH = "tagall_cache.db"
-CACHE_TIMEOUT_DAYS = 7  # Remove users not seen in 7 days
+CACHE_TIMEOUT_DAYS = 7    # Remove users not seen in 7 days
+CHUNK_SIZE = 5            # Default users per message. Use `/all 3`, `/all 4` or `/all --size=N`
+CHUNK_DELAY = 2.5         # Seconds between broadcast messages (stays flood-safe)
+MAX_TAG_MSG_LEN = 3800    # Stay under Telegram's 4096 char message limit
+TRACK_THROTTLE_SEC = 300  # Only write a user to disk at most once every 5 minutes
 
 class TagDB:
     def __init__(self):
@@ -643,8 +647,7 @@ class TagDB:
 db = TagDB()
 
 TAGGING_STATE = {}
-CHUNK_SIZE = 5
-CHUNK_DELAY = 2.5
+_track_throttle = {}  # (chat_id, user_id) -> last write timestamp
 
 def is_admin(chat: Chat, user_id: int) -> bool:
     if chat.type == 'private':
@@ -655,41 +658,97 @@ def is_admin(chat: Chat, user_id: int) -> bool:
     except:
         return False
 
-def tag_worker(bot, chat_id: int, users: List[Tuple[int, str]], message: str):
+def _mention(user: Tuple[int, str]) -> str:
+    """Build a safe HTML mention link (tg://user links work in both parse modes)."""
+    user_id, first_name = user
+    name = re.sub(r'[\r\n\t]+', ' ', str(first_name or ''))
+    name = html.escape(name).strip()
+    if not name:
+        name = "User"
+    return f'<a href="tg://user?id={user_id}">{name}</a>'
+
+def _build_chunk_texts(message: str, chunk_users: List[Tuple[int, str]]) -> List[str]:
+    """Build broadcast text(s) for a chunk, splitting if a message would be too long."""
+    header = f"<b>{html.escape(message)}</b>\n\n"
+    mentions = [_mention(u) for u in chunk_users]
+    body = ", ".join(mentions)
+
+    if len(header) + len(body) <= MAX_TAG_MSG_LEN:
+        return [header + body]
+
+    texts, current, current_len = [], [], len(header)
+    for m in mentions:
+        add = len(m) + 2 if current else len(m)
+        if current and current_len + add > MAX_TAG_MSG_LEN:
+            texts.append(header + ", ".join(current))
+            current, current_len = [m], len(header) + len(m)
+        else:
+            current.append(m)
+            current_len += add
+    if current:
+        texts.append(header + ", ".join(current))
+    return texts
+
+def tag_worker(bot, chat_id: int, users: List[Tuple[int, str]], message: str, chunk_size: int):
     total = len(users)
     sent = 0
-    
-    for i in range(0, total, CHUNK_SIZE):
+    i = 0
+
+    while i < total:
         if not TAGGING_STATE.get(chat_id, False):
-            bot.send_message(chat_id, "**⛔ Tagging cancelled!**", parse_mode=ParseMode.MARKDOWN)
+            try:
+                bot.send_message(chat_id, "<b>⛔ Tagging cancelled!</b>", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
             break
-        
-        chunk = users[i:i+CHUNK_SIZE]
-        mentions = []
-        
-        for user_id, first_name in chunk:
-            safe_name = first_name.replace('[', '').replace(']', '').replace('*', '').replace('_', '')
-            if not safe_name.strip():
-                safe_name = "User"
-            mentions.append(f"[{safe_name}](tg://user?id={user_id})")
-        
-        tag_text = f"{message}\n\n" + ", ".join(mentions)
-        
+
+        chunk = users[i:i + chunk_size]
+
         try:
-            bot.send_message(chat_id, tag_text, parse_mode=ParseMode.MARKDOWN)
+            for text in _build_chunk_texts(message, chunk):
+                if not TAGGING_STATE.get(chat_id, False):
+                    break
+                bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+                time.sleep(CHUNK_DELAY)
             sent += len(chunk)
-            time.sleep(CHUNK_DELAY)
         except RetryAfter as e:
-            time.sleep(e.retry_after + 0.5)
+            # Flood wait — back off and retry the SAME chunk so nobody gets skipped
+            time.sleep(e.retry_after + 1.0)
+            continue
         except Exception as e:
             LOGGER.error(f"Tag error: {e}")
             break
-    
+
+        i += chunk_size
+
     TAGGING_STATE[chat_id] = False
     try:
-        bot.send_message(chat_id, f"**✅ Tagging complete!** Sent to {sent} users.", parse_mode=ParseMode.MARKDOWN)
-    except:
+        bot.send_message(chat_id, f"<b>✅ Tagging complete!</b> Sent to {sent} users.", parse_mode=ParseMode.HTML)
+    except Exception:
         pass
+
+def _parse_tag_args(args: List[str]) -> Tuple[int, str]:
+    """Extract an optional chunk size (1-10) and the message text from /all args."""
+    chunk = CHUNK_SIZE
+    text = " ".join(args).strip() if args else ""
+
+    # --size=N or --chunk=N
+    size_match = re.match(r'^--(?:size|chunk)=(\d{1,2})', text)
+    if size_match:
+        chunk = max(1, min(10, int(size_match.group(1))))
+        text = re.sub(r'^--(?:size|chunk)=\d{1,2}\s*', '', text)
+    else:
+        # Bare number prefix, e.g. "/all 3" / "/all 4" / "/all 5 message"
+        parts = text.split(' ', 1)
+        if parts and parts[0].isdigit() and len(parts[0]) <= 2:
+            val = int(parts[0])
+            if 1 <= val <= 10:
+                chunk = val
+                text = parts[1].strip() if len(parts) > 1 else ""
+
+    if not text:
+        text = "Attention Everyone!"
+    return chunk, text
 
 @run_async
 def track_user(bot, update: Update):
@@ -701,7 +760,14 @@ def track_user(bot, update: Update):
     
     if chat.type == 'private' or user.is_bot:
         return
-    
+
+    # Throttle disk writes — only refresh a user every TRACK_THROTTLE_SEC
+    key = (chat.id, user.id)
+    now = time.time()
+    if key in _track_throttle and now - _track_throttle[key] < TRACK_THROTTLE_SEC:
+        return
+    _track_throttle[key] = now
+
     db.add_user(chat.id, user.id, user.first_name, user.username)
 
 @run_async
@@ -710,32 +776,24 @@ def cache_all_on_join(bot, update: Update):
     if chat.type == 'private':
         return
     
-    new_members = update.effective_message.new_chat_members
+    new_members = update.effective_message.new_chat_members or []
     is_bot_added = any(member.id == bot.id for member in new_members)
 
     if is_bot_added:
         LOGGER.info(f"Caching members for {chat.id}...")
         users_to_cache = []
-        
         try:
+            # The Bot API can only enumerate admins — cache them as a head start.
+            # Every other member gets cached by track_user as they send messages.
             admins = chat.get_administrators()
             for admin in admins:
                 user = admin.user
                 if not user.is_bot:
                     users_to_cache.append((user.id, user.first_name, user.username))
-            
-            try:
-                recent_messages = bot.get_chat_history(chat.id, limit=100)
-                for msg in recent_messages:
-                    if msg.from_user and not msg.from_user.is_bot:
-                        user = msg.from_user
-                        users_to_cache.append((user.id, user.first_name, user.username))
-            except:
-                pass
-            
+
             if users_to_cache:
                 db.add_users_batch(chat.id, list(set(users_to_cache)))
-                LOGGER.info(f"Cached {len(users_to_cache)} users for chat {chat.id}")
+                LOGGER.info(f"Cached {len(users_to_cache)} admins for chat {chat.id}")
         except Exception as e:
             LOGGER.error(f"Failed to cache users on join: {e}")
     else:
@@ -761,14 +819,26 @@ def tag_all(bot, update: Update, args: List[str] = None):
         msg.reply_text("⏳ A tagging process is already running! Use `/cancelall` to stop it.")
         return
     
-    text = " ".join(args) if args else "**Attention Everyone!**"
-    
+    chunk_size, text = _parse_tag_args(args or [])
+
+    # Refresh admin list so freshly-promoted members are reachable immediately
+    try:
+        admins = chat.get_administrators()
+        db.add_users_batch(chat.id, [
+            (a.user.id, a.user.first_name, a.user.username)
+            for a in admins if not a.user.is_bot
+        ])
+    except Exception as e:
+        LOGGER.error(f"Failed to refresh admins: {e}")
+
     users = db.get_users(chat.id)
-    
+    # Never tag the bot itself or the admin who ran the command
+    users = [u for u in users if u[0] != bot.id and u[0] != user.id]
+
     if not users:
         msg.reply_text(
             "📝 No users cached yet!\n\n"
-            "**Quick fix:** The bot will cache users when they send messages.\n"
+            "**Quick fix:** The bot caches users when they send messages.\n"
             "Try again in a few minutes after people chat, or:\n"
             "1. Have someone say *hello* in the group\n"
             "2. The bot will cache them\n"
@@ -778,11 +848,15 @@ def tag_all(bot, update: Update, args: List[str] = None):
         return
     
     TAGGING_STATE[chat.id] = True
-    msg.reply_text(f"**📢 Tagging {len(users)} users...**\nUse `/cancelall` to stop.", parse_mode=ParseMode.MARKDOWN)
+    msg.reply_text(
+        f"**📢 Tagging {len(users)} users** ({chunk_size} per message)...\n"
+        f"Use `/cancelall` to stop.",
+        parse_mode=ParseMode.MARKDOWN
+    )
     
     threading.Thread(
         target=tag_worker,
-        args=(bot, chat.id, users, text),
+        args=(bot, chat.id, users, text, chunk_size),
         daemon=True
     ).start()
 
@@ -824,7 +898,8 @@ def cache_status(bot, update: Update):
     update.effective_message.reply_text(
         f"📊 *Cache Status*\n\n"
         f"👥 Users cached: `{len(users)}`\n"
-        f"📅 Cache timeout: `{CACHE_TIMEOUT_DAYS} days`\n\n"
+        f"📅 Cache timeout: `{CACHE_TIMEOUT_DAYS} days`\n"
+        f"📄 Default chunk: `{CHUNK_SIZE}` users/message\n\n"
         f"_Users are cached when they send messages._",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -845,6 +920,9 @@ __help__ = """
  
  *📢 Tag All Commands (Admins Only):*
  - `@all <message>` or `/all <message>`: Tag all cached users.
+ - `/all 3 <message>`: Tag 3 users per message.
+ - `/all 4 <message>`: Tag 4 users per message.
+ - `/all --size=5 <message>`: Tag 5 (default) users per message (1-10).
  - `/cancelall`: Stop an active tagging process.
  - `/cachestatus`: Check how many users are cached for this group.
 """
