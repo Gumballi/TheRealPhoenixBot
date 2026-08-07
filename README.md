@@ -15,7 +15,6 @@
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/network"><img src="https://img.shields.io/github/forks/Gumballi/TheRealPhoenixBot?style=social" alt="GitHub Forks"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/issues"><img src="https://img.shields.io/github/issues/Gumballi/TheRealPhoenixBot" alt="GitHub Issues"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/pulls"><img src="https://img.shields.io/github/issues-pr/Gumballi/TheRealPhoenixBot" alt="Pull Requests"></a>
-  <a href="https://github.com/Gumballi/TheRealPhoenixBot/graphs/contributors"><img src="https://img.shields.io/github/contributors/Gumballi/TheRealPhoenixBot" alt="Contributors"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot/commits/master"><img src="https://img.shields.io/github/last-commit/Gumballi/TheRealPhoenixBot" alt="Last Commit"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot"><img src="https://img.shields.io/github/repo-size/Gumballi/TheRealPhoenixBot" alt="Repo Size"></a>
   <a href="https://github.com/Gumballi/TheRealPhoenixBot"><img src="https://img.shields.io/badge/Maintained-yes-green.svg" alt="Maintained"></a>
