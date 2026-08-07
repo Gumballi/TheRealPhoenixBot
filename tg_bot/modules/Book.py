@@ -3,6 +3,7 @@ import re
 import time
 import io
 import json
+import html
 import logging
 import math
 from typing import List, Optional, Dict, Any
@@ -33,7 +34,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- Constants & Configuration ---
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY")
 
-LIBGEN_DOMAINS = ["libgen.is", "libgen.rs", "libgen.st"]
+# Classic domains (libgen.is/rs/st) and library.lol went offline in late 2025.
+# The surviving mirrors all run the "libgen+" format-2 interface, which uses
+# index.php?req= for search, /ads.php?md5= for the download page and
+# get.php?md5=...&key= for the actual file. Rotate through the live ones.
+LIBGEN_DOMAINS = ["libgen.li", "libgen.la", "libgen.gl", "libgen.bz", "libgen.vg"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 session = requests.Session()
@@ -73,7 +78,7 @@ class BookFile:
     size: int = 0
     url: Optional[str] = None
     md5: Optional[str] = None
-    
+
 @dataclass
 class Book:
     md5: str
@@ -82,9 +87,63 @@ class Book:
     year: str
     domain: str = ""
     files: List[BookFile] = field(default_factory=list)
-    
+
     def get_available_formats(self) -> List[str]:
         return sorted(set(f.extension.lower() for f in self.files))
+
+
+# ==========================================
+# LIBGEN FORMAT-2 HELPERS (current mirrors)
+# ==========================================
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and decode entities."""
+    text = re.sub(r'<[^>]+>', ' ', text)
+    return html.unescape(text).strip()
+
+def _parse_size(size_text: str) -> int:
+    """Parse '2 MB' / '1.5 GB' style sizes into bytes."""
+    match = re.search(r'([\d.]+)\s*(KB|MB|GB)', size_text, re.IGNORECASE)
+    if not match:
+        return 0
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    multiplier = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}.get(unit, 1)
+    return int(value * multiplier)
+
+def _parse_libgen_rows(page: str, domain: str) -> List[Book]:
+    """Parse the format-2 search results table (one <tr> per file row)."""
+    books = []
+    for row in re.findall(r'<tr[^>]*>(.*?)</tr>', page, re.S | re.I):
+        if "ads.php?md5=" not in row:
+            continue
+
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
+        if len(cells) < 8:
+            continue
+
+        md5_match = re.search(r'ads\.php\?md5=([a-f0-9]{32})', row, re.I)
+        if not md5_match:
+            continue
+        md5 = md5_match.group(1)
+
+        # Title lives inside the edition.php anchor
+        title_match = re.search(r'edition\.php\?id=\d+[^>]*>(.*?)</a>', cells[0], re.S | re.I)
+        title = _strip_html(title_match.group(1)) if title_match else _strip_html(cells[0])
+        # Drop any trailing badge noise like "l 2478395"
+        title = re.sub(r'\s*l\s+\d+$', '', title).strip()
+
+        ext = _strip_html(cells[7]).split()[0].lower() if len(cells) > 7 else ""
+        size = _parse_size(_strip_html(cells[6])) if len(cells) > 6 else 0
+
+        books.append(Book(
+            md5=md5,
+            title=title[:100],
+            author=_strip_html(cells[1])[:80] if len(cells) > 1 else "Unknown",
+            year=_strip_html(cells[3])[:8] if len(cells) > 3 else "",
+            domain=domain,
+            files=[BookFile(extension=ext, size=size, md5=md5)]
+        ))
+    return books
 
 
 # ==========================================
@@ -96,11 +155,11 @@ def search_google_books(query: str) -> Optional[List[dict]]:
         params = {"q": query, "maxResults": 10}
         if GOOGLE_BOOKS_API_KEY:
             params["key"] = GOOGLE_BOOKS_API_KEY
-            
+
         resp = session.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        
+
         books = []
         for item in data.get("items", []):
             vol = item.get("volumeInfo", {})
@@ -110,12 +169,12 @@ def search_google_books(query: str) -> Optional[List[dict]]:
             year = vol.get("publishedDate", "")[:4]
             page_count = vol.get("pageCount", "Unknown")
             rating = vol.get("averageRating", "N/A")
-            
+
             # Clean HTML out of description
             desc = re.sub(r'<[^>]+>', '', desc)
             if len(desc) > 500:
                 desc = desc[:497] + "..."
-                
+
             books.append({
                 "title": title,
                 "author": authors,
@@ -142,14 +201,14 @@ def build_bookinfo_keyboard(msg_id: int, idx: int, total: int) -> InlineKeyboard
     keyboard = [
         [InlineKeyboardButton("📥 Search & Download on LibGen", callback_data=f"bi_dl_{msg_id}_{idx}")]
     ]
-    
+
     nav_row = []
     if idx > 0:
         nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"bi_pg_{msg_id}_{idx-1}"))
     nav_row.append(InlineKeyboardButton(f"{idx+1}/{total}", callback_data="bi_ignore"))
     if idx < total - 1:
         nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"bi_pg_{msg_id}_{idx+1}"))
-        
+
     if nav_row:
         keyboard.append(nav_row)
     keyboard.append([InlineKeyboardButton("❌ Close", callback_data=f"bi_cancel")])
@@ -161,19 +220,19 @@ def bookinfo_command(bot, update: Update, args):
     if not args:
         msg.reply_text("💡 *Smart Book Search*\n\nSearch by concept, plot, or title to get summaries and recommendations.\nExample: `/bookinfo books about wizards in space`", parse_mode=ParseMode.MARKDOWN)
         return
-        
+
     cleanup_caches()
     query = ' '.join(args).strip()
     status_msg = msg.reply_text(f"🧠 Searching concepts for '{query}'...")
-    
+
     results = search_google_books(query)
     if not results:
         status_msg.edit_text("😕 No recommendations found for that query.")
         return
-        
+
     BOOKINFO_RESULTS[status_msg.message_id] = results
     CACHE_TIMESTAMPS[status_msg.message_id] = time.time()
-    
+
     text = build_bookinfo_msg(results[0])
     kb = build_bookinfo_keyboard(status_msg.message_id, 0, len(results))
     status_msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -182,7 +241,7 @@ def bookinfo_command(bot, update: Update, args):
 def bookinfo_callback(bot, update: Update):
     query = update.callback_query
     data = query.data
-    
+
     if data == "bi_ignore":
         query.answer()
         return
@@ -190,41 +249,41 @@ def bookinfo_callback(bot, update: Update):
         query.edit_message_text("❌ Closed.")
         query.answer()
         return
-        
+
     parts = data.split("_")
     action, msg_id, idx = parts[1], int(parts[2]), int(parts[3])
-    
+
     results = BOOKINFO_RESULTS.get(msg_id)
     if not results:
         query.answer("Session expired. Please run /bookinfo again.", show_alert=True)
         return
-        
+
     CACHE_TIMESTAMPS[msg_id] = time.time()
-    
+
     if action == "pg":
         text = build_bookinfo_msg(results[idx])
         kb = build_bookinfo_keyboard(msg_id, idx, len(results))
         query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        
+
     elif action == "dl":
         book = results[idx]
-        
+
         # LibGen is extremely strict. Subtitles break searches.
         # We strip everything after a colon or parenthesis to get the core title.
         clean_title = book['title'].split(':')[0].split('(')[0].strip()
-        
+
         query.answer("Searching LibGen...")
         status_msg = query.message.edit_text(f"🔍 Searching LibGen for '{clean_title}'...")
-        
+
         try:
             libgen_books = search_libgen(clean_title)
             if not libgen_books:
                 status_msg.edit_text(f"😕 '{clean_title}' could not be found on LibGen.")
                 return
-                
+
             ABOOK_RESULTS[status_msg.message_id] = libgen_books
             CACHE_TIMESTAMPS[status_msg.message_id] = time.time()
-            
+
             keyboard = []
             for i, lb in enumerate(libgen_books[:10]):
                 formats = lb.get_available_formats()
@@ -233,10 +292,10 @@ def bookinfo_callback(bot, update: Update):
                 author = lb.author[:15] + "..." if len(lb.author) > 15 else lb.author
                 btn_text = f"{i+1}. {title} — {author} [{format_str}]"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"ab_opt_{status_msg.message_id}_{i}")])
-            
+
             keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="ab_cancel")])
             status_msg.edit_text(f"📚 Found {len(libgen_books)} match(es). Select to download:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-            
+
         except Exception as e:
             status_msg.edit_text(f"❌ Error bridging to LibGen: {str(e)}")
 
@@ -281,7 +340,7 @@ def build_openlib_keyboard(msg_id: int, page: int, total_pages: int, results: li
     nav_row.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="ol_ignore"))
     if page < total_pages - 1:
         nav_row.append(InlineKeyboardButton("➡️", callback_data=f"ol_pg_{msg_id}_{page+1}"))
-        
+
     if nav_row:
         keyboard.append(nav_row)
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"ol_cancel_{msg_id}")])
@@ -293,19 +352,19 @@ def book_command(bot, update: Update, args):
     if not args:
         msg.reply_text("📚 *Open Library Search*\n\nExample: `/book Pride and Prejudice`", parse_mode=ParseMode.MARKDOWN)
         return
-        
+
     cleanup_caches()
     query = ' '.join(args).strip()
     status_msg = msg.reply_text(f"🔍 Searching Open Library for '{query}'...")
-    
+
     results = OpenLibraryFetcher.search(query)
     if not results:
         status_msg.edit_text("😕 No public domain books found for that query.")
         return
-        
+
     OPENLIB_RESULTS[status_msg.message_id] = {"query": query, "results": results}
     CACHE_TIMESTAMPS[status_msg.message_id] = time.time()
-    
+
     kb = build_openlib_keyboard(status_msg.message_id, 0, math.ceil(len(results) / 5), results)
     status_msg.edit_text(f"📚 *Results for '{query}'*\nSelect a book to download:", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
@@ -313,38 +372,38 @@ def book_command(bot, update: Update, args):
 def openlib_callback(bot, update: Update):
     query = update.callback_query
     data = query.data
-    
+
     if data == "ol_ignore":
         query.answer()
         return
-        
+
     parts = data.split("_")
     action, msg_id = parts[1], int(parts[2])
-    
+
     if data.startswith("ol_cancel"):
         query.edit_message_text("❌ Search cancelled.")
         query.answer()
         return
-        
+
     search_data = OPENLIB_RESULTS.get(msg_id)
     if not search_data:
         query.answer("Search expired.", show_alert=True)
         return
-        
+
     CACHE_TIMESTAMPS[msg_id] = time.time()
     results = search_data["results"]
-    
+
     if action == "pg":
         page = int(parts[3])
         kb = build_openlib_keyboard(msg_id, page, math.ceil(len(results) / 5), results)
         query.edit_message_text(f"📚 *Results for '{search_data['query']}'*\nSelect a book to download:", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        
+
     elif action == "dl":
         idx = int(parts[3])
         item = results[idx]
         query.answer("Fetching metadata...")
         status_msg = query.message.edit_text(f"⬇️ Preparing '{item['title']}' from Internet Archive...")
-        
+
         try:
             ia_meta = session.get(f"https://archive.org/metadata/{item['ia_id']}", timeout=10).json()
             dl_url, ext = None, "txt"
@@ -360,15 +419,15 @@ def openlib_callback(bot, update: Update):
             if not dl_url:
                 status_msg.edit_text("❌ No EPUB or PDF available for this edition.")
                 return
-                
+
             status_msg.edit_text("Downloading file to server...")
             resp = session.get(dl_url, stream=True, timeout=45)
-            
+
             file_obj = io.BytesIO(resp.content)
             safe_title = re.sub(r'[\\/*?:"<>|]', '', item['title']).replace(' ', '_')
             file_obj.name = f"{safe_title}.{ext}"
             file_obj.seek(0)
-            
+
             status_msg.edit_text("Uploading to Telegram...")
             bot.send_document(
                 chat_id=query.message.chat_id, document=file_obj, filename=file_obj.name,
@@ -385,64 +444,49 @@ def openlib_callback(bot, update: Update):
 # 3. LIBGEN ENGINE (/abook)
 # ==========================================
 def search_libgen(query: str, format_filter: Optional[str] = None) -> List[Book]:
-    """Search Library Genesis using verify=False to bypass expired certificates."""
+    """Search Library Genesis format-2 mirrors using verify=False to bypass expired certificates."""
     for domain in LIBGEN_DOMAINS:
         try:
-            search_url = f"https://{domain}/search.php"
-            # verify=False prevents crashes when LibGen forgets to renew their SSL cert
-            resp = session.get(search_url, params={"req": query, "res": 25}, timeout=15, verify=False)
-            
+            search_url = f"https://{domain}/index.php"
+            # ads=false keeps the results table clean of injected ad rows
+            resp = session.get(search_url, params={"req": query, "ads": "false"}, timeout=15, verify=False)
+
             if resp.status_code != 200:
                 continue
-                
+
             # If Cloudflare intercepts, skip domain
             if "cloudflare" in resp.text.lower() or "just a moment" in resp.text.lower():
                 continue
-                
-            ids = re.findall(r'name="id\[\]" value="(\d+)"', resp.text)
-            
-            # THE LOGICAL FIX: Connection worked, Cloudflare passed, but no IDs found = 0 results
-            if not ids:
+
+            books = _parse_libgen_rows(resp.text, domain)
+            if format_filter:
+                books = [b for b in books if format_filter.lower() in b.get_available_formats()]
+
+            # THE LOGICAL FIX: Connection worked, Cloudflare passed, but no rows parsed = 0 results
+            if not books:
                 return []
-                
-            json_url = f"https://{domain}/json.php"
-            meta_resp = session.get(json_url, params={"ids": ",".join(ids[:20]), "c": "id,title,author,year,md5,extension"}, timeout=15, verify=False)
-            
-            if meta_resp.status_code == 200:
-                data = meta_resp.json()
-                books = []
-                
-                for item in data:
-                    ext = item.get('extension', '').lower()
-                    if format_filter and ext != format_filter.lower():
-                        continue
-                        
-                    books.append(Book(
-                        md5=item.get('md5'),
-                        title=item.get('title', 'Unknown')[:100],
-                        author=item.get('author', 'Unknown')[:80],
-                        year=item.get('year', ''),
-                        domain=domain,
-                        files=[BookFile(extension=ext, md5=item.get('md5'))]
-                    ))
-                
-                if books:
-                    return books
+
+            return books
         except Exception as e:
+            LOGGER.debug(f"[LibGen] {domain} failed: {e}")
             continue
-            
+
     raise Exception("Could not reach active library networks. They may be temporarily down.")
 
 def get_libgen_download_url(md5: str) -> Optional[str]:
-    """Scrapes the direct GET link from library.lol with SSL checks bypassed."""
-    try:
-        resp = session.get(f"https://library.lol/main/{md5}", timeout=15, verify=False)
-        if resp.status_code == 200:
-            match = re.search(r'href="(https?://[^"]+)"[^>]*>GET</a>', resp.text, re.IGNORECASE)
+    """Resolve the direct get.php download URL from a mirror's ads.php page."""
+    for domain in LIBGEN_DOMAINS:
+        try:
+            resp = session.get(f"https://{domain}/ads.php", params={"md5": md5}, timeout=15, verify=False)
+            if resp.status_code != 200:
+                continue
+            # The download key is generated fresh on every ads.php page load
+            match = re.search(r'href="(get\.php\?md5=[a-f0-9]+&key=[^"]+)"', resp.text, re.IGNORECASE)
             if match:
-                return match.group(1)
-    except Exception as e:
-        LOGGER.error(f"Failed to get LibGen download link: {e}")
+                return f"https://{domain}/{match.group(1)}"
+        except Exception as e:
+            LOGGER.debug(f"[LibGen] ads.php failed on {domain}: {e}")
+            continue
     return None
 
 @run_async
@@ -451,48 +495,48 @@ def abook_command(bot, update: Update, args):
     if not args:
         msg.reply_text("📚 *Library Search*\n\nExample: `/abook How Linux Works`\nFilter: `/abook Dune --format epub`", parse_mode=ParseMode.MARKDOWN)
         return
-    
+
     cleanup_caches()
     query = ' '.join(args)
     format_filter = None
-    
+
     format_match = re.search(r'--format\s+(\w+)', query, re.IGNORECASE)
     if format_match:
         format_filter = format_match.group(1)
         query = re.sub(r'--format\s+\w+', '', query).strip()
-    
+
     status_msg = msg.reply_text(f"🔍 Searching Library for '{query}'...")
-    
+
     try:
         books = search_libgen(query, format_filter)
-        
+
         if not books:
             status_msg.edit_text("😕 No results found. Try different keywords or check spelling.")
             return
-        
+
         ABOOK_RESULTS[status_msg.message_id] = books
         CACHE_TIMESTAMPS[status_msg.message_id] = time.time()
-        
+
         keyboard = []
         for i, book in enumerate(books[:10]):
             formats = book.get_available_formats()
             format_str = ', '.join(f.upper() for f in formats[:2])
             title = book.title[:25] + "..." if len(book.title) > 25 else book.title
             author = book.author[:15] + "..." if len(book.author) > 15 else book.author
-            
+
             button_text = f"{i+1}. {title} — {author} [{format_str}]"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"ab_opt_{status_msg.message_id}_{i}")])
-        
+
         keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="ab_cancel")])
         status_msg.edit_text(f"📚 Found {len(books)} book(s). Select one to download:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        
+
     except Exception as e:
         status_msg.edit_text(f"❌ Search failed: {str(e)}")
 
 @run_async
 def abook_menu_callback(bot, update: Update):
     query = update.callback_query
-    
+
     if query.data == "ab_cancel":
         query.edit_message_text("❌ Search cancelled.")
         query.answer()
@@ -502,11 +546,11 @@ def abook_menu_callback(bot, update: Update):
         _, msg_id_str = query.data.split("_", 2)[1:]
         msg_id = int(msg_id_str)
         books = ABOOK_RESULTS.get(msg_id)
-        
+
         if not books:
             query.answer("Search expired.", show_alert=True)
             return
-        
+
         keyboard = []
         for i, book in enumerate(books[:10]):
             formats = book.get_available_formats()
@@ -515,7 +559,7 @@ def abook_menu_callback(bot, update: Update):
             author = book.author[:15] + "..." if len(book.author) > 15 else book.author
             button_text = f"{i+1}. {title} — {author} [{format_str}]"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"ab_opt_{msg_id}_{i}")])
-        
+
         keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="ab_cancel")])
         query.edit_message_text(f"📚 Found {len(books)} book(s). Select one to download:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         query.answer()
@@ -525,15 +569,15 @@ def abook_menu_callback(bot, update: Update):
         parts = query.data.split("_")
         _, _, msg_id_str, idx_str = parts
         msg_id, idx = int(msg_id_str), int(idx_str)
-        
+
         books = ABOOK_RESULTS.get(msg_id)
         if not books or idx >= len(books):
             query.answer("Search expired. Please run /abook again.", show_alert=True)
             return
-        
+
         book = books[idx]
         formats = book.get_available_formats()
-        
+
         keyboard = []
         row_btns = []
         for fmt_idx, fmt in enumerate(formats):
@@ -544,9 +588,9 @@ def abook_menu_callback(bot, update: Update):
                 row_btns = []
         if row_btns:
             keyboard.append(row_btns)
-        
+
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f"ab_back_{msg_id}")])
-        
+
         query.edit_message_text(
             f"*📖 {book.title}*\n\n"
             f"✍️ *Author:* {book.author}\n"
@@ -561,59 +605,59 @@ def abook_menu_callback(bot, update: Update):
 @run_async
 def abook_dl_callback(bot, update: Update):
     query = update.callback_query
-    
+
     try:
         parts = query.data.split("_")
         _, _, msg_id_str, idx_str, fmt_idx_str = parts
         msg_id, idx, fmt_idx = int(msg_id_str), int(idx_str), int(fmt_idx_str)
-        
+
         books = ABOOK_RESULTS.get(msg_id)
         if not books or idx >= len(books):
             query.answer("Search expired.", show_alert=True)
             return
-        
+
         book = books[idx]
         formats = book.get_available_formats()
         selected_format = formats[fmt_idx]
-        
+
         query.answer(f"Downloading {selected_format.upper()}...")
         status_msg = query.message.edit_text(f"⬇️ Locating '{book.title}' [{selected_format.upper()}]...")
-        
+
         download_url = get_libgen_download_url(book.md5)
-        
+
         if not download_url:
             status_msg.edit_text(
                 f"❌ Could not extract direct download link.\n\n"
-                f"[Try Manual Download](http://library.lol/main/{book.md5})",
+                f"[Try Manual Download](https://{book.domain}/ads.php?md5={book.md5})",
                 parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
             )
             return
-            
+
         status_msg.edit_text(f"⬇️ Downloading file to server...")
-        
+
         try:
-            # verify=False prevents download stream crashes on expired library.lol certs
+            # verify=False prevents download stream crashes on expired CDN certs
             resp = session.get(download_url, stream=True, timeout=60, verify=False)
             resp.raise_for_status()
-            
+
             content_length = int(resp.headers.get('content-length', 0))
             if content_length > MAX_FILE_SIZE:
                 status_msg.edit_text(f"⚠️ File exceeds Telegram's 50MB limit.\n\n[Download Directly]({download_url})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
                 return
-            
+
             content = resp.content
-            
+
             if content.startswith(b'<!DOCTYPE') or b'<html' in content[:50]:
                 status_msg.edit_text("❌ Download mirror served an error page.")
                 return
-            
+
             status_msg.edit_text("📤 Uploading book to Telegram...")
-            
+
             file_obj = io.BytesIO(content)
             safe_title = re.sub(r'[\\/*?:"<>|]', '_', book.title)
             filename = f"{safe_title}.{selected_format}"
             file_obj.name = filename
-            
+
             bot.send_document(
                 chat_id=query.message.chat_id,
                 document=file_obj,
@@ -622,13 +666,13 @@ def abook_dl_callback(bot, update: Update):
                 parse_mode=ParseMode.MARKDOWN,
                 timeout=120
             )
-            
+
             status_msg.delete()
-            
+
         except Exception as e:
             LOGGER.error(f"Download stream error: {e}")
             status_msg.edit_text(f"❌ Download failed.\n\n[Try Direct Link]({download_url})", parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            
+
     except Exception as e:
         LOGGER.error(f"Callback error: {e}")
         query.answer("An error occurred.", show_alert=True)
