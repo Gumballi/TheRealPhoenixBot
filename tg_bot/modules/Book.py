@@ -244,14 +244,16 @@ def build_aabook_keyboard(msg_id: int, results: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def _send_book_file(bot, chat_id: int, status_msg, content: bytes, filename: str,
-                    title: str, author: str, ext: str, source_note: str):
+                    title: str, author: str, ext: str):
     file_obj = io.BytesIO(content)
     file_obj.name = filename
+    username = getattr(bot, "username", None) or "the bot"
+    credit = f"@{username}" if username != "the bot" else "the bot"
     bot.send_document(
         chat_id=chat_id,
         document=file_obj,
         filename=filename,
-        caption=f"📚 *{title}*\n✍️ *Author:* {author}\n📄 *Format:* {ext.upper()}\n\n_{source_note}_",
+        caption=f"📚 *{title}*\n✍️ *Author:* {author}\n📄 *Format:* {ext.upper()}\n\n_Downloaded Via {credit}_",
         parse_mode=ParseMode.MARKDOWN,
         timeout=120
     )
@@ -326,7 +328,7 @@ def aabook_callback(bot, update: Update):
                     status_msg.edit_text("📤 Uploading book to Telegram...")
                     safe_title = re.sub(r'[\\/*?:"<>|]', '_', book['title'])
                     _send_book_file(bot, chat_id, status_msg, content, f"{safe_title}.{book['ext']}",
-                                    book['title'], book['author'], book['ext'], "Downloaded via Anna's Archive (LibGen)")
+                                    book['title'], book['author'], book['ext'])
                     return
             except Exception as e:
                 LOGGER.error(f"[AA LibGen DL] {e}")
@@ -348,7 +350,7 @@ def aabook_callback(bot, update: Update):
                     safe_title = re.sub(r'[\\/*?:"<>|]', '_', book['title'])
                     ext = ia_url.rsplit('.', 1)[-1].split('?')[0]
                     _send_book_file(bot, chat_id, status_msg, content, f"{safe_title}.{ext}",
-                                    book['title'], book['author'], ext, "Downloaded via Anna's Archive (Internet Archive)")
+                                    book['title'], book['author'], ext)
                     return
             except Exception as e:
                 LOGGER.error(f"[AA IA DL] {e}")
@@ -643,9 +645,11 @@ def openlib_callback(bot, update: Update):
             file_obj.seek(0)
 
             status_msg.edit_text("Uploading to Telegram...")
+            username = getattr(bot, "username", None) or "the bot"
+            credit = f"@{username}" if username != "the bot" else "the bot"
             bot.send_document(
                 chat_id=query.message.chat_id, document=file_obj, filename=file_obj.name,
-                caption=f"📚 *{item['title']}*\n✍️ *Author:* {item['author']}\n\n_Downloaded via Open Library_",
+                caption=f"📚 *{item['title']}*\n✍️ *Author:* {item['author']}\n\n_Downloaded Via {credit}_",
                 parse_mode=ParseMode.MARKDOWN, timeout=120
             )
             status_msg.delete()
@@ -871,12 +875,14 @@ def abook_dl_callback(bot, update: Update):
             safe_title = re.sub(r'[\\/*?:"<>|]', '_', book.title)
             filename = f"{safe_title}.{selected_format}"
             file_obj.name = filename
+            username = getattr(bot, "username", None) or "the bot"
+            credit = f"@{username}" if username != "the bot" else "the bot"
 
             bot.send_document(
                 chat_id=query.message.chat_id,
                 document=file_obj,
                 filename=filename,
-                caption=f"📚 *{book.title}*\n✍️ *Author:* {book.author}\n📄 *Format:* {selected_format.upper()}\n\n_Downloaded via Library Search_",
+                caption=f"📚 *{book.title}*\n✍️ *Author:* {book.author}\n📄 *Format:* {selected_format.upper()}\n\n_Downloaded Via {credit}_",
                 parse_mode=ParseMode.MARKDOWN,
                 timeout=120
             )
