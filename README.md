@@ -1,6 +1,6 @@
 # ⚡ Pɧơɛnıх (Phoenix)
 
-<video src="https://telegra.ph/file/93612a540608640355f20.gif" controls="controls"></video>
+![Phoenix in action](https://files.catbox.moe/qy3420.gif)
 
 <p align="center">
   <a href="https://t.me/ThyRealPhoenixBot"><img src="https://img.shields.io/badge/Telegram-%40ThyRealPhoenixBot-2CA5E0?logo=telegram&logoColor=white" alt="Telegram Bot"></a>
