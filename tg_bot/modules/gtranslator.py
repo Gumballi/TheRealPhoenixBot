@@ -66,4 +66,3 @@ TRANSLATE_HANDLER = DisableAbleCommandHandler(["tl", "tr"], translate)
 LANGUAGES_HANDLER = DisableAbleCommandHandler("langs", languages)
 dispatcher.add_handler(TRANSLATE_HANDLER)
 dispatcher.add_handler(LANGUAGES_HANDLER)
-
