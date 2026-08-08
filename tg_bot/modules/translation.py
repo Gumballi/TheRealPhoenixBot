@@ -1,4 +1,5 @@
 import json
+import os
 from pprint import pprint
 
 import requests
@@ -7,8 +8,8 @@ from telegram.ext import CommandHandler
 
 from tg_bot import dispatcher
 
-# Open API key
-API_KEY = "6ae0c3a0-afdc-4532-a810-82ded0054236"
+# Open API key (overridable via GINGER_API_KEY env var)
+API_KEY = os.environ.get("GINGER_API_KEY", "6ae0c3a0-afdc-4532-a810-82ded0054236")
 URL = "http://services.gingersoftware.com/Ginger/correct/json/GingerTheText"
 
 
@@ -31,6 +32,10 @@ def translate(bot: Bot, update: Update):
         curr_string = ""
 
         prev_end = 0
+
+        if not changes:
+            update.effective_message.reply_text(msg.text)
+            return
 
         for change in changes:
             start = change.get('From')
