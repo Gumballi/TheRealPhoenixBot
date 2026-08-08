@@ -15,20 +15,8 @@ collections.Sequence = collections.abc.Sequence
 collections.MutableSequence = collections.abc.MutableSequence
 
 # Intercept and fix malclient-upgraded constructor compatibility
-import malclient
-original_client = malclient.Client
-
-class PatchedClient(original_client):
-    def __init__(self, *args, **kwargs):
-        if not args and not kwargs:
-            kwargs['client_id'] = os.environ.get("MAL_CLIENT_ID", "dummy_id_to_bypass_init_check")
-        super().__init__(*args, **kwargs)
-
-    def init(self, *args, **kwargs):
-        # Eat the .init() call from legacy codebase so it doesn't crash
-        pass
-
-malclient.Client = PatchedClient
+# (myanimelist.py now talks to the MAL API directly via requests, so the
+# monkeypatch is no longer needed and was removed.)
 
 import datetime
 import importlib
@@ -60,6 +48,12 @@ def process_update(self, update):
 
     now = datetime.datetime.utcnow()
     cnt = CHATS_CNT.get(update.effective_chat.id, 0)
+
+    if len(CHATS_TIME) > 1000:
+        cutoff = now - datetime.timedelta(0, 3600)
+        for chat_id in [cid for cid, t in CHATS_TIME.items() if t < cutoff]:
+            CHATS_TIME.pop(chat_id, None)
+            CHATS_CNT.pop(chat_id, None)
 
     t = CHATS_TIME.get(update.effective_chat.id, datetime.datetime(1970, 1, 1))
     if t and now > t + datetime.timedelta(0, 1):
@@ -157,7 +151,11 @@ USER_SETTINGS = {}
 GDPR = []
 
 for module_name in ALL_MODULES:
-    imported_module = importlib.import_module("tg_bot.modules." + module_name)
+    try:
+        imported_module = importlib.import_module("tg_bot.modules." + module_name)
+    except Exception as e:
+        LOGGER.error(f"Failed to import module {module_name}: {e}")
+        continue
     if not hasattr(imported_module, "__mod_name__"):
         imported_module.__mod_name__ = imported_module.__name__
 
