@@ -333,6 +333,9 @@ def get_time(bot: Bot, update: Update, args: List[str]):
 def echo(bot: Bot, update: Update):
     args = update.effective_message.text.split(None, 1)
     message = update.effective_message
+    if len(args) < 2:
+        message.reply_text("What do you want me to echo?")
+        return
     if message.reply_to_message:
         message.reply_to_message.reply_text(args[1])
     else:
