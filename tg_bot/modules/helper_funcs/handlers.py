@@ -2,11 +2,12 @@ import re
 import telegram.ext as tg
 from telegram import Update
 import tg_bot.modules.sql.blacklistusers_sql as sql
-from tg_bot import DEV_USERS, SUDO_USERS
+from tg_bot import DEV_USERS, SUDO_USERS, ALLOW_EXCL
 from pyrate_limiter import (BucketFullException, Duration, RequestRate, Limiter,
                             MemoryListBucket)
 
-CMD_STARTERS = ('/', '!')
+# '!' prefix commands are only accepted when ALLOW_EXCL is enabled
+CMD_STARTERS = ('/', '!') if ALLOW_EXCL else ('/',)
 
 class AntiSpam:
 
