@@ -74,7 +74,9 @@ def new_fed(bot: Bot, update: Update):
 	if chat.type != "private":
 		update.effective_message.reply_text("Please run this command in my PM only!")
 		return
-	fednam = message.text.split(None, 1)[1]
+	fednam = ""
+	if len(message.text.split(None, 1)) > 1:
+		fednam = message.text.split(None, 1)[1]
 	if not fednam == '':
 		fed_id = str(uuid.uuid4())
 		fed_name = fednam
@@ -427,8 +429,10 @@ def fed_ban(bot: Bot, update: Update, args: List[str]):
 		message.reply_text("This person is whitelisted so I can't ban them!")
 		return
 
-	if int(user_id) in (777000, 7179117035):
-		message.reply_text("I'm not fbanning Telegram bots.")
+	if user_id:
+		if int(user_id) in (777000, 7179117035):
+			message.reply_text("I'm not fbanning Telegram bots.")
+			return
 
 	try:
 		user_chat = bot.get_chat(user_id)
