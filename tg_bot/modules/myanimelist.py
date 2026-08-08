@@ -1,7 +1,5 @@
 from typing import List
 import requests
-from malclient import Client
-from malclient.exceptions import APIException
 
 from telegram import Bot, Update, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import run_async
@@ -11,7 +9,7 @@ from tg_bot.modules.disable import DisableAbleCommandHandler
 # Import SQL database session and our helper model
 from tg_bot.modules.sql import mal_sql as sql
 
-client = Client()
+MAL_API = "https://api.myanimelist.net/v2"
 
 # Load tokens from database if they exist; otherwise, use env variables
 db_tokens = sql.get_tokens()
@@ -24,43 +22,62 @@ else:
     # Initialize DB with env variables
     sql.update_tokens(CURRENT_ACCESS_TOKEN, CURRENT_REFRESH_TOKEN)
 
-client.init(access_token=CURRENT_ACCESS_TOKEN)
+
+def _current_token():
+    latest_tokens = sql.get_tokens()
+    return (latest_tokens.access_token if latest_tokens and latest_tokens.access_token
+            else CURRENT_ACCESS_TOKEN)
+
+
+def _search(endpoint, query):
+    url = f"{MAL_API}/{endpoint}?q={requests.utils.quote(query)}&limit=1"
+    headers = {"Authorization": f"Bearer {_current_token()}"}
+    req = requests.get(url, headers=headers)
+    req.raise_for_status()
+    items = req.json().get("data", [])
+    return items[0]["node"] if items else None
 
 
 def refresh_token(msg: Message, error: Exception) -> None:
     # Handle both malclient APIException and general HTTP 401 errors
     is_unauthorized = False
-    if isinstance(error, APIException) and str(error.response) == "<Response [401]>":
+    if isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code == 401:
         is_unauthorized = True
-    elif isinstance(error, requests.HTTPError) and error.response.status_code == 401:
-        is_unauthorized = True
+    elif isinstance(error, requests.RequestException):
+        is_unauthorized = False
 
     if is_unauthorized:
         # Get latest refresh token from DB
         latest_tokens = sql.get_tokens()
         r_token = latest_tokens.refresh_token if latest_tokens else MAL_REFRESH_TOKEN
-        
+
         try:
-            client.refresh_bearer_token(
-                client_id=MAL_CLIENT_ID,
-                refresh_token=r_token,
-                client_secret=MAL_CLIENT_SECRET
+            resp = requests.post(
+                "https://myanimelist.net/v1/oauth2/token",
+                data={
+                    "client_id": MAL_CLIENT_ID,
+                    "client_secret": MAL_CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "refresh_token": r_token,
+                },
             )
-            new_access_token = client.bearer_token
-            new_refresh_token = client.refresh_token
-            
+            resp.raise_for_status()
+            data = resp.json()
+            new_access_token = data.get("access_token", "")
+            new_refresh_token = data.get("refresh_token", r_token)
+
             # Save new tokens directly to the SQL Database!
             sql.update_tokens(new_access_token, new_refresh_token)
-            
+
             # Update local global-like state if necessary (though the DB is our main source of truth now)
             global CURRENT_ACCESS_TOKEN
             CURRENT_ACCESS_TOKEN = new_access_token
-            
+
             MSG_TEXT = (f"*MAL tokens refreshed and saved to Database!*\n\n"
                         f"*New Access Token*: `{new_access_token[:15]}...`\n"
                         f"*New Refresh Token*: `{new_refresh_token[:15]}...`")
             dispatcher.bot.send_message(OWNER_ID, MSG_TEXT, parse_mode="MARKDOWN")
-            
+
             msg.reply_text("Tokens refreshed successfully! Please try your search again.")
         except Exception as refresh_error:
             msg.reply_text(f"Failed to refresh MAL token: `{refresh_error}`", parse_mode="MARKDOWN")
@@ -76,15 +93,18 @@ def search_anime(bot: Bot, update: Update, args: List[str]) -> None:
         msg.reply_text("I can't search for nothing...")
         return
     try:
-        anime = client.search_anime(query)
-    except APIException as e:
+        anime = _search("anime", query)
+    except requests.HTTPError as e:
         refresh_token(msg, e)
+        return
+    except Exception as e:
+        msg.reply_text(f"Failed to search anime: `{e}`", parse_mode="MARKDOWN")
         return
     if not anime:
         msg.reply_text("Not found!")
         return
-        
-    anime_id = anime[0].id
+
+    anime_id = anime.get("id")
 
     # Fetch details directly from MAL API using requests to bypass malclient validation & signature issues
     detail_fields = (
@@ -168,15 +188,18 @@ def search_manga(bot: Bot, update: Update, args: List[str]) -> None:
         msg.reply_text("I can't search for nothing...")
         return
     try:
-        manga = client.search_manga(query)
-    except APIException as e:
+        manga = _search("manga", query)
+    except requests.HTTPError as e:
         refresh_token(msg, e)
+        return
+    except Exception as e:
+        msg.reply_text(f"Failed to search manga: `{e}`", parse_mode="MARKDOWN")
         return
     if not manga:
         msg.reply_text("Not found!")
         return
-        
-    manga_id = manga[0].id
+
+    manga_id = manga.get("id")
 
     # Fetch details directly from MAL API using requests
     manga_detail_fields = (
