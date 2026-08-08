@@ -22,7 +22,11 @@ def get_note_type(msg: Message):
     content = None
     text = ""
     raw_text = msg.text or msg.caption
+    if not raw_text:
+        return None, "", None, None, []
     args = raw_text.split(None, 2)  # use python's maxsplit to separate cmd and args
+    if len(args) < 2:
+        return None, "", None, None, []
     note_name = args[1]
 
     buttons = []
