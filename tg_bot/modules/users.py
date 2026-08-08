@@ -200,7 +200,8 @@ __help__ = ""  # no help string
 __mod_name__ = "Users"
 
 # Handler declarations
-START_HANDLER = CommandHandler("start", start)
+# NOTE: a /start handler (with deep-link support) is registered in __main__.py.
+# Registering another "start" here would shadow it and break deep links.
 BROADCAST_HANDLER = CommandHandler("broadcast", broadcast, filters=Filters.user(OWNER_ID))
 USER_HANDLER = MessageHandler(Filters.all & Filters.group, log_user)
 CHATLIST_HANDLER = CommandHandler("chatlist", chats, filters=CustomFilters.sudo_filter)
@@ -208,7 +209,6 @@ DELETE_CHATS_HANDLER = CommandHandler("cleanchats", rem_chat, filters=Filters.us
 
 # Registering handlers to dispatcher
 dispatcher.add_handler(USER_HANDLER, USERS_GROUP)
-dispatcher.add_handler(START_HANDLER)
 dispatcher.add_handler(BROADCAST_HANDLER)
 dispatcher.add_handler(CHATLIST_HANDLER)
 dispatcher.add_handler(DELETE_CHATS_HANDLER)
