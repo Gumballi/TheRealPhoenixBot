@@ -83,7 +83,7 @@ def steal(bot: Bot, update: Update, args: List[str]):
         try:
             im = Image.open(stolensticker)
             maxsize = (512, 512)
-            if (im.width and im.height) < 512:
+            if im.width < 512 and im.height < 512:
                 size1 = im.width
                 size2 = im.height
                 if im.width > im.height:
@@ -138,7 +138,7 @@ def steal(bot: Bot, update: Update, args: List[str]):
             urllib.urlretrieve(png_sticker, stolensticker)
             im = Image.open(stolensticker)
             maxsize = (512, 512)
-            if (im.width and im.height) < 512:
+            if im.width < 512 and im.height < 512:
                 size1 = im.width
                 size2 = im.height
                 if im.width > im.height:
