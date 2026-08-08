@@ -145,9 +145,9 @@ def error_callback(bot, update, error):
     try:
         raise error
     except (TimedOut, NetworkError):
-        log.debug(error, exc_info=True)
+        LOGGER.debug(error, exc_info=True)
     except:
-        log.info(error, exc_info=True)
+        LOGGER.info(error, exc_info=True)
 
 __mod_name__ = "Eval"
 
@@ -158,4 +158,3 @@ clear_handle = CommandHandler('clearlocals', clear)
 dispatcher.add_handler(eval_handle)
 dispatcher.add_handler(exec_handle)
 dispatcher.add_handler(clear_handle)
-
