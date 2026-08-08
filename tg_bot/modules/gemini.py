@@ -15,11 +15,13 @@
 #   - Mistral call failures are surfaced more clearly instead of always
 #     collapsing into the generic "neural misfire" message.
 
+import io
 import os
 import time
 import logging
 import re
-from collections import defaultdict
+import requests
+from collections import defaultdict, deque
 
 from telegram import Bot, Update, ParseMode
 from telegram.ext import CommandHandler, MessageHandler, Filters, run_async
@@ -30,7 +32,9 @@ LOGGER = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are Phoenix, a helpful, authentic, and witty AI companion bot in a Telegram chat. "
-    "Respond concisely, keep formatting clean (use basic markdown safely), and match the conversational tone of the user."
+    "Respond concisely, keep formatting clean (use basic markdown safely), and match the conversational tone of the user. "
+    "Multiple users may talk in the same group chat, so pay attention to the name shown for each message "
+    "and address the person who asked. Keep up with the recent conversation history when answering."
 )
 
 # ---------------------------------------------------------------------------
@@ -122,6 +126,71 @@ def _on_cooldown(user_id: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Short-term conversation memory (per chat) so the AI can keep up with a
+# multi-user group conversation instead of answering each message in a vacuum.
+# ---------------------------------------------------------------------------
+MAX_HISTORY = 12                      # messages (user + bot) kept per chat
+MAX_MEDIA_BYTES = 15 * 1024 * 1024    # cap for inline video/animation bytes
+
+_histories = defaultdict(deque)       # chat_id -> deque[(display_name, text)]
+
+
+def _record_history(chat_id: int, name: str, text: str) -> None:
+    h = _histories[chat_id]
+    h.append((name, text))
+    while len(h) > MAX_HISTORY:
+        h.popleft()
+
+
+def _history_context(chat_id: int) -> str:
+    h = _histories.get(chat_id)
+    if not h:
+        return ""
+    return "\n".join(f"{name}: {text}" for name, text in h)
+
+
+def _user_label(user) -> str:
+    """Human-readable name + id so the AI can tell users apart."""
+    if not user:
+        return "Unknown user"
+    name = (user.first_name or "").strip()
+    if user.last_name:
+        name = f"{name} {user.last_name}".strip()
+    return f"{name or 'User'} (id {user.id})"
+
+
+def _extract_media(bot: Bot, msg) -> list:
+    """Downloads photo/video/animation from a message for multimodal Gemini."""
+    parts = []
+    if not msg:
+        return parts
+    try:
+        if getattr(msg, "photo", None):
+            file_obj = bot.get_file(msg.photo[-1].file_id)
+            bio = io.BytesIO()
+            file_obj.download(out=bio, timeout=60)
+            data = bio.getvalue()
+            if data:
+                parts.append({"mime_type": "image/jpeg", "data": data})
+
+        for attr in ("video", "animation"):
+            obj = getattr(msg, attr, None)
+            if obj and getattr(obj, "file_id", None):
+                file_obj = bot.get_file(obj.file_id)
+                bio = io.BytesIO()
+                file_obj.download(out=bio, timeout=120)
+                data = bio.getvalue()
+                if data and len(data) <= MAX_MEDIA_BYTES:
+                    parts.append({
+                        "mime_type": getattr(obj, "mime_type", None) or "video/mp4",
+                        "data": data,
+                    })
+    except Exception as e:
+        LOGGER.warning(f"[ai] Failed to download media: {e}")
+    return parts
+
+
+# ---------------------------------------------------------------------------
 # Core AI Functions
 # ---------------------------------------------------------------------------
 
@@ -129,16 +198,26 @@ def _is_transient(err: Exception) -> bool:
     text = str(err).lower()
     return any(marker.lower() in text for marker in TRANSIENT_MARKERS)
 
-def _call_gemini(prompt: str) -> str:
+def _call_gemini(prompt: str, media=None) -> str:
     config = genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+    if media:
+        contents = [
+            genai_types.Part.from_bytes(data=m["data"], mime_type=m["mime_type"])
+            for m in media
+        ]
+        contents.append(prompt)
+    else:
+        contents = prompt
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
-        contents=prompt,
+        contents=contents,
         config=config,
     )
     return response.text.strip()
 
-def _call_mistral(prompt: str) -> str:
+def _call_mistral(prompt: str, media=None) -> str:
+    if media:
+        raise RuntimeError("Mistral provider does not support images/videos - use Gemini.")
     if not mistral_supports_chat_complete:
         raise RuntimeError(
             "mistralai SDK installed does not support chat.complete() - upgrade the package"
@@ -153,11 +232,11 @@ def _call_mistral(prompt: str) -> str:
     return response.choices[0].message.content.strip()
 
 PROVIDERS = {
-    "gemini": (lambda: gemini_client is not None, _call_gemini),
-    "mistral": (lambda: mistral_client is not None and mistral_supports_chat_complete, _call_mistral),
+    "gemini": (lambda: gemini_client is not None, _call_gemini, True),
+    "mistral": (lambda: mistral_client is not None and mistral_supports_chat_complete, _call_mistral, False),
 }
 
-def generate_ai_response(prompt: str) -> str:
+def generate_ai_response(prompt: str, media=None) -> str:
     last_error = None
     tried_any = False
 
@@ -167,14 +246,18 @@ def generate_ai_response(prompt: str) -> str:
             LOGGER.warning(f"[ai] Unknown provider '{provider_name}' in AI_PROVIDER_ORDER, skipping.")
             continue
 
-        is_available, call_fn = provider
+        is_available, call_fn, supports_media = provider
         if not is_available():
+            continue
+
+        if media and not supports_media:
+            LOGGER.warning(f"[ai] {provider_name} does not support images/videos, skipping.")
             continue
 
         tried_any = True
         for attempt in range(1, MAX_RETRIES_PER_PROVIDER + 1):
             try:
-                return call_fn(prompt)
+                return call_fn(prompt, media)
             except Exception as e:
                 last_error = e
                 transient = _is_transient(e)
@@ -235,21 +318,58 @@ def _get_youtube_transcript(video_id: str) -> str:
         LOGGER.warning(f"[ai] Could not fetch transcript for {video_id}: {e}")
         return None
 
+def _get_youtube_context(video_id: str, url: str):
+    """Fetch title/channel via oEmbed (no API key) plus the transcript."""
+    title = None
+    author = None
+    try:
+        resp = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": url, "format": "json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            title = data.get("title")
+            author = data.get("author_name")
+    except Exception as e:
+        LOGGER.debug(f"[ai] YouTube oEmbed lookup failed: {e}")
+
+    transcript = _get_youtube_transcript(video_id)
+    return title, author, transcript
+
 def enhance_prompt_with_youtube(prompt: str) -> str:
-    """Scans the prompt for a YouTube link, fetches the transcript, and silently injects it for the AI."""
+    """Scans the prompt for a YouTube link, fetches title/channel + transcript,
+    and silently injects them so the AI knows what the video is about."""
     yt_pattern = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
     match = re.search(yt_pattern, prompt)
 
-    if match:
-        video_id = match.group(1)
-        transcript = _get_youtube_transcript(video_id)
+    if not match:
+        return prompt
 
-        if transcript:
-            return prompt + f"\n\n[System Note: A YouTube video was linked. Here is the hidden video transcript for you to analyze and answer the user's question:\n{transcript}]"
-        else:
-            return prompt + f"\n\n[System Note: A YouTube video was linked, but closed captions are disabled or unavailable. Inform the user you cannot 'watch' it without a transcript.]"
+    video_id = match.group(1)
+    video_url = match.group(0)
+    title, author, transcript = _get_youtube_context(video_id, video_url)
 
-    return prompt
+    meta_lines = []
+    if title:
+        meta_lines.append(f"Title: {title}")
+    if author:
+        meta_lines.append(f"Channel: {author}")
+    meta_str = "\n".join(meta_lines) or "Title: (unknown)"
+
+    if transcript:
+        note = (
+            f"[System Note: A YouTube video was linked. Here is the hidden video context to analyze and answer the user's question:\n"
+            f"{meta_str}\n\nTranscript:\n{transcript}]"
+        )
+    else:
+        note = (
+            f"[System Note: A YouTube video was linked, but its transcript is unavailable. Here is what is known about it:\n"
+            f"{meta_str}\nIf the user asks about the video's content, explain you cannot watch it without a transcript.]"
+        )
+
+    return prompt + "\n\n" + note
 
 # ---------------------------------------------------------------------------
 # Handlers
@@ -270,27 +390,42 @@ def ask_ai(bot: Bot, update: Update, args):
         msg.reply_text(f"Slow down a bit! Try again in {remaining}s.")
         return
 
-    prompt = query
-    if msg.reply_to_message:
+    media = _extract_media(bot, msg)
+    if not media and msg.reply_to_message:
+        media = _extract_media(bot, msg.reply_to_message)
+
+    user_label = _user_label(msg.from_user)
+    _record_history(msg.chat_id, user_label, query)
+
+    context = _history_context(msg.chat_id)
+    if context:
+        prompt = f"Recent conversation in this chat:\n{context}\n\n{user_label} asked: {query}"
+    elif msg.reply_to_message:
         context_text = msg.reply_to_message.caption or msg.reply_to_message.text
         if context_text:
-            prompt = f"Previous message context:\n{context_text.strip()}\n\nUser question: {query}"
+            prompt = f"Previous message context:\n{context_text.strip()}\n\n{user_label} asked: {query}"
+        else:
+            prompt = f"{user_label} asked: {query}"
+    else:
+        prompt = f"{user_label} asked: {query}"
 
     prompt = enhance_prompt_with_youtube(prompt)
 
     bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-    response = generate_ai_response(prompt)
+    response = generate_ai_response(prompt, media)
+    _record_history(msg.chat_id, "Phoenix", response)
     msg.reply_text(response)
 
 def _is_bot_mentioned(bot: Bot, msg) -> bool:
     """Checks real mention/text_mention entities rather than a raw substring search,
     which previously could false-positive on usernames that merely contain the
-    bot's username as a substring."""
-    if not msg.entities:
+    bot's username as a substring. Works for captions on media messages too."""
+    text = msg.text or msg.caption
+    if not msg.entities or not text:
         return False
     for entity in msg.entities:
         if entity.type == "mention":
-            mention_text = msg.text[entity.offset: entity.offset + entity.length]
+            mention_text = text[entity.offset: entity.offset + entity.length]
             if bot.username and mention_text.lower() == f"@{bot.username}".lower():
                 return True
         elif entity.type == "text_mention" and entity.user and entity.user.id == bot.id:
@@ -300,7 +435,7 @@ def _is_bot_mentioned(bot: Bot, msg) -> bool:
 @run_async
 def mention_chatbot(bot: Bot, update: Update):
     msg = update.effective_message
-    if not msg or not msg.text:
+    if not msg:
         return
 
     is_pm = update.effective_chat.type == "private"
@@ -312,10 +447,11 @@ def mention_chatbot(bot: Bot, update: Update):
     )
 
     is_mentioned = _is_bot_mentioned(bot, msg)
+    media = _extract_media(bot, msg)
 
     # Bail out immediately if none of these apply - avoids spawning a thread
-    # for every single reply message in a busy group (previous behavior).
-    if not (is_pm or is_mentioned or is_reply_to_bot):
+    # for every single message in a busy group (previous behavior).
+    if not (is_pm or is_mentioned or is_reply_to_bot or media):
         return
 
     user_id = msg.from_user.id
@@ -327,10 +463,14 @@ def mention_chatbot(bot: Bot, update: Update):
 
     LOGGER.info(
         f"[ai] mention_chatbot triggered by {user_id} in chat {msg.chat_id} "
-        f"(PM: {is_pm}, Mention: {is_mentioned}, ReplyToBot: {is_reply_to_bot})"
+        f"(PM: {is_pm}, Mention: {is_mentioned}, ReplyToBot: {is_reply_to_bot}, Media: {bool(media)})"
     )
 
-    query = msg.text
+    query = msg.text or msg.caption or ""
+    if media and not query:
+        query = "Please describe this image/video in detail."
+    elif media and query:
+        query = f"{query}\n\n(Also analyze the attached image/video.)"
     bot_username = f"@{bot.username}" if bot.username else ""
     if bot_username and bot_username.lower() in query.lower():
         query = re.sub(re.escape(bot_username), "", query, flags=re.IGNORECASE).strip()
@@ -338,19 +478,26 @@ def mention_chatbot(bot: Bot, update: Update):
     if not query:
         return
 
-    if is_reply_to_bot and msg.reply_to_message:
+    user_label = _user_label(msg.from_user)
+    _record_history(msg.chat_id, user_label, query)
+
+    context = _history_context(msg.chat_id)
+    if context:
+        prompt = f"Recent conversation in this chat:\n{context}\n\n{user_label}: {query}"
+    elif is_reply_to_bot and msg.reply_to_message:
         previous_text = msg.reply_to_message.caption or msg.reply_to_message.text
         if previous_text:
-            prompt = f"Previous message context:\n{previous_text.strip()}\n\nUser reply: {query}"
+            prompt = f"Previous message context:\n{previous_text.strip()}\n\n{user_label}: {query}"
         else:
-            prompt = query
+            prompt = f"{user_label}: {query}"
     else:
-        prompt = query
+        prompt = f"{user_label}: {query}"
 
     prompt = enhance_prompt_with_youtube(prompt)
 
     bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-    response = generate_ai_response(prompt)
+    response = generate_ai_response(prompt, media)
+    _record_history(msg.chat_id, "Phoenix", response)
     msg.reply_text(response)
 
 @run_async
@@ -361,7 +508,7 @@ def ai_status(bot: Bot, update: Update):
         if not provider:
             lines.append(f"- `{name}`: unknown provider name")
             continue
-        is_available, _ = provider
+        is_available, _, _ = provider
         status = "configured" if is_available() else "NOT configured (missing API key or incompatible SDK)"
         lines.append(f"- `{name}`: {status}")
     update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
@@ -380,6 +527,15 @@ MENTION_HANDLER = MessageHandler(
 )
 dispatcher.add_handler(MENTION_HANDLER, group=10)
 
+# Multimodal: photos/videos/gifs sent to the bot (or replying to it) are also
+# answered. The same is_pm/is_mentioned/is_reply_to_bot gate inside
+# mention_chatbot() stops this from firing on random media in busy groups.
+MEDIA_HANDLER = MessageHandler(
+    Filters.photo | Filters.video | Filters.animation,
+    mention_chatbot,
+)
+dispatcher.add_handler(MEDIA_HANDLER, group=10)
+
 AI_STATUS_HANDLER = CommandHandler("aistatus", ai_status)
 dispatcher.add_handler(AI_STATUS_HANDLER)
 
@@ -394,11 +550,17 @@ Let's make the bot conversational! You can interact with the built-in AI model.
 *Alternative:*
 - Simply tag the bot (`@bot_username`) in a group message, or message it in private, and it will automatically answer you using AI!
 
+*Conversation memory:*
+- The bot keeps track of the last several messages in a chat, so it can follow multi-turn conversations and tell users apart by name.
+
+*Images & videos:*
+- Send (or reply with) a photo, video, or GIF and the bot will describe and analyze it (Gemini only — Mistral has no vision).
+
 *YouTube Support:*
-If you send a YouTube link to the AI, it will attempt to extract the closed captions and answer questions about the video!
+If you send a YouTube link to the AI, it will fetch the video's title, channel, and closed captions and answer questions about the video!
 
 *Reliability:*
-This module automatically retries and fails over between providers (currently Gemini and Mistral, in that order) if one is temporarily overloaded.
+This module automatically retries and fails over between providers (currently Gemini and Mistral, in that order) if one is temporarily overloaded. When images/videos are attached, only Gemini is used.
 """
 
 __mod_name__ = "AI Chatbot"
