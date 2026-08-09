@@ -42,6 +42,14 @@ SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("AI_API_KEY") or os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")  # overridable if Google renames/retires it
+# If the configured model 404s (renamed/retired, or typo in GEMINI_MODEL), try
+# these in order until one actually exists for the API key in use.
+GEMINI_FALLBACK_MODELS = [
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
 gemini_client = None
 genai_types = None
 
@@ -198,22 +206,42 @@ def _is_transient(err: Exception) -> bool:
     text = str(err).lower()
     return any(marker.lower() in text for marker in TRANSIENT_MARKERS)
 
+def _model_not_found(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(marker in text for marker in ("not found", "model not found", "404", "does not exist", "model_not_found", "permission denied"))
+
 def _call_gemini(prompt: str, media=None) -> str:
-    config = genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-    if media:
-        contents = [
-            genai_types.Part.from_bytes(data=m["data"], mime_type=m["mime_type"])
-            for m in media
-        ]
-        contents.append(prompt)
-    else:
-        contents = prompt
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=config,
-    )
-    return response.text.strip()
+    last_error = None
+    models_to_try = [GEMINI_MODEL] + [
+        m for m in GEMINI_FALLBACK_MODELS if m.lower() != GEMINI_MODEL.lower()
+    ]
+    for model in models_to_try:
+        try:
+            config = genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+            if media:
+                contents = [
+                    genai_types.Part.from_bytes(data=m["data"], mime_type=m["mime_type"])
+                    for m in media
+                ]
+                contents.append(prompt)
+            else:
+                contents = prompt
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            return response.text.strip()
+        except Exception as e:
+            last_error = e
+            if not _model_not_found(e):
+                # Real failure (auth, quota, network) - do not mask it behind a
+                # "model renamed" fallback; let the retry/failover layer handle it.
+                raise
+            LOGGER.warning(f"[ai] Gemini model '{model}' unavailable ({e}); trying fallback model.")
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Gemini call failed with no models available.")
 
 def _call_mistral(prompt: str, media=None) -> str:
     if media:
@@ -283,40 +311,96 @@ def generate_ai_response(prompt: str, media=None) -> str:
 # YouTube Transcript Integration
 # ---------------------------------------------------------------------------
 
-def _get_youtube_transcript(video_id: str) -> str:
+def _join_transcript(data, max_chars: int = 15000) -> str:
+    """Stitch transcript blocks into one string. Blocks may be objects with a
+    .text attribute (older youtube-transcript-api) or dicts with 'text'."""
+    parts = []
+    for block in data:
+        if isinstance(block, dict):
+            text = block.get("text", "")
+        else:
+            text = getattr(block, "text", "")
+        if text:
+            parts.append(str(text))
+    text = " ".join(parts)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "... [Transcript truncated due to length]"
+    return text
+
+
+def _try_youtube_transcript_api(video_id: str) -> str:
+    """Primary: the youtube-transcript-api library. Tolerates both the modern
+    instance API and the older static API. Note: this is frequently IP-blocked
+    on cloud hosts (Render, AWS, etc.), hence the fallbacks below."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
 
-        # Initialize the API client (required for the latest versions of the library)
-        yt_api = YouTubeTranscriptApi()
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        except AttributeError:
+            transcript_list = YouTubeTranscriptApi().list(video_id)
 
-        # Retrieve the list of all available transcripts for the video
-        transcript_list = yt_api.list(video_id)
-
-        # Iterate and grab the first available transcript (bypasses strict language constraints)
-        transcript_data = None
         for transcript in transcript_list:
-            transcript_data = transcript.fetch()
-            break  # Stop after successfully grabbing the first one
-
-        if not transcript_data:
-            return None
-
-        # Stitch all subtitle blocks together
-        text = " ".join([block.text for block in transcript_data])
-
-        # Truncate at ~15,000 characters to prevent overloading token limits on massive videos
-        if len(text) > 15000:
-            text = text[:15000] + "... [Transcript truncated due to length]"
-
-        return text
-
+            data = transcript.fetch()
+            if data:
+                return _join_transcript(data)
     except ImportError:
         LOGGER.error("[ai] youtube-transcript-api is not installed!")
-        return None
     except Exception as e:
-        LOGGER.warning(f"[ai] Could not fetch transcript for {video_id}: {e}")
-        return None
+        LOGGER.warning(f"[ai] youtube-transcript-api failed for {video_id}: {e}")
+    return None
+
+
+def _try_tactiq(video_id: str) -> str:
+    """Fallback: tactiq's free unofficial transcript endpoint."""
+    try:
+        resp = requests.post(
+            "https://tactiq-apps-prod.tactiq.io/transcript",
+            json={"videoUrl": f"https://www.youtube.com/watch?v={video_id}", "langCode": "en"},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return _join_transcript(data)
+    except Exception as e:
+        LOGGER.warning(f"[ai] tactiq transcript failed for {video_id}: {e}")
+    return None
+
+
+def _try_youtubetotranscript(video_id: str) -> str:
+    """Fallback: youtubetotranscript.com free endpoint."""
+    try:
+        resp = requests.post(
+            "https://youtubetotranscript.com/transcript",
+            data={"video_id": video_id, "format": "true"},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return _join_transcript(data)
+    except Exception as e:
+        LOGGER.warning(f"[ai] youtubetotranscript failed for {video_id}: {e}")
+    return None
+
+
+def _get_youtube_transcript(video_id: str) -> str:
+    """Fetches a transcript using a fallback chain. On Render/cloud IPs the
+    youtube-transcript-api requests are usually IP-blocked by YouTube, so we
+    try alternative public endpoints afterwards."""
+    for fetcher in (_try_youtube_transcript_api, _try_tactiq, _try_youtubetotranscript):
+        try:
+            text = fetcher(video_id)
+        except Exception as e:
+            LOGGER.warning(f"[ai] {fetcher.__name__} crashed for {video_id}: {e}")
+            continue
+        if text:
+            LOGGER.info(f"[ai] got transcript for {video_id} via {fetcher.__name__}")
+            return text
+    return None
 
 def _get_youtube_context(video_id: str, url: str):
     """Fetch title/channel via oEmbed (no API key) plus the transcript."""
