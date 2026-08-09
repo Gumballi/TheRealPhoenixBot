@@ -20,6 +20,7 @@ import os
 import time
 import logging
 import re
+import glob
 import requests
 from collections import defaultdict, deque
 
@@ -158,9 +159,14 @@ def _history_context(chat_id: int) -> str:
 
 
 def _user_label(user) -> str:
-    """Human-readable name + id so the AI can tell users apart."""
+    """Human-readable name + id so the AI can tell users apart. Prefers the
+    user's exact @username when set (what people actually want to be called),
+    falling back to display first/last name."""
     if not user:
         return "Unknown user"
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{username} (id {user.id})"
     name = (user.first_name or "").strip()
     if user.last_name:
         name = f"{name} {user.last_name}".strip()
@@ -351,26 +357,57 @@ def _try_youtube_transcript_api(video_id: str) -> str:
     return None
 
 
-def _try_tactiq(video_id: str) -> str:
-    """Fallback: tactiq's free unofficial transcript endpoint."""
+def _try_yt_dlp(video_id: str) -> str:
+    """Fallback: yt-dlp with mobile player clients. The default 'web' client is
+    what youtube-transcript-api uses and is frequently IP-blocked on cloud
+    hosts; the android/ios clients are not (so far) and work from Render."""
+    import tempfile
+    import shutil
+    import yt_dlp
+    import json as _json
+
+    tmpdir = tempfile.mkdtemp(prefix="yt_subs_")
     try:
-        resp = requests.post(
-            "https://tactiq-apps-prod.tactiq.io/transcript",
-            json={"videoUrl": f"https://www.youtube.com/watch?v={video_id}", "langCode": "en"},
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if isinstance(data, list) and data:
-            return _join_transcript(data)
+        opts = {
+            "skip_download": True,
+            "writeautomaticsub": True,
+            "writesubtitles": True,
+            "subtitleslangs": ["en.*"],
+            "subtitlesformat": "json3/vtt",
+            "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+
+        for path in sorted(glob.glob(os.path.join(tmpdir, "*.json3"))):
+            with open(path, "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            texts = []
+            for ev in data.get("events", []):
+                segs = ev.get("segs")
+                if segs:
+                    texts.append("".join(s.get("utf8", "") for s in segs))
+            text = " ".join(texts).replace("\n", " ")
+            if text.strip():
+                return _join_transcript([{"text": text}])
+        return None
+    except ImportError:
+        LOGGER.error("[ai] yt-dlp is not installed! (pip install yt-dlp) to enable this fallback.")
+        return None
     except Exception as e:
-        LOGGER.warning(f"[ai] tactiq transcript failed for {video_id}: {e}")
-    return None
+        LOGGER.warning(f"[ai] yt-dlp transcript failed for {video_id}: {e}")
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _try_youtubetotranscript(video_id: str) -> str:
-    """Fallback: youtubetotranscript.com free endpoint."""
+    """Fallback: youtubetotranscript.com free endpoint. This is frequently behind
+    a Cloudflare challenge from server IPs, so it's the last resort."""
     try:
         resp = requests.post(
             "https://youtubetotranscript.com/transcript",
@@ -390,8 +427,8 @@ def _try_youtubetotranscript(video_id: str) -> str:
 def _get_youtube_transcript(video_id: str) -> str:
     """Fetches a transcript using a fallback chain. On Render/cloud IPs the
     youtube-transcript-api requests are usually IP-blocked by YouTube, so we
-    try alternative public endpoints afterwards."""
-    for fetcher in (_try_youtube_transcript_api, _try_tactiq, _try_youtubetotranscript):
+    try yt-dlp (mobile clients) and public endpoints afterwards."""
+    for fetcher in (_try_youtube_transcript_api, _try_yt_dlp, _try_youtubetotranscript):
         try:
             text = fetcher(video_id)
         except Exception as e:
