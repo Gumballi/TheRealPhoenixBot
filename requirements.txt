@@ -27,3 +27,4 @@ beautifulsoup4
 cloudscraper
 curl_cffi
 torrentp
+yt-dlp
