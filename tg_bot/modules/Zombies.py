@@ -1,3 +1,4 @@
+import html
 import logging
 from time import sleep
 from typing import List
@@ -6,9 +7,11 @@ from telegram import Update, Bot, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import CommandHandler, Filters
 from telegram.ext.dispatcher import run_async
+from telegram.utils.helpers import mention_html
 
 from tg_bot import dispatcher
 from tg_bot.modules.helper_funcs.chat_status import is_bot_admin, is_user_admin
+from tg_bot.modules.log_channel import loggable
 
 # Reuse the tag-all member cache (extras.py) as the best available member list.
 # The Bot API cannot enumerate all chat members, so candidates are the admins
@@ -66,12 +69,16 @@ def _collect_zombies(bot: Bot, chat_id: int) -> List[int]:
     return zombies
 
 
-def _zombies_clean(bot: Bot, chat, message) -> None:
+@run_async
+@loggable
+def _zombies_clean(bot: Bot, update: Update) -> str:
+    chat = update.effective_chat
+    message = update.effective_message
     user = message.from_user
 
     if not is_bot_admin(chat, bot.id):
         message.reply_text("I'm not admin!")
-        return
+        return ""
 
     try:
         can_restrict = chat.get_member(bot.id).can_restrict_members
@@ -79,17 +86,17 @@ def _zombies_clean(bot: Bot, chat, message) -> None:
         can_restrict = False
     if not can_restrict:
         message.reply_text("I can't restrict members here! Make sure I'm admin and can ban users.")
-        return
+        return ""
 
     if not is_user_admin(chat, user.id):
         message.reply_text("Who dis non-admin telling me what to do?")
-        return
+        return ""
 
     status = message.reply_text("Purging out zombies from this group...")
     zombies = _collect_zombies(bot, chat.id)
     if not zombies:
         status.edit_text("No zombies or deleted accounts found in this group, group is clean!")
-        return
+        return ""
 
     killed, immune = 0, 0
     for uid in zombies:
@@ -108,6 +115,16 @@ def _zombies_clean(bot: Bot, chat, message) -> None:
     else:
         status.edit_text("Zombies purged! Zombies killed: `{}`".format(killed), parse_mode=ParseMode.MARKDOWN)
 
+    log = "<b>{}:</b>" \
+          "\n#ZOMBIES" \
+          "\n<b>Admin:</b> {}" \
+          "\n<b>Zombies killed:</b> {}".format(html.escape(chat.title),
+                                               mention_html(user.id, user.first_name),
+                                               killed)
+    if immune:
+        log += "\n<b>Zombies with immunity:</b> {}".format(immune)
+    return log
+
 
 @run_async
 def zombies(bot: Bot, update: Update, args: List[str]) -> None:
@@ -119,7 +136,7 @@ def zombies(bot: Bot, update: Update, args: List[str]) -> None:
         return
 
     if args and args[0].lower() == "clean":
-        _zombies_clean(bot, chat, message)
+        _zombies_clean(bot, update)
         return
 
     status = message.reply_text("Searching for zombies...")
