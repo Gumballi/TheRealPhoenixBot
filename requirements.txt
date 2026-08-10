@@ -28,3 +28,4 @@ cloudscraper
 curl_cffi
 torrentp
 yt-dlp
+gTTS
