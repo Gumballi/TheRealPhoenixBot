@@ -15,8 +15,50 @@ LOGGER = logging.getLogger(__name__)
 
 try:
     from gtts import gTTS
+    from gtts.langs import _langs
 except ImportError:
     gTTS = None
+    _langs = {}
+
+COMMON_LANGS = {
+    "af", "am", "ar", "bn", "bs", "ca", "cs", "cy", "da", "de",
+    "el", "en", "es", "et", "eu", "fa", "fi", "fil", "fr", "fr-CA",
+    "ga", "gl", "gu", "ha", "he", "hi", "hr", "hu", "hy", "id",
+    "ig", "it", "ja", "jv", "ka", "kk", "km", "kn", "ko", "lo",
+    "lt", "lv", "mg", "mk", "ml", "mr", "ms", "mt", "ne", "nl",
+    "no", "pa", "pl", "pt", "ro", "ru", "si", "sk", "sl", "so",
+    "sq", "sr", "sv", "sw", "ta", "te", "th", "tl", "tr", "uk",
+    "ur", "uz", "vi", "yo", "zh-CN", "zh-TW", "zu",
+}
+
+
+def _parse_input(input_str: str, reply_text: str) -> tuple:
+    input_str = input_str.strip()
+
+    if not input_str:
+        return ("en", reply_text) if reply_text else (None, None)
+
+    if "-" in input_str:
+        lan, text = input_str.split("-", 1)
+        lan = lan.strip() or "en"
+        text = text.strip() or (reply_text or "")
+        return lan, text
+
+    parts = input_str.split(None, 1)
+    first = parts[0]
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if first in COMMON_LANGS:
+        if rest:
+            return first, rest
+        if reply_text:
+            return first, reply_text
+        return first, ""
+
+    if reply_text and not rest:
+        return "en", reply_text
+
+    return "en", input_str
 
 
 def _generate_voice(text: str, lan: str) -> tuple:
@@ -45,30 +87,31 @@ def _generate_voice(text: str, lan: str) -> tuple:
 def voice(bot: Bot, update: Update, args: List[str]) -> None:
     message = update.effective_message
     reply = message.reply_to_message
+    reply_text = reply.text or reply.caption if reply and (reply.text or reply.caption) else None
     input_str = " ".join(args).strip()
 
-    if reply and (reply.text or reply.caption):
-        text = reply.text or reply.caption
-        lan = input_str or "en"
-    elif "-" in input_str:
-        lan, text = input_str.split("-", 1)
-    else:
+    lan, text = _parse_input(input_str, reply_text)
+
+    if not text:
         message.reply_text(
-            "Usage: /voice <language code> - <text>\n"
+            "Usage:\n"
+            " /voice <language code> - <text>\n"
+            " /voice <language code> <text>\n"
+            " /voice <text>  (English by default)\n\n"
             "Or reply to a message with: /voice <language code>\n\n"
             "Common codes: en, am, es, fr, de, hi, sw, ar, pt, ru"
         )
         return
 
-    text = text.strip()
-    lan = lan.strip()
-
-    if not text:
-        message.reply_text("Give me some text to speak!")
-        return
-
     if gTTS is None:
         message.reply_text("gTTS is not installed. Add `gTTS` to requirements.txt and restart.")
+        return
+
+    if lan not in _langs:
+        message.reply_text(
+            "Unsupported language code: `{}`\n\n"
+            "Full list: https://telegra.ph/SfMæisér--𐌷𐌴ࠋࠋ𐌱𐍈𐌸-𐌾𐌰𐍀𐌾-06-04".format(lan)
+        )
         return
 
     status = message.reply_text("Preparing voice...")
@@ -84,13 +127,14 @@ def voice(bot: Bot, update: Update, args: List[str]) -> None:
 
     duration = (datetime.datetime.now() - start).seconds
     caption = "Voiced: {}...\nLanguage: {}\nTime taken: {}s".format(text[:97], lan, duration)
+    reply_id = message.reply_to_message.message_id if message.reply_to_message else None
 
     try:
         with open(opus_path, "rb") as voice_file:
             message.reply_voice(
                 voice_file,
                 caption=caption,
-                reply_to_message_id=message.reply_to_message_id,
+                reply_to_message_id=reply_id,
             )
         status.delete()
     except Exception as err:
@@ -108,11 +152,17 @@ dispatcher.add_handler(VOICE_HANDLER)
 __help__ = """
 *Text to Speech*
  - /voice <lang> - <text>: Generates a voice note speaking the given text.
+ - /voice <lang> <text>: Same, without the `-` separator.
+ - /voice <text>: Speaks in English by default.
  - /voice <lang> (as a reply to a message): Speaks the replied message.
 
-Language defaults to English if omitted.
+Works with or without a reply. Language defaults to English if omitted.
 
-Common language codes: `en` English, `am` Amharic, `es` Spanish, `fr` French,
+The first word is auto-detected as the language if it matches a common
+language code; otherwise the whole text is spoken in English. Use `-` to
+force a specific code: `/voice <lang> - <text>`.
+
+Common codes: `en` English, `am` Amharic, `es` Spanish, `fr` French,
 `de` German, `hi` Hindi, `sw` Swahili, `ar` Arabic, `pt` Portuguese, `ru` Russian.
 
 Full list: https://telegra.ph/SfMæisér--𐌷𐌴ࠋࠋ𐌱𐍈𐌸-𐌾𐌰𐍀𐌾-06-04
