@@ -6,10 +6,10 @@ import tempfile
 from typing import List
 
 from telegram import Update, Bot
-from telegram.ext import CommandHandler, Filters
 from telegram.ext.dispatcher import run_async
 
 from tg_bot import dispatcher
+from tg_bot.modules.disable import DisableAbleCommandHandler
 
 LOGGER = logging.getLogger(__name__)
 
@@ -146,7 +146,7 @@ def voice(bot: Bot, update: Update, args: List[str]) -> None:
                 os.remove(path)
 
 
-VOICE_HANDLER = CommandHandler("voice", voice, pass_args=True)
+VOICE_HANDLER = DisableAbleCommandHandler("voice", voice, pass_args=True)
 dispatcher.add_handler(VOICE_HANDLER)
 
 __help__ = """
@@ -165,7 +165,7 @@ force a specific code: `/voice <lang> - <text>`.
 Common codes: `en` English, `am` Amharic, `es` Spanish, `fr` French,
 `de` German, `hi` Hindi, `sw` Swahili, `ar` Arabic, `pt` Portuguese, `ru` Russian.
 
-Full list: https://telegra.ph/SfMæisér--𐌷𐌴ࠋࠋ𐌱𐍈𐌸-𐌾𐌰𐍀𐌾-06-04
+*Admins only:* `/disable voice` / `/enable voice` toggles this command per chat.
 """
 
 __mod_name__ = "Voice"
