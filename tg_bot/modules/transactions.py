@@ -84,14 +84,19 @@ def _format_result(provider: str, body: dict) -> str:
         return "*Verification failed:*\n`{}`".format(message)
 
     data = body.get("data") or []
+    if isinstance(data, dict):
+        data = [data]
     if not data:
-        status = (body.get("verification") or {}).get("status", "unknown")
+        status = (body.get("verification") or {}).get("status")
         if status == "pending":
             return "Transaction is *still processing*. Try again in a few seconds."
         return "*Transaction not found* or could not be verified."
 
     item = data[0]
     if not item.get("verified"):
+        processing = item.get("processingStatus")
+        if processing == "pending":
+            return "Transaction is *still processing*. Try again in a few seconds."
         return "*Transaction not found* or could not be verified."
 
     lines = [
@@ -226,7 +231,7 @@ Verify Ethiopian bank and wallet payment receipts using the verify.et API.
  - /kaafi <reference> [phone]: Verify a Kaafi eBirr payment.
  - /verify <reference> [suffix] [phone]: Universal smart-router lookup.
 
-Requires the VERIFY_ET_API_KEY environment variable.
+Requires the `VERIFY_ET_API_KEY` environment variable.
 """
 
 __mod_name__ = "Transactions"
