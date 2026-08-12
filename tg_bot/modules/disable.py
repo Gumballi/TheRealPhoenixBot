@@ -5,7 +5,7 @@ from telegram import ParseMode, Update, Bot, Chat, User
 from telegram.ext import CommandHandler, RegexHandler, Filters
 from telegram.utils.helpers import escape_markdown
 
-from tg_bot import dispatcher
+from tg_bot import dispatcher, OWNER_ID
 from tg_bot.modules.helper_funcs.handlers import CMD_STARTERS
 from tg_bot.modules.helper_funcs.misc import is_module_loaded
 import tg_bot.modules.sql.blacklistusers_sql as bsql
@@ -74,6 +74,7 @@ if is_module_loaded(FILENAME):
     @user_admin
     def disable(bot: Bot, update: Update, args: List[str]):
         chat = update.effective_chat  # type: Optional[Chat]
+        user = update.effective_user  # type: Optional[User]
         if len(args) >= 1:
             disable_cmd = args[0]
             if disable_cmd.startswith(CMD_STARTERS):
@@ -81,8 +82,14 @@ if is_module_loaded(FILENAME):
 
             if disable_cmd in set(DISABLE_CMDS + DISABLE_OTHER):
                 sql.disable_command(chat.id, str(disable_cmd).lower())
-                update.effective_message.reply_text("Disabled the use of `{}`".format(disable_cmd),
-                                                    parse_mode=ParseMode.MARKDOWN)
+                if user.id == OWNER_ID:
+                    sql.owner_lock_command(chat.id, str(disable_cmd).lower())
+                    update.effective_message.reply_text(
+                        "Disabled the use of `{}` and locked it — only the owner can re-enable it".format(disable_cmd),
+                        parse_mode=ParseMode.MARKDOWN)
+                else:
+                    update.effective_message.reply_text("Disabled the use of `{}`".format(disable_cmd),
+                                                        parse_mode=ParseMode.MARKDOWN)
             else:
                 update.effective_message.reply_text("That command can't be disabled")
 
@@ -94,10 +101,19 @@ if is_module_loaded(FILENAME):
     @user_admin
     def enable(bot: Bot, update: Update, args: List[str]):
         chat = update.effective_chat  # type: Optional[Chat]
+        user = update.effective_user  # type: Optional[User]
         if len(args) >= 1:
             enable_cmd = args[0]
             if enable_cmd.startswith(CMD_STARTERS):
                 enable_cmd = enable_cmd[1:]
+
+            if sql.is_owner_locked(chat.id, enable_cmd):
+                if user.id != OWNER_ID:
+                    update.effective_message.reply_text(
+                        "Only the owner can re-enable `{}`".format(enable_cmd),
+                        parse_mode=ParseMode.MARKDOWN)
+                    return
+                sql.owner_unlock_command(chat.id, enable_cmd)
 
             if sql.enable_command(chat.id, enable_cmd):
                 update.effective_message.reply_text("Enabled the use of `{}`".format(enable_cmd),
@@ -125,12 +141,14 @@ if is_module_loaded(FILENAME):
     # do not async
     def build_curr_disabled(chat_id: Union[str, int]) -> str:
         disabled = sql.get_all_disabled(chat_id)
+        owner_locked = sql.get_all_owner_locked(chat_id)
         if not disabled:
             return "No commands are disabled!"
 
         result = ""
         for cmd in disabled:
-            result += " - `{}`\n".format(escape_markdown(cmd))
+            lock = " 🔒" if cmd in owner_locked else ""
+            result += " - `{}`{}\n".format(escape_markdown(cmd), lock)
         return "The following commands are currently restricted:\n{}".format(result)
 
 
@@ -141,7 +159,8 @@ if is_module_loaded(FILENAME):
 
 
     def __stats__():
-        return "{} disabled items, across {} chats.".format(sql.num_disabled(), sql.num_chats())
+        return "{} disabled items, across {} chats. {} owner-locked.".format(
+            sql.num_disabled(), sql.num_chats(), sql.num_owner_locked())
 
 
     def __migrate__(old_chat_id, new_chat_id):
@@ -161,6 +180,8 @@ if is_module_loaded(FILENAME):
  - /enable <cmd name>: enable that command
  - /disable <cmd name>: disable that command
  - /listcmds: list all possible toggleable commands
+
+Commands disabled by the owner are locked (🔒) and can only be re-enabled by the owner.
     """
 
     DISABLE_HANDLER = CommandHandler("disable", disable, pass_args=True, filters=Filters.group)
