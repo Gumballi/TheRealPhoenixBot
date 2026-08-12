@@ -1,18 +1,7 @@
 # Modular AI Chatbot module for TheRealPhoenixBot
-# Automatically retries transient errors (503/429/overload) and fails over between
-# providers (Gemini, Mistral, and optionally Poke) so a single provider's outage
-# doesn't take /ask down entirely. Upgraded with YouTube Transcript extraction.
-#
-# Poke integration (https://poke.com):
-#   - Added as a provider through the official Poke HTTP API
-#     (POST {POKE_API}/inbound/api-message with a Bearer API key).
-#   - Credentials are read ONLY from environment variables (POKE_API_KEY), never
-#     hardcoded. Obtain a key at https://poke.com/kitchen/api-keys after logging in.
-#   - NOTE: Poke is an asynchronous assistant - it delivers its actual reply through
-#     its own channels (iMessage/Telegram/tunnel). The API call returns a
-#     confirmation message, not the synchronous AI answer, so it is best used as a
-#     last-resort fallback provider.
-#   - Genuinely Don't know if this api works😂
+# Automatically retries transient errors (503/429/overload) and fails over from
+# Gemini to Mistral so a single provider's outage doesn't take /ask down entirely.
+# Upgraded with YouTube Transcript extraction capabilities.
 #
 # FIXED (see PR/patch notes):
 #   - mention_chatbot no longer fires on every reply in the chat (was matching
@@ -35,8 +24,8 @@ import glob
 import requests
 from collections import defaultdict, deque
 
-from telegram import Bot, Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CommandHandler, MessageHandler, Filters, CallbackQueryHandler, run_async
+from telegram import Bot, Update, ParseMode
+from telegram.ext import CommandHandler, MessageHandler, Filters, run_async
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
@@ -117,25 +106,10 @@ if MISTRAL_API_KEY:
 else:
     LOGGER.warning("[ai] MISTRAL_API_KEY not set - Mistral fallback disabled.")
 
-# ---------------------------------------------------------------------------
-# Poke setup (optional provider, https://poke.com)
-# ---------------------------------------------------------------------------
-# The Poke SDK is JS-only, so we talk to the same HTTP API it wraps. The magic
-# login-link (poke.com/login-link/<code>) is a one-time browser credential and is
-# NOT an API token - do not paste it here. Log in once via that link, create an API
-# key at https://poke.com/kitchen/api-keys, and export POKE_API_KEY.
-POKE_API_KEY = os.environ.get("POKE_API_KEY")
-POKE_API = os.environ.get("POKE_API", "https://poke.com/api/v1")
-
-if POKE_API_KEY:
-    LOGGER.info("[ai] Poke provider enabled (POKE_API_KEY set).")
-else:
-    LOGGER.warning("[ai] POKE_API_KEY not set - Poke provider disabled.")
-
-# Order providers are tried in. Override via env if you want Mistral/Poke first
+# Order providers are tried in. Override via env if you want Mistral tried first
 PROVIDER_ORDER = [
     p.strip().lower()
-    for p in os.environ.get("AI_PROVIDER_ORDER", "gemini,mistral,poke").split(",")
+    for p in os.environ.get("AI_PROVIDER_ORDER", "gemini,mistral").split(",")
     if p.strip()
 ]
 
@@ -148,35 +122,6 @@ TRANSIENT_MARKERS = ("503", "UNAVAILABLE", "429", "rate limit", "overloaded", "h
 # ---------------------------------------------------------------------------
 COOLDOWN_SECONDS = int(os.environ.get("AI_COOLDOWN_SECONDS", "8"))
 _last_request_at = defaultdict(float)  # user_id -> unix timestamp
-
-
-# ---------------------------------------------------------------------------
-# Per-user model preference (set via /model). "auto"/absent = PROVIDER_ORDER.
-# ---------------------------------------------------------------------------
-_user_provider = {}  # user_id -> provider name
-
-
-def _model_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Builds the model-picker inline keyboard. The user's current choice is
-    marked with a checkmark; unconfigured providers are flagged with '(off)'."""
-    current = _user_provider.get(user_id, "auto")
-    rows = []
-    for name in PROVIDER_ORDER:
-        provider = PROVIDERS.get(name)
-        if not provider:
-            continue
-        is_available, _, _ = provider
-        label = f"{'✓ ' if name == current else ''}{name}"
-        if not is_available():
-            label += " (off)"
-        rows.append([InlineKeyboardButton(label, callback_data=f"model:{name}")])
-    rows.append([
-        InlineKeyboardButton(
-            "✓ auto" if current == "auto" else "auto",
-            callback_data="model:auto",
-        )
-    ])
-    return InlineKeyboardMarkup(rows)
 
 
 def _on_cooldown(user_id: int) -> float:
@@ -320,62 +265,16 @@ def _call_mistral(prompt: str, media=None) -> str:
     )
     return response.choices[0].message.content.strip()
 
-def _call_poke(prompt: str, media=None) -> str:
-    """Calls the Poke assistant via the same HTTP API the JS SDK wraps.
-
-    Poke replies asynchronously: the agent delivers its real answer through its own
-    channels (iMessage/Telegram/tunnel), so this returns whatever confirmation text
-    the API returns rather than a synchronous model answer."""
-    if media:
-        raise RuntimeError("Poke provider does not support images/videos - use Gemini.")
-    try:
-        resp = requests.post(
-            f"{POKE_API}/inbound/api-message",
-            headers={
-                "Authorization": f"Bearer {POKE_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"message": prompt},
-            timeout=60,
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(f"Poke network error: {e}")
-
-    if resp.status_code == 401:
-        raise RuntimeError("Poke: invalid API key (401) - regenerate at https://poke.com/kitchen/api-keys")
-    if resp.status_code == 429:
-        raise RuntimeError("Poke: rate limited (429) - slow down")
-    if resp.status_code != 200:
-        raise RuntimeError(f"Poke API error ({resp.status_code}): {resp.text[:200]}")
-
-    data = resp.json()
-    if isinstance(data, dict):
-        text = data.get("message") or data.get("reply") or data.get("text")
-        if text:
-            return str(text).strip()
-    return "Poke accepted your message (its reply arrives through Poke's own channel)."
-
 PROVIDERS = {
     "gemini": (lambda: gemini_client is not None, _call_gemini, True),
     "mistral": (lambda: mistral_client is not None and mistral_supports_chat_complete, _call_mistral, False),
-    "poke": (lambda: bool(POKE_API_KEY), _call_poke, False),
 }
 
-def generate_ai_response(prompt: str, media=None, preferred=None) -> str:
+def generate_ai_response(prompt: str, media=None) -> str:
     last_error = None
     tried_any = False
 
-    # If the user picked a model via /model, try it first; if it gets exhausted
-    # (rate limited / overloaded / down), we automatically pass to the next
-    # provider in the order until one answers.
-    order = []
-    if preferred and preferred in PROVIDERS:
-        order.append(preferred)
-    for name in PROVIDER_ORDER:
-        if name not in order:
-            order.append(name)
-
-    for provider_name in order:
+    for provider_name in PROVIDER_ORDER:
         provider = PROVIDERS.get(provider_name)
         if not provider:
             LOGGER.warning(f"[ai] Unknown provider '{provider_name}' in AI_PROVIDER_ORDER, skipping.")
@@ -634,7 +533,7 @@ def ask_ai(bot: Bot, update: Update, args):
     prompt = enhance_prompt_with_youtube(prompt)
 
     bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-    response = generate_ai_response(prompt, media, preferred=_user_provider.get(user_id))
+    response = generate_ai_response(prompt, media)
     _record_history(msg.chat_id, "Phoenix", response)
     msg.reply_text(response)
 
@@ -718,7 +617,7 @@ def mention_chatbot(bot: Bot, update: Update):
     prompt = enhance_prompt_with_youtube(prompt)
 
     bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-    response = generate_ai_response(prompt, media, preferred=_user_provider.get(user_id))
+    response = generate_ai_response(prompt, media)
     _record_history(msg.chat_id, "Phoenix", response)
     msg.reply_text(response)
 
@@ -734,77 +633,6 @@ def ai_status(bot: Bot, update: Update):
         status = "configured" if is_available() else "NOT configured (missing API key or incompatible SDK)"
         lines.append(f"- `{name}`: {status}")
     update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-@run_async
-def model_command(bot: Bot, update: Update, args):
-    msg = update.effective_message
-    user_id = msg.from_user.id
-    arg = " ".join(args).strip().lower()
-
-    if not arg:
-        current = _user_provider.get(user_id, "auto")
-        msg.reply_text(
-            f"Your current model: `{current}`\n\nTap a button to switch, or use `/model <name>` / `/model auto`.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_model_keyboard(user_id),
-        )
-        return
-
-    if arg == "auto":
-        _user_provider.pop(user_id, None)
-        msg.reply_text("Model set to *auto* (automatic fallback order).", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    provider = PROVIDERS.get(arg)
-    if not provider:
-        msg.reply_text(f"Unknown model `{arg}`. See `/model` for the list.", parse_mode=ParseMode.MARKDOWN)
-        return
-    is_available, _, _ = provider
-    if not is_available():
-        msg.reply_text(f"Model `{arg}` is not configured (missing API key or incompatible SDK).", parse_mode=ParseMode.MARKDOWN)
-        return
-    _user_provider[user_id] = arg
-    msg.reply_text(
-        f"Model set to `{arg}`. If it gets exhausted, the bot will automatically pass to the next provider.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-@run_async
-def model_callback(bot: Bot, update: Update):
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    # Only the user who opened the /model menu can change their own model.
-    owner_id = query.message.from_user.id if query.message else query.from_user.id
-    if query.from_user.id != owner_id:
-        query.answer("This isn't your model menu!")
-        return
-
-    user_id = query.from_user.id
-    choice = query.data[len("model:"):].strip().lower()
-
-    if choice == "auto":
-        _user_provider.pop(user_id, None)
-        label = "auto"
-    elif choice in PROVIDERS:
-        is_available, _, _ = PROVIDERS[choice]
-        if not is_available():
-            query.answer(f"{choice} is not configured")
-            return
-        _user_provider[user_id] = choice
-        label = choice
-    else:
-        query.answer("Unknown model")
-        return
-
-    query.answer()
-    query.edit_message_text(
-        f"Model set to `{label}`. If it gets exhausted, the bot automatically passes to the next provider.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_model_keyboard(user_id),
-    )
 
 
 ASK_HANDLER = DisableAbleCommandHandler(["ask", "ai"], ask_ai, pass_args=True)
@@ -832,26 +660,16 @@ dispatcher.add_handler(MEDIA_HANDLER, group=10)
 AI_STATUS_HANDLER = CommandHandler("aistatus", ai_status)
 dispatcher.add_handler(AI_STATUS_HANDLER)
 
-MODEL_HANDLER = DisableAbleCommandHandler("model", model_command, pass_args=True)
-dispatcher.add_handler(MODEL_HANDLER)
-
-MODEL_CALLBACK_HANDLER = CallbackQueryHandler(model_callback, pattern=r"^model:")
-dispatcher.add_handler(MODEL_CALLBACK_HANDLER)
-
 __help__ = """
 Let's make the bot conversational! You can interact with the built-in AI model.
 
 *Available commands:*
  - /ask <question>: Ask the AI any question directly.
  - /ai <question>: Same as /ask.
- - /model: Choose your preferred AI model (Gemini / Mistral / Poke / Auto) with an inline keyboard, or use `/model <name>`.
  - /aistatus: Shows which AI providers are configured and their fallback order.
 
 *Alternative:*
 - Simply tag the bot (`@bot_username`) in a group message, or message it in private, and it will automatically answer you using AI!
-
-*Model selection:*
-Run `/model` and tap a button to pick the provider used for your questions. Choose *Auto* (the default) to let the bot decide. If your chosen model gets exhausted (rate limited / overloaded), the bot automatically passes to the next available provider.
 
 *Conversation memory:*
 - The bot keeps track of the last several messages in a chat, so it can follow multi-turn conversations and tell users apart by name.
@@ -862,11 +680,8 @@ Run `/model` and tap a button to pick the provider used for your questions. Choo
 *YouTube Support:*
 If you send a YouTube link to the AI, it will fetch the video's title, channel, and closed captions and answer questions about the video!
 
-*Poke (optional):*
-The bot can also fall back to your [Poke](https://poke.com) assistant. Set the `POKE_API_KEY` environment variable (create a key at poke.com/kitchen/api-keys after logging in). Note that Poke replies asynchronously through its own channels, so its API confirmation text is used as the fallback reply.
-
 *Reliability:*
-This module automatically retries and fails over between providers (currently Gemini → Mistral → Poke, in that order) if one is temporarily overloaded. When images/videos are attached, only Gemini is used. Provider order is configurable via the `AI_PROVIDER_ORDER` environment variable.
+This module automatically retries and fails over between providers (currently Gemini and Mistral, in that order) if one is temporarily overloaded. When images/videos are attached, only Gemini is used.
 """
 
 __mod_name__ = "AI Chatbot"
