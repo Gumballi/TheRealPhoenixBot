@@ -1,7 +1,7 @@
 # Modular AI Chatbot module for TheRealPhoenixBot
-# Automatically retries transient errors (503/429/overload) and fails over from
-# Gemini to Mistral so a single provider's outage doesn't take /ask down entirely.
-# Upgraded with YouTube Transcript extraction capabilities.
+# Automatically retries transient errors (503/429/overload) and fails over between
+# providers (Gemini, Mistral) so a single provider's outage doesn't take /ask down
+# entirely. Upgraded with YouTube Transcript extraction.
 #
 # FIXED (see PR/patch notes):
 #   - mention_chatbot no longer fires on every reply in the chat (was matching
@@ -14,6 +14,9 @@
 #   - GEMINI_MODEL is now overridable via env var.
 #   - Mistral call failures are surfaced more clearly instead of always
 #     collapsing into the generic "neural misfire" message.
+#   - /model command with an inline keyboard to pick the per-user provider.
+#   - NOTE: Poke was removed - its API is send-only (fire-and-forget, replies arrive
+#     on the user's own phone), so it can't produce chat answers.
 
 import io
 import os
@@ -24,8 +27,8 @@ import glob
 import requests
 from collections import defaultdict, deque
 
-from telegram import Bot, Update, ParseMode
-from telegram.ext import CommandHandler, MessageHandler, Filters, run_async
+from telegram import Bot, Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CommandHandler, MessageHandler, Filters, CallbackQueryHandler, run_async
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
@@ -122,6 +125,35 @@ TRANSIENT_MARKERS = ("503", "UNAVAILABLE", "429", "rate limit", "overloaded", "h
 # ---------------------------------------------------------------------------
 COOLDOWN_SECONDS = int(os.environ.get("AI_COOLDOWN_SECONDS", "8"))
 _last_request_at = defaultdict(float)  # user_id -> unix timestamp
+
+
+# ---------------------------------------------------------------------------
+# Per-user model preference (set via /model). "auto"/absent = PROVIDER_ORDER.
+# ---------------------------------------------------------------------------
+_user_provider = {}  # user_id -> provider name
+
+
+def _model_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Builds the model-picker inline keyboard. The user's current choice is
+    marked with a checkmark; unconfigured providers are flagged with '(off)'."""
+    current = _user_provider.get(user_id, "auto")
+    rows = []
+    for name in PROVIDER_ORDER:
+        provider = PROVIDERS.get(name)
+        if not provider:
+            continue
+        is_available, _, _ = provider
+        label = f"{'✓ ' if name == current else ''}{name}"
+        if not is_available():
+            label += " (off)"
+        rows.append([InlineKeyboardButton(label, callback_data=f"model:{name}")])
+    rows.append([
+        InlineKeyboardButton(
+            "✓ auto" if current == "auto" else "auto",
+            callback_data="model:auto",
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _on_cooldown(user_id: int) -> float:
@@ -270,11 +302,21 @@ PROVIDERS = {
     "mistral": (lambda: mistral_client is not None and mistral_supports_chat_complete, _call_mistral, False),
 }
 
-def generate_ai_response(prompt: str, media=None) -> str:
+def generate_ai_response(prompt: str, media=None, preferred=None) -> str:
     last_error = None
     tried_any = False
 
-    for provider_name in PROVIDER_ORDER:
+    # If the user picked a model via /model, try it first; if it gets exhausted
+    # (rate limited / overloaded / down), we automatically pass to the next
+    # provider in the order until one answers.
+    order = []
+    if preferred and preferred in PROVIDERS:
+        order.append(preferred)
+    for name in PROVIDER_ORDER:
+        if name not in order:
+            order.append(name)
+
+    for provider_name in order:
         provider = PROVIDERS.get(provider_name)
         if not provider:
             LOGGER.warning(f"[ai] Unknown provider '{provider_name}' in AI_PROVIDER_ORDER, skipping.")
@@ -533,7 +575,7 @@ def ask_ai(bot: Bot, update: Update, args):
     prompt = enhance_prompt_with_youtube(prompt)
 
     bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-    response = generate_ai_response(prompt, media)
+    response = generate_ai_response(prompt, media, preferred=_user_provider.get(user_id))
     _record_history(msg.chat_id, "Phoenix", response)
     msg.reply_text(response)
 
@@ -617,7 +659,7 @@ def mention_chatbot(bot: Bot, update: Update):
     prompt = enhance_prompt_with_youtube(prompt)
 
     bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-    response = generate_ai_response(prompt, media)
+    response = generate_ai_response(prompt, media, preferred=_user_provider.get(user_id))
     _record_history(msg.chat_id, "Phoenix", response)
     msg.reply_text(response)
 
@@ -633,6 +675,77 @@ def ai_status(bot: Bot, update: Update):
         status = "configured" if is_available() else "NOT configured (missing API key or incompatible SDK)"
         lines.append(f"- `{name}`: {status}")
     update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+@run_async
+def model_command(bot: Bot, update: Update, args):
+    msg = update.effective_message
+    user_id = msg.from_user.id
+    arg = " ".join(args).strip().lower()
+
+    if not arg:
+        current = _user_provider.get(user_id, "auto")
+        msg.reply_text(
+            f"Your current model: `{current}`\n\nTap a button to switch, or use `/model <name>` / `/model auto`.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_model_keyboard(user_id),
+        )
+        return
+
+    if arg == "auto":
+        _user_provider.pop(user_id, None)
+        msg.reply_text("Model set to *auto* (automatic fallback order).", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    provider = PROVIDERS.get(arg)
+    if not provider:
+        msg.reply_text(f"Unknown model `{arg}`. See `/model` for the list.", parse_mode=ParseMode.MARKDOWN)
+        return
+    is_available, _, _ = provider
+    if not is_available():
+        msg.reply_text(f"Model `{arg}` is not configured (missing API key or incompatible SDK).", parse_mode=ParseMode.MARKDOWN)
+        return
+    _user_provider[user_id] = arg
+    msg.reply_text(
+        f"Model set to `{arg}`. If it gets exhausted, the bot will automatically pass to the next provider.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@run_async
+def model_callback(bot: Bot, update: Update):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    # Only the user who opened the /model menu can change their own model.
+    owner_id = query.message.from_user.id if query.message else query.from_user.id
+    if query.from_user.id != owner_id:
+        query.answer("This isn't your model menu!")
+        return
+
+    user_id = query.from_user.id
+    choice = query.data[len("model:"):].strip().lower()
+
+    if choice == "auto":
+        _user_provider.pop(user_id, None)
+        label = "auto"
+    elif choice in PROVIDERS:
+        is_available, _, _ = PROVIDERS[choice]
+        if not is_available():
+            query.answer(f"{choice} is not configured")
+            return
+        _user_provider[user_id] = choice
+        label = choice
+    else:
+        query.answer("Unknown model")
+        return
+
+    query.answer()
+    query.edit_message_text(
+        f"Model set to `{label}`. If it gets exhausted, the bot automatically passes to the next provider.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_model_keyboard(user_id),
+    )
 
 
 ASK_HANDLER = DisableAbleCommandHandler(["ask", "ai"], ask_ai, pass_args=True)
@@ -660,16 +773,26 @@ dispatcher.add_handler(MEDIA_HANDLER, group=10)
 AI_STATUS_HANDLER = CommandHandler("aistatus", ai_status)
 dispatcher.add_handler(AI_STATUS_HANDLER)
 
+MODEL_HANDLER = DisableAbleCommandHandler("model", model_command, pass_args=True)
+dispatcher.add_handler(MODEL_HANDLER)
+
+MODEL_CALLBACK_HANDLER = CallbackQueryHandler(model_callback, pattern=r"^model:")
+dispatcher.add_handler(MODEL_CALLBACK_HANDLER)
+
 __help__ = """
 Let's make the bot conversational! You can interact with the built-in AI model.
 
 *Available commands:*
  - /ask <question>: Ask the AI any question directly.
  - /ai <question>: Same as /ask.
+ - /model: Choose your preferred AI model (Gemini / Mistral / Auto) with an inline keyboard, or use `/model <name>`.
  - /aistatus: Shows which AI providers are configured and their fallback order.
 
 *Alternative:*
 - Simply tag the bot (`@bot_username`) in a group message, or message it in private, and it will automatically answer you using AI!
+
+*Model selection:*
+Run `/model` and tap a button to pick the provider used for your questions. Choose *Auto* (the default) to let the bot decide. If your chosen model gets exhausted (rate limited / overloaded), the bot automatically passes to the next available provider.
 
 *Conversation memory:*
 - The bot keeps track of the last several messages in a chat, so it can follow multi-turn conversations and tell users apart by name.
@@ -681,7 +804,7 @@ Let's make the bot conversational! You can interact with the built-in AI model.
 If you send a YouTube link to the AI, it will fetch the video's title, channel, and closed captions and answer questions about the video!
 
 *Reliability:*
-This module automatically retries and fails over between providers (currently Gemini and Mistral, in that order) if one is temporarily overloaded. When images/videos are attached, only Gemini is used.
+This module automatically retries and fails over between providers (currently Gemini → Mistral, in that order) if one is temporarily overloaded. When images/videos are attached, only Gemini is used. Provider order is configurable via the `AI_PROVIDER_ORDER` environment variable.
 """
 
 __mod_name__ = "AI Chatbot"
