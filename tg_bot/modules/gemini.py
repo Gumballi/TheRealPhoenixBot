@@ -131,6 +131,17 @@ _last_request_at = defaultdict(float)  # user_id -> unix timestamp
 # Per-user model preference (set via /model). "auto"/absent = PROVIDER_ORDER.
 # ---------------------------------------------------------------------------
 _user_provider = {}  # user_id -> provider name
+# Tracks who opened each /model menu (message_id -> user_id). The keyboard sits on
+# the bot's own reply message, so the owner can't be derived from the message.
+_model_menu_owner = {}  # message_id -> user_id
+
+
+def _prune_menu_owners() -> None:
+    """Keeps the owner map from growing forever (dicts preserve insertion order)."""
+    if len(_model_menu_owner) > 500:
+        overflow = len(_model_menu_owner) - 500
+        for key in list(_model_menu_owner)[:overflow]:
+            _model_menu_owner.pop(key, None)
 
 
 def _model_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -685,11 +696,14 @@ def model_command(bot: Bot, update: Update, args):
 
     if not arg:
         current = _user_provider.get(user_id, "auto")
-        msg.reply_text(
+        sent = msg.reply_text(
             f"Your current model: `{current}`\n\nTap a button to switch, or use `/model <name>` / `/model auto`.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=_model_keyboard(user_id),
         )
+        if sent:
+            _model_menu_owner[sent.message_id] = user_id
+            _prune_menu_owners()
         return
 
     if arg == "auto":
@@ -717,13 +731,14 @@ def model_callback(bot: Bot, update: Update):
     query = update.callback_query
     if not query or not query.data:
         return
-    # Only the user who opened the /model menu can change their own model.
-    owner_id = query.message.from_user.id if query.message else query.from_user.id
+    user_id = query.from_user.id
+    # Only the user who opened the /model menu can change their own model. The
+    # keyboard lives on the bot's reply message, so look up the owner by message_id.
+    owner_id = _model_menu_owner.get(query.message.message_id, user_id) if query.message else user_id
     if query.from_user.id != owner_id:
         query.answer("This isn't your model menu!")
         return
 
-    user_id = query.from_user.id
     choice = query.data[len("model:"):].strip().lower()
 
     if choice == "auto":
