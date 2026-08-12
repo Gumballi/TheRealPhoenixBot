@@ -39,9 +39,10 @@ GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY")
 # index.php?req= for search, /ads.php?md5= for the download page and
 # get.php?md5=...&key= for the actual file. Rotate through the live ones.
 LIBGEN_DOMAINS = ["libgen.li", "libgen.la", "libgen.gl", "libgen.bz", "libgen.vg"]
-# Anna's Archive mirrors. .org is unreachable from some hosts; .gl serves real
-# search results without a JS challenge and is used as the primary fallback.
-ANNA_MIRRORS = ["annas-archive.org", "annas-archive.gl", "annas-archive.se"]
+# Anna's Archive mirrors. .org and .se frequently fail DNS resolution from
+# cloud hosts (Render) and some ISPs; .gl resolves and serves search results
+# without a JS challenge, so it is listed first.
+ANNA_MIRRORS = ["annas-archive.gl", "annas-archive.org", "annas-archive.se"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 session = requests.Session()
@@ -206,31 +207,50 @@ def search_annas_archive(query: str) -> Optional[List[dict]]:
             continue
     raise Exception("Could not reach Anna's Archive. They may be temporarily down.")
 
+# Internet Archive collection/category ids that appear in Anna's Archive
+# /md5/ pages but are NOT real item identifiers. Resolving these returns
+# generic collection metadata and never a file, so skip them.
+IA_JUNK_IDS = {
+    "inlibrary", "in_library", "internetarchivebooks", "printdisabled",
+    "bannedcollection", "booksfromparliament", "americana",
+    "lendinglibrary", "popularlibrary", "top4collection",
+    "library_of_congress", "tessellation", "europeanlibraries",
+    "web-books", "pub_elements", "cover", "ia_thumb",
+}
+
+
 def get_ia_download_url(md5: str) -> Optional[str]:
-    """Resolve an Internet Archive download link for an Anna's Archive record."""
-    try:
-        resp = session.get(f"https://{ANNA_MIRRORS[0]}/md5/{md5}", timeout=20)
-        if resp.status_code != 200:
-            return None
-        ia_ids = re.findall(r'https://archive\.org/details/([A-Za-z0-9_.-]+)', resp.text)
-        for ia_id in dict.fromkeys(ia_ids):
-            try:
-                meta = session.get(f"https://archive.org/metadata/{ia_id}", timeout=10).json()
-                # Lending-only items return 403 on direct file download — skip them
-                if meta.get("metadata", {}).get("access-restricted-item") == "true":
-                    continue
-                for f in meta.get("files", []):
-                    name = f.get("name", "")
-                    if name.lower().endswith(".epub"):
-                        return f"https://archive.org/download/{ia_id}/{name}"
-                for f in meta.get("files", []):
-                    name = f.get("name", "")
-                    if name.lower().endswith(".pdf") and "encrypted" not in name.lower():
-                        return f"https://archive.org/download/{ia_id}/{name}"
-            except Exception:
+    """Resolve an Internet Archive download link for an Anna's Archive record.
+    Iterates the mirror list so a single dead mirror (e.g. .org failing DNS)
+    doesn't break the whole lookup, and skips IA collection IDs that are not
+    real items."""
+    for domain in ANNA_MIRRORS:
+        try:
+            resp = session.get(f"https://{domain}/md5/{md5}", timeout=20)
+            if resp.status_code != 200:
                 continue
-    except Exception as e:
-        LOGGER.error(f"[AnnasArchive IA resolver] {e}")
+            ia_ids = re.findall(r'https://archive\.org/details/([A-Za-z0-9_.-]+)', resp.text)
+            for ia_id in dict.fromkeys(ia_ids):
+                if ia_id in IA_JUNK_IDS:
+                    continue
+                try:
+                    meta = session.get(f"https://archive.org/metadata/{ia_id}", timeout=10).json()
+                    # Lending-only items return 403 on direct file download — skip them
+                    if meta.get("metadata", {}).get("access-restricted-item") == "true":
+                        continue
+                    for f in meta.get("files", []):
+                        name = f.get("name", "")
+                        if name.lower().endswith(".epub"):
+                            return f"https://archive.org/download/{ia_id}/{name}"
+                    for f in meta.get("files", []):
+                        name = f.get("name", "")
+                        if name.lower().endswith(".pdf") and "encrypted" not in name.lower():
+                            return f"https://archive.org/download/{ia_id}/{name}"
+                except Exception:
+                    continue
+        except Exception as e:
+            LOGGER.debug(f"[AnnasArchive IA resolver] {domain} failed: {e}")
+            continue
     return None
 
 def build_aabook_keyboard(msg_id: int, results: list) -> InlineKeyboardMarkup:
