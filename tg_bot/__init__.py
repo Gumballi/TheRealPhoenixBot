@@ -52,6 +52,43 @@ logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO)
 # enable logging
 LOGGER = logging.getLogger(__name__)
 
+
+def _early_port_bind():
+    """Bind $PORT as early as possible so Render's health check sees the
+    instance as alive while the slow import-time DB work (18 sql modules run
+    __table__.create()/__load_*() at import) is still finishing. Without this,
+    a slow Neon pool blocks boot past Render's timeout and the instance is
+    SIGTERM'd and restarted in a loop."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    port = int(os.environ.get("PORT", 10000))
+
+    class _Health(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    def _serve():
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", port), _Health)
+            LOGGER.info("Early health server listening on port %s", port)
+            server.serve_forever()
+        except OSError as err:
+            if err.errno == 98:  # EADDRINUSE - another worker already bound it
+                LOGGER.warning("Port %s already in use; skipping early bind.", port)
+            else:
+                LOGGER.warning("Early port bind failed on %s: %s", port, err)
+
+    threading.Thread(target=_serve, daemon=True, name="early-port-bind").start()
+
+
+_early_port_bind()
+
 # Verify Python runtime compatibility
 if sys.version_info[0] < 3 or sys.version_info[1] < 7:
     LOGGER.error("You MUST have a python version of at least 3.7! Modern async features depend on this. Bot quitting.")
