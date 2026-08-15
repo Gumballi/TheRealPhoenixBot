@@ -42,13 +42,16 @@ LIBGEN_DOMAINS = ["libgen.li", "libgen.la", "libgen.gl", "libgen.bz", "libgen.vg
 # Anna's Archive mirrors. .org and .se frequently fail DNS resolution from
 # cloud hosts (Render) and some ISPs; .gl resolves and serves search results
 # without a JS challenge, so it is listed first.
-ANNA_MIRRORS = ["annas-archive.gl", "annas-archive.org", "annas-archive.se"]
+ANNA_MIRRORS = ["annas-archive.gd", "annas-archive.pk", "annas-archive.gl"]
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "text/html,application/json,application/xhtml+xml,*/*;q=0.8"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://annas-archive.gd/",
+    "Connection": "keep-alive"
 })
 
 RETRY_STRATEGY = Retry(total=1, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504], raise_on_status=False)
@@ -155,57 +158,49 @@ def _parse_libgen_rows(page: str, domain: str) -> List[Book]:
 # ==========================================
 # 4. ANNA'S ARCHIVE ENGINE (/aabook)
 # ==========================================
-def _parse_annas_rows(page: str) -> List[dict]:
-    """Parse Anna's Archive search results (one flex row per book)."""
+def _is_bot_challenge(response: requests.Response) -> bool:
+    """Detect Turnstile, Cloudflare, DDoS-Guard and similar interstitials."""
+    body = (response.text or "")[:200000].lower()
+    markers = ("cf-chl-", "turnstile", "challenges.cloudflare.com", "cloudflare ray id",
+               "just a moment", "checking your browser", "ddos-guard", "ddos protection",
+               "security verification", "verify you are human", "challenge-platform", "captcha")
+    return response.status_code in {403, 429, 503} or any(x in body for x in markers)
+
+def _parse_annas_rows(page: str, domain: str = "") -> List[dict]:
+    """Parse Anna's Archive rows defensively and tag each result's mirror."""
     books = []
+    if not page: return books
     for seg in re.split(r'(?=<div class="flex\s+pt-3 pb-3 border-b)', page):
-        md5_match = re.search(r'/md5/([a-f0-9]{32})', seg)
-        if not md5_match:
-            continue
-        md5 = md5_match.group(1)
-
-        title_match = re.search(r'class="[^"]*js-vim-focus[^"]*"[^>]*>(.*?)</a>', seg, re.S)
-        title = _strip_html(title_match.group(1)) if title_match else "Unknown"
-
-        author_match = re.search(r'icon-\[mdi--user-edit\][^>]*></span>\s*(.*?)</a>', seg, re.S)
-        author = _strip_html(author_match.group(1)) if author_match else "Unknown"
-
-        meta_match = re.search(r'class="text-gray-800[^"]*mt-2">(.*?)(?:\s*<a href="#"|</div>)', seg, re.S)
-        meta = _strip_html(meta_match.group(1)) if meta_match else ""
-
-        parts = [p.strip() for p in meta.split('·')]
-        ext = next((t for t in parts if re.fullmatch(r'[A-Za-z0-9]{3,5}', t)), "").lower()
-        year = next((t for t in parts if re.fullmatch(r'\d{4}', t)), "")
-        lang = parts[0].replace('✅', '').replace('❌', '').strip() if parts else ""
-
-        books.append({
-            "md5": md5,
-            "title": title[:100],
-            "author": author[:80],
-            "year": year,
-            "ext": ext,
-            "size": _parse_size(meta),
-            "lang": lang
-        })
+        try:
+            m = re.search(r'/md5/([a-f0-9]{32})', seg, re.I)
+            if not m: continue
+            tm = re.search(r'class="[^"]*js-vim-focus[^"]*"[^>]*>(.*?)</a>', seg, re.S|re.I)
+            am = re.search(r'icon-\[mdi--user-edit\][^>]*></span>\s*(.*?)</a>', seg, re.S|re.I)
+            mm = re.search(r'class="text-gray-800[^"]*mt-2">(.*?)(?:\s*<a href="#"|</div>)', seg, re.S|re.I)
+            title = _strip_html(tm.group(1)) if tm else "Unknown"; author = _strip_html(am.group(1)) if am else "Unknown"
+            meta = _strip_html(mm.group(1)) if mm else ""; parts = [x.strip() for x in meta.split("·") if x.strip()]
+            ext = next((x for x in parts if re.fullmatch(r"[A-Za-z0-9]{2,5}", x)), "").lower()
+            year = next((x for x in parts if re.fullmatch(r"\d{4}", x)), "")
+            lang = parts[0].replace("✅", "").replace("❌", "").strip() if parts else ""
+            books.append({"md5":m.group(1).lower(), "title":title[:100], "author":author[:80], "year":year, "ext":ext, "size":_parse_size(meta), "lang":lang, "domain":domain})
+        except (AttributeError, IndexError, TypeError, ValueError, re.error) as exc: LOGGER.debug("Malformed Anna row: %s", exc)
     return books
 
 def search_annas_archive(query: str) -> Optional[List[dict]]:
-    """Search Anna's Archive (indexes LibGen, Z-Library, IA, Sci-Hub & more)."""
+    """Search every mirror; an empty parse continues to the next mirror."""
+    if not query or not query.strip(): return []
+    failed = False
     for domain in ANNA_MIRRORS:
         try:
-            resp = session.get(f"https://{domain}/search", params={"q": query, "lang": "en"}, timeout=20)
-            if resp.status_code != 200:
-                continue
-            if "cloudflare" in resp.text.lower() or "just a moment" in resp.text.lower():
-                continue
-            books = _parse_annas_rows(resp.text)
-            if books:
-                return books
-            return []
-        except Exception as e:
-            LOGGER.debug(f"[AnnasArchive] {domain} failed: {e}")
-            continue
-    raise Exception("Could not reach Anna's Archive. They may be temporarily down.")
+            base = f"https://{domain}"
+            resp = session.get(f"{base}/search", params={"q":query.strip(), "lang":"en"}, headers={"Referer":f"{base}/", "Accept-Language":"en-US,en;q=0.9"}, timeout=20)
+            if resp.status_code != 200 or _is_bot_challenge(resp): failed=True; continue
+            books = _parse_annas_rows(resp.text, domain)
+            if books: return books
+        except requests.RequestException: failed=True
+        except Exception: failed=True; LOGGER.exception("Anna mirror %s failed", domain)
+    if failed: raise Exception("Could not reach or parse Anna's Archive mirrors.")
+    return []
 
 # Internet Archive collection/category ids that appear in Anna's Archive
 # /md5/ pages but are NOT real item identifiers. Resolving these returns
@@ -377,7 +372,7 @@ def aabook_callback(bot, update: Update):
 
         status_msg.edit_text(
             f"❌ Could not resolve a direct download link.\n\n"
-            f"[Open on Anna's Archive](https://annas-archive.gl/md5/{md5})",
+            f"[Open on Anna's Archive](https://{book.get('domain') or ANNA_MIRRORS[0]}/md5/{md5})",
             parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
         )
 
