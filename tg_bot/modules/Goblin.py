@@ -81,8 +81,32 @@ ALL_PLATFORMS = {
     "threads": _THREADS_PATTERN,
 }
 
-# Optional: path to a Netscape cookies.txt for YouTube (set via env var)
+# Optional: YouTube auth cookies. Supports two methods:
+#   1. YT_COOKIES_FILE: path to a Netscape cookies.txt file (needs persistent disk)
+#   2. YOUTUBE_COOKIES_B64: base64-encoded contents of cookies.txt (Render-friendly)
 _YT_COOKIES = os.environ.get("YT_COOKIES_FILE", "")
+_YT_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
+
+
+def _get_yt_cookiefile() -> Optional[str]:
+    """Return a path to a valid cookies.txt file, or None."""
+    # Method 1: direct file path
+    if _YT_COOKIES and os.path.isfile(_YT_COOKIES):
+        return _YT_COOKIES
+    # Method 2: base64 env var — decode to a temp file
+    if _YT_COOKIES_B64:
+        try:
+            import base64 as _b64
+            decoded = _b64.b64decode(_YT_COOKIES_B64)
+            # Cache the file so we only write it once per process
+            cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+            if not os.path.exists(cookie_path):
+                with open(cookie_path, "wb") as f:
+                    f.write(decoded)
+            return cookie_path
+        except Exception as err:
+            LOGGER.warning("Failed to decode YOUTUBE_COOKIES_B64: %s", err)
+    return None
 
 # ---------------------------------------------------------------------------
 # Cooldown and pending download state
@@ -174,8 +198,9 @@ def _get_yt_formats(url: str) -> Tuple[Optional[dict], list]:
             "noplaylist": True,
             "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         }
-        if _YT_COOKIES and os.path.isfile(_YT_COOKIES):
-            ydl_opts["cookiefile"] = _YT_COOKIES
+        _cookiefile = _get_yt_cookiefile()
+        if _cookiefile:
+            ydl_opts["cookiefile"] = _cookiefile
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if not info:
@@ -286,8 +311,9 @@ def _download_yt(url: str, fmt_str: str, tmpdir: str) -> Optional[str]:
             "merge_output_format": "mp4",
             "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         }
-        if _YT_COOKIES and os.path.isfile(_YT_COOKIES):
-            ydl_opts["cookiefile"] = _YT_COOKIES
+        _cookiefile = _get_yt_cookiefile()
+        if _cookiefile:
+            ydl_opts["cookiefile"] = _cookiefile
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
         if not info:
