@@ -81,6 +81,9 @@ ALL_PLATFORMS = {
     "threads": _THREADS_PATTERN,
 }
 
+# Optional: path to a Netscape cookies.txt for YouTube (set via env var)
+_YT_COOKIES = os.environ.get("YT_COOKIES_FILE", "")
+
 # ---------------------------------------------------------------------------
 # Cooldown and pending download state
 # ---------------------------------------------------------------------------
@@ -171,6 +174,8 @@ def _get_yt_formats(url: str) -> Tuple[Optional[dict], list]:
             "noplaylist": True,
             "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         }
+        if _YT_COOKIES and os.path.isfile(_YT_COOKIES):
+            ydl_opts["cookiefile"] = _YT_COOKIES
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if not info:
@@ -238,6 +243,8 @@ def _download_yt(url: str, fmt_str: str, tmpdir: str) -> Optional[str]:
             "merge_output_format": "mp4",
             "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         }
+        if _YT_COOKIES and os.path.isfile(_YT_COOKIES):
+            ydl_opts["cookiefile"] = _YT_COOKIES
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
         if not info:
@@ -337,6 +344,72 @@ def _download_threads(url: str, tmpdir: str) -> Optional[str]:
     return None
 
 
+def _download_pinterest(url: str, tmpdir: str) -> Optional[str]:
+    """Scrape Pinterest media via cloudscraper + OpenGraph/meta tags.
+    Falls back when yt-dlp can't find video formats (image-only pins, etc.)."""
+    try:
+        scraper = cloudscraper.create_scraper()
+        resp = scraper.get(url, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+
+        # Try og:video first, then og:image
+        for prop in ("og:video", "og:video:secure_url", "og:image"):
+            match = re.search(
+                r'<meta\s+(?:property|name)=["\']' + prop + r'["\']\s+content=["\']([^"\']+)["\']',
+                html,
+            )
+            if not match:
+                match = re.search(
+                    r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']' + prop + r'["\']',
+                    html,
+                )
+            if match:
+                media_url = match.group(1)
+                if media_url.startswith("//"):
+                    media_url = "https:" + media_url
+                parsed = urllib.parse.urlparse(media_url)
+                ext = os.path.splitext(parsed.path)[1] or (".mp4" if "video" in prop else ".jpg")
+                filepath = os.path.join(tmpdir, "pinterest_media" + ext)
+                dl_resp = scraper.get(media_url, timeout=30, stream=True)
+                dl_resp.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl_resp.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None
+                return filepath
+
+        # Fallback: look for embed/description video URL in JSON
+        for pattern in (
+            r'"video_url"\s*:\s*"([^"]+)"',
+            r'"embed_url"\s*:\s*"([^"]+)"',
+            r'"images\s*:\s*\{[^}]*"orig"\s*:\s*\{[^}]*"url"\s*:\s*"([^"]+)"',
+        ):
+            json_match = re.search(pattern, html)
+            if json_match:
+                media_url = json_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+                if media_url.startswith("//"):
+                    media_url = "https:" + media_url
+                parsed = urllib.parse.urlparse(media_url)
+                ext = os.path.splitext(parsed.path)[1] or ".jpg"
+                filepath = os.path.join(tmpdir, "pinterest_media" + ext)
+                dl_resp = scraper.get(media_url, timeout=30, stream=True)
+                dl_resp.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl_resp.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None
+                return filepath
+
+    except Exception as err:
+        LOGGER.warning("Pinterest scrape failed for %s: %s", url, err)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Send helpers
 # ---------------------------------------------------------------------------
@@ -421,7 +494,7 @@ def goblin_callback(bot: Bot, update: Update):
         bot.send_chat_action(chat_id, action="upload_video")
         filepath = _download_yt(url, fmt_str, tmpdir)
         if not filepath:
-            query.edit_message_text("Download failed. Try a different quality.")
+            query.edit_message_text("Download failed — YouTube may be blocking this server.\nTry a different quality, or the owner can set YT_COOKIES_FILE.")
             return
 
         fsize = os.path.getsize(filepath)
@@ -504,7 +577,7 @@ def _handle_youtube(bot: Bot, message, url: str, chat_id: int, msg_id: int):
     try:
         info, formats = _get_yt_formats(url)
         if not info:
-            status.edit_text("Could not extract video info.")
+            status.edit_text("Could not extract video info. YouTube may be blocking this server.")
             return
 
         duration = info.get("duration", 0)
@@ -564,6 +637,10 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
     try:
         bot.send_chat_action(chat_id, action="upload_video")
         filepath = _download_generic(url, tmpdir, platform)
+        # Fallback: custom scraper for Pinterest when yt-dlp fails
+        if not filepath and platform == "pinterest":
+            status.edit_text("Trying Pinterest scraper...")
+            filepath = _download_pinterest(url, tmpdir)
         if not filepath:
             status.edit_text("Could not download from {}.".format(platform.title()))
             return
