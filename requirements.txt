@@ -27,5 +27,5 @@ beautifulsoup4
 cloudscraper
 curl_cffi
 torrentp
-yt-dlp
+yt-dlp>=2025.6.1
 gTTS
