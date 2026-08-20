@@ -198,6 +198,49 @@ def _get_yt_formats(url: str) -> Tuple[Optional[dict], list]:
         return None, []
 
 
+def _get_yt_fallback_info(url: str) -> Optional[dict]:
+    """When yt-dlp is blocked, try to scrape basic info from the page HTML."""
+    try:
+        scraper = cloudscraper.create_scraper()
+        resp = scraper.get(url, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+
+        title = None
+        thumb = None
+
+        # og:title
+        m = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)', html)
+        if not m:
+            m = re.search(r'content=["\']([^"\']+)', html)
+        if m:
+            title = m.group(1).strip()
+
+        # og:image (usually the video thumbnail)
+        m = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)', html)
+        if not m:
+            m = re.search(r'<meta\s+content=["\']([^"\']+)', html)
+        if m:
+            thumb = m.group(1).strip()
+
+        # Try extracting from JSON-LD
+        if not title:
+            m = re.search(r'"name"\s*:\s*"([^"]+)"', html)
+            if m:
+                title = m.group(1)
+
+        if not thumb:
+            m = re.search(r'"thumbnailUrl"\s*:\s*\["([^"]+)"', html)
+            if m:
+                thumb = m.group(1)
+
+        if title or thumb:
+            return {"title": title or "YouTube video", "thumbnail": thumb}
+    except Exception as err:
+        LOGGER.warning("YouTube fallback scrape failed for %s: %s", url, err)
+    return None
+
+
 def _pick_format(formats: list, target: str) -> str:
     """Pick a yt-dlp format string from available formats."""
     if target == "a":
@@ -410,6 +453,72 @@ def _download_pinterest(url: str, tmpdir: str) -> Optional[str]:
     return None
 
 
+def _download_instagram(url: str, tmpdir: str) -> Optional[str]:
+    """Scrape Instagram media via cloudscraper + OpenGraph/meta tags.
+    Falls back when yt-dlp needs authentication."""
+    try:
+        scraper = cloudscraper.create_scraper()
+        resp = scraper.get(url, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+
+        # Try og:video first (reels/carousel videos), then og:image (photos)
+        for prop in ("og:video", "og:video:secure_url", "og:image"):
+            match = re.search(
+                r'<meta\s+(?:property|name)=["\']' + prop + r'["\']\s+content=["\']([^"\']+)["\']',
+                html,
+            )
+            if not match:
+                match = re.search(
+                    r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']' + prop + r'["\']',
+                    html,
+                )
+            if match:
+                media_url = match.group(1)
+                if media_url.startswith("//"):
+                    media_url = "https:" + media_url
+                parsed = urllib.parse.urlparse(media_url)
+                ext = os.path.splitext(parsed.path)[1] or (".mp4" if "video" in prop else ".jpg")
+                filepath = os.path.join(tmpdir, "instagram_media" + ext)
+                dl_resp = scraper.get(media_url, timeout=30, stream=True)
+                dl_resp.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl_resp.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None
+                return filepath
+
+        # Fallback: look for video URL in page JSON
+        for pattern in (
+            r'"video_url"\s*:\s*"([^"]+)"',
+            r'"display_url"\s*:\s*"([^"]+)"',
+            r'"shortcode_media".*?"video_url"\s*:\s*"([^"]+)"',
+        ):
+            json_match = re.search(pattern, html)
+            if json_match:
+                media_url = json_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+                if media_url.startswith("//"):
+                    media_url = "https:" + media_url
+                parsed = urllib.parse.urlparse(media_url)
+                ext = os.path.splitext(parsed.path)[1] or ".mp4"
+                filepath = os.path.join(tmpdir, "instagram_media" + ext)
+                dl_resp = scraper.get(media_url, timeout=30, stream=True)
+                dl_resp.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl_resp.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None
+                return filepath
+
+    except Exception as err:
+        LOGGER.warning("Instagram scrape failed for %s: %s", url, err)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Send helpers
 # ---------------------------------------------------------------------------
@@ -576,8 +685,31 @@ def _handle_youtube(bot: Bot, message, url: str, chat_id: int, msg_id: int):
     status = message.reply_text("Extracting video info...")
     try:
         info, formats = _get_yt_formats(url)
+
+        # If yt-dlp failed, try the HTML fallback
         if not info:
-            status.edit_text("Could not extract video info. YouTube may be blocking this server.")
+            fb = _get_yt_fallback_info(url)
+            if fb:
+                title = fb.get("title", "YouTube video")[:60]
+                thumb = fb.get("thumbnail")
+                btn = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Watch on YouTube", url=url)]]
+                )
+                caption = "<b>{}</b>".format(_escape_html(title))
+                if thumb:
+                    try:
+                        bot.send_photo(chat_id, thumb, caption=caption,
+                                       parse_mode=ParseMode.HTML,
+                                       reply_markup=btn,
+                                       reply_to_message_id=msg_id)
+                        status.delete()
+                        return
+                    except Exception:
+                        pass
+                status.edit_text(caption, reply_markup=btn, parse_mode=ParseMode.HTML)
+                return
+            status.edit_text("YouTube is unavailable from this server.\n[Watch on YouTube]({})".format(url),
+                             parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
             return
 
         duration = info.get("duration", 0)
@@ -637,10 +769,13 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
     try:
         bot.send_chat_action(chat_id, action="upload_video")
         filepath = _download_generic(url, tmpdir, platform)
-        # Fallback: custom scraper for Pinterest when yt-dlp fails
+        # Fallback: custom scrapers when yt-dlp fails
         if not filepath and platform == "pinterest":
             status.edit_text("Trying Pinterest scraper...")
             filepath = _download_pinterest(url, tmpdir)
+        if not filepath and platform == "instagram":
+            status.edit_text("Trying Instagram scraper...")
+            filepath = _download_instagram(url, tmpdir)
         if not filepath:
             status.edit_text("Could not download from {}.".format(platform.title()))
             return
