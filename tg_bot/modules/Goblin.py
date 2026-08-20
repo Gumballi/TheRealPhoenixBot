@@ -81,31 +81,35 @@ ALL_PLATFORMS = {
     "threads": _THREADS_PATTERN,
 }
 
-# Optional: YouTube auth cookies. Supports two methods:
-#   1. YT_COOKIES_FILE: path to a Netscape cookies.txt file (needs persistent disk)
-#   2. YOUTUBE_COOKIES_B64: base64-encoded contents of cookies.txt (Render-friendly)
+# Optional: YouTube auth cookies. Supports three methods:
+#   1. YT_COOKIES_FILE: path to a cookies.txt file
+#   2. cookies.txt in project root (detected automatically)
+#   3. YOUTUBE_COOKIES_URL: URL to download cookies from at startup
 _YT_COOKIES = os.environ.get("YT_COOKIES_FILE", "")
-_YT_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
+_YT_COOKIES_URL = os.environ.get("YOUTUBE_COOKIES_URL", "")
 
 
 def _get_yt_cookiefile() -> Optional[str]:
     """Return a path to a valid cookies.txt file, or None."""
-    # Method 1: direct file path
+    # Method 1: direct file path from env var
     if _YT_COOKIES and os.path.isfile(_YT_COOKIES):
         return _YT_COOKIES
-    # Method 2: base64 env var — decode to a temp file
-    if _YT_COOKIES_B64:
-        try:
-            import base64 as _b64
-            decoded = _b64.b64decode(_YT_COOKIES_B64)
-            # Cache the file so we only write it once per process
-            cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-            if not os.path.exists(cookie_path):
-                with open(cookie_path, "wb") as f:
-                    f.write(decoded)
-            return cookie_path
-        except Exception as err:
-            LOGGER.warning("Failed to decode YOUTUBE_COOKIES_B64: %s", err)
+    # Method 2: cookies.txt in project root
+    root_cookie = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cookies.txt")
+    if os.path.isfile(root_cookie):
+        return root_cookie
+    # Method 3: download from URL at startup
+    if _YT_COOKIES_URL:
+        cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        if not os.path.exists(cookie_path):
+            try:
+                import urllib.request as _urlreq
+                _urlreq.urlretrieve(_YT_COOKIES_URL, cookie_path)
+                LOGGER.info("Downloaded YouTube cookies from URL")
+            except Exception as err:
+                LOGGER.warning("Failed to download cookies from URL: %s", err)
+                return None
+        return cookie_path
     return None
 
 # ---------------------------------------------------------------------------
