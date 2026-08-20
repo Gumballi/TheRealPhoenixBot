@@ -231,7 +231,19 @@ def _get_yt_fallback_info(url: str) -> Optional[dict]:
     """When yt-dlp is blocked, try to scrape basic info from the page HTML."""
     try:
         scraper = cloudscraper.create_scraper()
-        resp = scraper.get(url, timeout=15)
+        # Pass cookies if available
+        _cookiefile = _get_yt_cookiefile()
+        if _cookiefile and os.path.isfile(_cookiefile):
+            try:
+                import http.cookiejar
+                cj = http.cookiejar.MozillaCookieJar(_cookiefile)
+                cj.load(ignore_discard=True, ignore_expires=True)
+                scraper.cookies = cj
+            except Exception:
+                pass
+        resp = scraper.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        })
         resp.raise_for_status()
         html = resp.text
 
@@ -265,6 +277,16 @@ def _get_yt_fallback_info(url: str) -> Optional[dict]:
 
         if title or thumb:
             return {"title": title or "YouTube video", "thumbnail": thumb}
+
+        # Last resort: try oEmbed API (works even on blocked IPs sometimes)
+        oembed_url = "https://www.youtube.com/oembed?url={}&format=json".format(urllib.parse.quote(url, safe=""))
+        try:
+            oresp = scraper.get(oembed_url, timeout=10)
+            if oresp.status_code == 200:
+                odata = oresp.json()
+                return {"title": odata.get("title", "YouTube video"), "thumbnail": None}
+        except Exception:
+            pass
     except Exception as err:
         LOGGER.warning("YouTube fallback scrape failed for %s: %s", url, err)
     return None
