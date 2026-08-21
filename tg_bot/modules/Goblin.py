@@ -52,7 +52,7 @@ _IG_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?instagram\.com/(?:reel|p)/[A-Za-z0-9_-]+"
 )
 _REDDIT_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:redd\.it/\S+|reddit\.com/(?:r/\S+/comments|link)\S+)"
+    r"(?:https?://)?(?:www\.)?(?:redd\.it/\S+|reddit\.com/(?:r/\S+/comments|r/\S+/s|link)/?\S*)"
 )
 _X_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/(?:\S+/status/\d+|i/status/\d+)"
