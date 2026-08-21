@@ -179,7 +179,7 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
-                if os.path.getsize(filepath) > 70 * 1024 * 1024:
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
                 return filepath, meta
@@ -201,7 +201,7 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
-                if os.path.getsize(filepath) > 70 * 1024 * 1024:
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
                 return filepath, meta
@@ -221,13 +221,16 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
     try:
         ydl_opts = {
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-            "format": "best[ext=mp4][filesize<70M]/best[filesize<70M]/best",
+            "format": "best[ext=mp4]/best",
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
             "merge_output_format": "mp4",
-            "max_filesize": 70 * 1024 * 1024,
+            "extractor_args": {},
         }
+        # TikTok needs specific client on datacenter IPs
+        if platform == "tiktok":
+            ydl_opts["extractor_args"]["tiktok"] = {"player_client": ["web"]}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
         if not info:
@@ -246,8 +249,17 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
             base, _ = os.path.splitext(filepath)
             for ext in (".mp4", ".mkv", ".webm", ".opus", ".mp3", ".m4a"):
                 if os.path.exists(base + ext):
-                    return base + ext, meta
-        return (filepath, meta) if os.path.exists(filepath) else (None, meta)
+                    filepath = base + ext
+                    break
+        if not os.path.exists(filepath):
+            return None, meta
+
+        # Verify size on disk (Telegram limit is ~50MB for video)
+        if os.path.getsize(filepath) > 50 * 1024 * 1024:
+            os.remove(filepath)
+            return None, meta
+
+        return filepath, meta
     except Exception as err:
         LOGGER.warning("yt-dlp failed for %s (%s): %s", url, platform, err)
         return None, meta
@@ -259,7 +271,7 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
 
 def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: int) -> bool:
     size = os.path.getsize(filepath)
-    if size > 70 * 1024 * 1024:
+    if size > 50 * 1024 * 1024:
         return False
     ext = os.path.splitext(filepath)[1].lower()
     try:
@@ -318,11 +330,10 @@ def _build_caption(bot: Bot, platform: str, meta: dict) -> str:
 
     # Bot username
     try:
-        bot_user = "@{}".format(bot.username)
+        bot_user = getattr(bot, "username", None) or "Phoenix"
     except Exception:
-        bot_user = ""
-    if bot_user:
-        parts.append("{}".format(bot_user))
+        bot_user = "Phoenix"
+    parts.append("@{}".format(bot_user))
 
     return "\n".join(parts)
 
@@ -350,7 +361,7 @@ def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
-            status.edit_text("File too large for Telegram (>70MB).")
+            status.edit_text("File too large for Telegram (>50MB).")
     except Exception as err:
         LOGGER.exception("Threads handler error: %s", err)
         try:
@@ -407,7 +418,7 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
-            status.edit_text("File too large for Telegram (>70MB).")
+            status.edit_text("File too large for Telegram (>50MB).")
     except Exception as err:
         LOGGER.exception("%s handler error: %s", platform, err)
         try:
@@ -505,7 +516,7 @@ TikTok, Instagram, X (Twitter), Reddit, Facebook, Twitch Clips, Pinterest, Threa
 
 *How it works:*
  - Just paste a link and the bot grabs the media automatically.
- - Downloads the best quality under 70MB with title, uploader, and description.
+ - Downloads the best quality under 50MB with title, uploader, and description.
 
 *Manual trigger:*
  - /goblin <url>: Download a specific link on demand.
