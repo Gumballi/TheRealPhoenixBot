@@ -274,21 +274,14 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
     ext = os.path.splitext(filepath)[1].lower()
     try:
         with open(filepath, "rb") as f:
-            if ext in (".mp4", ".mkv", ".webm"):
-                # Videos >50MB must go as document (send_video hard-caps at 50MB)
-                if size > 50 * 1024 * 1024:
-                    bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                                      reply_to_message_id=reply_to, timeout=120)
-                else:
-                    bot.send_video(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                                   reply_to_message_id=reply_to, timeout=120)
-            elif ext in (".mp3", ".m4a", ".opus", ".wav"):
+            if ext in (".mp3", ".m4a", ".opus", ".wav"):
                 bot.send_audio(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                               reply_to_message_id=reply_to, timeout=60)
+                               reply_to_message_id=reply_to, timeout=120)
             elif ext in (".gif", ".png", ".jpg", ".jpeg", ".webp"):
                 bot.send_photo(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
                                reply_to_message_id=reply_to, timeout=60)
             else:
+                # Videos as document — avoids send_video 50MB cap + upload quirks
                 bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
                                   reply_to_message_id=reply_to, timeout=120)
         return True
