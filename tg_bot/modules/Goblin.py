@@ -94,6 +94,28 @@ _UA = (
 )
 
 
+def _get_proxies() -> Optional[dict]:
+    """Optional Webshare (or any HTTP proxy) support, routed around
+    platform IP-blocking - same WEBSHARE_PROXY_USERNAME/PASSWORD env vars
+    used for the YouTube transcript fix in chatbot.py. Returns None (no
+    proxy) if unset, so behavior is unchanged unless explicitly configured.
+    Reddit's .json/RSS endpoints blocking Render's IP (403 Blocked) is the
+    main thing this addresses; can also help with Instagram's 429s."""
+    ws_user = os.environ.get("WEBSHARE_PROXY_USERNAME")
+    ws_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD")
+    ws_host = os.environ.get("WEBSHARE_PROXY_HOST", "p.webshare.io")
+    ws_port = os.environ.get("WEBSHARE_PROXY_PORT", "80")
+
+    if not (ws_user and ws_pass):
+        return None
+
+    proxy_url = f"http://{ws_user}:{ws_pass}@{ws_host}:{ws_port}"
+    return {"http": proxy_url, "https": proxy_url}
+
+
+_PROXIES = _get_proxies()
+
+
 def _extract_urls(message) -> list:
     urls = []
     text = message.text or message.caption or ""
@@ -208,7 +230,7 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
     meta = {}
     try:
         scraper = cloudscraper.create_scraper()
-        resp = scraper.get(url, timeout=20, headers={"User-Agent": _UA})
+        resp = scraper.get(url, timeout=20, headers={"User-Agent": _UA}, proxies=_PROXIES)
         resp.raise_for_status()
         html = resp.text
     except Exception as err:
@@ -248,7 +270,7 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
             ext = os.path.splitext(parsed.path)[1] or (".mp4" if is_video else ".jpg")
             filepath = os.path.join(tmpdir, f"{prefix}_media{ext}")
             try:
-                dl = scraper.get(media_url, timeout=30, stream=True)
+                dl = scraper.get(media_url, timeout=30, stream=True, proxies=_PROXIES)
                 dl.raise_for_status()
                 if _content_type_rejects(dl):
                     continue
@@ -275,7 +297,7 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
             ext = os.path.splitext(parsed.path)[1] or ".mp4"
             filepath = os.path.join(tmpdir, f"{prefix}_media{ext}")
             try:
-                dl = scraper.get(media_url, timeout=30, stream=True)
+                dl = scraper.get(media_url, timeout=30, stream=True, proxies=_PROXIES)
                 dl.raise_for_status()
                 if _content_type_rejects(dl):
                     continue
@@ -479,6 +501,7 @@ def _resolve_reddit_share_link(url: str) -> str:
             url, timeout=15,
             headers={"User-Agent": _UA},
             allow_redirects=True,
+            proxies=_PROXIES,
         )
         if resp.url and "/s/" not in resp.url:
             LOGGER.info("Resolved Reddit share link %s -> %s", url, resp.url)
@@ -508,7 +531,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
 
     # Try JSON API first
     try:
-        resp = scraper.get(clean, timeout=15, headers=headers)
+        resp = scraper.get(clean, timeout=15, headers=headers, proxies=_PROXIES)
         resp.raise_for_status()
         data = resp.json()
         post = data[0]["data"]["children"][0]["data"]
@@ -519,7 +542,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             video_url = post["media"]["reddit_video"]["fallback_url"].split("?")[0]
             audio_url = post["media"]["reddit_video"].get("fallback_audio_url", "")
             filepath = os.path.join(tmpdir, "reddit_video.mp4")
-            dl = scraper.get(video_url, timeout=60, headers=headers, stream=True)
+            dl = scraper.get(video_url, timeout=60, headers=headers, stream=True, proxies=_PROXIES)
             dl.raise_for_status()
             if _content_type_rejects(dl):
                 return None, meta
@@ -535,7 +558,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             if audio_url:
                 audio_path = os.path.join(tmpdir, "reddit_audio.mp4")
                 try:
-                    da = scraper.get(audio_url.split("?")[0], timeout=60, headers=headers, stream=True)
+                    da = scraper.get(audio_url.split("?")[0], timeout=60, headers=headers, stream=True, proxies=_PROXIES)
                     da.raise_for_status()
                     with open(audio_path, "wb") as f:
                         for chunk in da.iter_content(8192):
@@ -564,7 +587,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
         parsed = urllib.parse.urlparse(media_url)
         ext = os.path.splitext(parsed.path)[1] or ".jpg"
         filepath = os.path.join(tmpdir, "reddit_media" + ext)
-        dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
+        dl = scraper.get(media_url, timeout=60, headers=headers, stream=True, proxies=_PROXIES)
         dl.raise_for_status()
         if _content_type_rejects(dl):
             return None, meta
@@ -584,7 +607,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
     # Fallback: try the share endpoint (works when JSON is blocked)
     try:
         share_url = clean.replace(".json", "")
-        resp = scraper.get(share_url, timeout=15, headers=headers)
+        resp = scraper.get(share_url, timeout=15, headers=headers, proxies=_PROXIES)
         resp.raise_for_status()
         html = resp.text
 
@@ -599,7 +622,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                 parsed = urllib.parse.urlparse(media_url)
                 ext = os.path.splitext(parsed.path)[1] or ".jpg"
                 filepath = os.path.join(tmpdir, "reddit_share" + ext)
-                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
+                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True, proxies=_PROXIES)
                 dl.raise_for_status()
                 if _content_type_rejects(dl):
                     continue
@@ -628,7 +651,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                 parsed = urllib.parse.urlparse(media_url)
                 ext = os.path.splitext(parsed.path)[1] or ".mp4"
                 filepath = os.path.join(tmpdir, "reddit_share" + ext)
-                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
+                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True, proxies=_PROXIES)
                 dl.raise_for_status()
                 if _content_type_rejects(dl):
                     continue
@@ -653,7 +676,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
     # Fallback: RSS feed
     try:
         rss_url = clean.replace(".json", ".rss")
-        resp = scraper.get(rss_url, timeout=15, headers=headers)
+        resp = scraper.get(rss_url, timeout=15, headers=headers, proxies=_PROXIES)
         resp.raise_for_status()
         xml_text = resp.text
 
@@ -674,7 +697,7 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                 parsed = urllib.parse.urlparse(media_url)
                 ext = os.path.splitext(parsed.path)[1] or ".jpg"
                 filepath = os.path.join(tmpdir, "reddit_rss" + ext)
-                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
+                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True, proxies=_PROXIES)
                 dl.raise_for_status()
                 if _content_type_rejects(dl):
                     continue
@@ -707,11 +730,11 @@ def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
         # fxtwitter / vxtwitter public API
         scraper = cloudscraper.create_scraper()
         api_url = "https://api.fxtwitter.com/i/status/{}".format(tweet_id)
-        resp = scraper.get(api_url, timeout=15, headers={"User-Agent": _UA})
+        resp = scraper.get(api_url, timeout=15, headers={"User-Agent": _UA}, proxies=_PROXIES)
         if resp.status_code != 200:
             # Try vxtwitter
             api_url = "https://api.vxtwitter.com/i/status/{}".format(tweet_id)
-            resp = scraper.get(api_url, timeout=15, headers={"User-Agent": _UA})
+            resp = scraper.get(api_url, timeout=15, headers={"User-Agent": _UA}, proxies=_PROXIES)
 
         if resp.status_code != 200:
             return None, meta
@@ -729,7 +752,7 @@ def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             if not video_url:
                 return None, meta
             filepath = os.path.join(tmpdir, "x_video.mp4")
-            dl = scraper.get(video_url, timeout=30, headers={"User-Agent": _UA}, stream=True)
+            dl = scraper.get(video_url, timeout=30, headers={"User-Agent": _UA}, stream=True, proxies=_PROXIES)
             dl.raise_for_status()
             if _content_type_rejects(dl):
                 return None, meta
@@ -751,7 +774,7 @@ def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             if not photo_url:
                 return None, meta
             filepath = os.path.join(tmpdir, "x_photo.jpg")
-            dl = scraper.get(photo_url, timeout=30, headers={"User-Agent": _UA}, stream=True)
+            dl = scraper.get(photo_url, timeout=30, headers={"User-Agent": _UA}, stream=True, proxies=_PROXIES)
             dl.raise_for_status()
             if _content_type_rejects(dl):
                 return None, meta
