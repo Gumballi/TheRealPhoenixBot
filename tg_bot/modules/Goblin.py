@@ -1,33 +1,28 @@
 """
-Goblin — gobbles links and regurgitates media.
+Goblin -- gobbles links and regurgitates media.
 
 Detects social media URLs in group messages, downloads the media, and
-replies with the file. YouTube links get an inline quality picker.
+replies with the file.  Try yt-dlp first, then fall back to custom
+cloudscraper scrapers for Pinterest / Instagram / Threads.
 """
 import os
 import re
 import time
-import string
-import random
 import logging
 import tempfile
-import threading
+import shutil
 import urllib.parse
 from typing import Dict, Optional, Tuple
 
-import shutil
 import cloudscraper
 import yt_dlp
 from telegram import (
     Update,
     Bot,
     ParseMode,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     run_async,
-    CallbackQueryHandler,
     MessageHandler,
     Filters,
 )
@@ -41,11 +36,8 @@ LOGGER = logging.getLogger(__name__)
 # Platform URL patterns
 # ---------------------------------------------------------------------------
 
-_YT_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:[^/\n\s]+/\S+/|(?:v|e(?:mbed)?)|\S*?[?&]v=)|youtu\.be/)([a-zA-Z0-9_-]{11})"
-)
 _TIKTOK_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:tiktok\.com/@\S+/video/\d+|vm\.tiktok\.com/\S+)"
+    r"(?:https?://)?(?:www\.)?(?:tiktok\.com/@\S+/video/\d+|vm\.tiktok\.com/\S+|vt\.tiktok\.com/\S+)"
 )
 _IG_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?instagram\.com/(?:reel|p)/[A-Za-z0-9_-]+"
@@ -69,8 +61,7 @@ _THREADS_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:threads\.net|threads\.com)/@\S+/post/\S+"
 )
 
-ALL_PLATFORMS = {
-    "youtube": _YT_PATTERN,
+PLATFORMS = {
     "tiktok": _TIKTOK_PATTERN,
     "instagram": _IG_PATTERN,
     "x": _X_PATTERN,
@@ -81,81 +72,18 @@ ALL_PLATFORMS = {
     "threads": _THREADS_PATTERN,
 }
 
-# Optional: YouTube auth cookies. Supports three methods:
-#   1. YT_COOKIES_FILE: path to a cookies.txt file
-#   2. cookies.txt in project root (detected automatically)
-#   3. YOUTUBE_COOKIES_URL: URL to download cookies from at startup
-_YT_COOKIES = os.environ.get("YT_COOKIES_FILE", "")
-_YT_COOKIES_URL = os.environ.get("YOUTUBE_COOKIES_URL", "")
-
-
-def _get_yt_cookiefile() -> Optional[str]:
-    """Return a path to a valid cookies.txt file, or None."""
-    # Method 1: direct file path from env var
-    if _YT_COOKIES and os.path.isfile(_YT_COOKIES):
-        return _YT_COOKIES
-    # Method 2: cookies.txt in project root
-    root_cookie = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cookies.txt")
-    if os.path.isfile(root_cookie):
-        return root_cookie
-    # Method 3: download from URL at startup
-    if _YT_COOKIES_URL:
-        cookie_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        if not os.path.exists(cookie_path):
-            try:
-                import urllib.request as _urlreq
-                _urlreq.urlretrieve(_YT_COOKIES_URL, cookie_path)
-                LOGGER.info("Downloaded YouTube cookies from URL")
-            except Exception as err:
-                LOGGER.warning("Failed to download cookies from URL: %s", err)
-                return None
-        return cookie_path
-    return None
-
 # ---------------------------------------------------------------------------
-# Cooldown and pending download state
+# Helpers
 # ---------------------------------------------------------------------------
 
 _chat_cooldown: Dict[int, float] = {}
 _COOLDOWN_SECONDS = 10
 
-_pending: Dict[str, dict] = {}
-_SHORT_ID_LEN = 8
-_PENDING_TTL = 900  # 15 minutes
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
-_pending_lock = threading.Lock()
-
-
-def _gen_short_id() -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=_SHORT_ID_LEN))
-
-
-def _store_pending(info: dict) -> str:
-    sid = _gen_short_id()
-    with _pending_lock:
-        _pending[sid] = {**info, "time": time.time()}
-    return sid
-
-
-def _pop_pending(sid: str) -> Optional[dict]:
-    with _pending_lock:
-        entry = _pending.pop(sid, None)
-    if entry and (time.time() - entry.get("time", 0)) < _PENDING_TTL:
-        return entry
-    return None
-
-
-def _cleanup_pending():
-    now = time.time()
-    with _pending_lock:
-        expired = [k for k, v in _pending.items() if now - v.get("time", 0) > _PENDING_TTL]
-        for k in expired:
-            del _pending[k]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _extract_urls(message) -> list:
     urls = []
@@ -169,8 +97,7 @@ def _extract_urls(message) -> list:
 
 
 def _is_cooldown(chat_id: int) -> bool:
-    last = _chat_cooldown.get(chat_id, 0)
-    return (time.time() - last) < _COOLDOWN_SECONDS
+    return (time.time() - _chat_cooldown.get(chat_id, 0)) < _COOLDOWN_SECONDS
 
 
 def _set_cooldown(chat_id: int):
@@ -178,7 +105,7 @@ def _set_cooldown(chat_id: int):
 
 
 def _detect_platform(url: str) -> Optional[str]:
-    for name, pattern in ALL_PLATFORMS.items():
+    for name, pattern in PLATFORMS.items():
         if pattern.search(url):
             return name
     return None
@@ -192,173 +119,105 @@ def _human_size(nbytes: int) -> str:
     return f"{nbytes:.1f} TB"
 
 
-def _get_yt_formats(url: str) -> Tuple[Optional[dict], list]:
-    """Extract YouTube info without downloading. Returns (info, format_list)."""
-    try:
-        ydl_opts = {
-            "skip_download": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
-        }
-        _cookiefile = _get_yt_cookiefile()
-        if _cookiefile:
-            ydl_opts["cookiefile"] = _cookiefile
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if not info:
-            return None, []
-
-        formats = info.get("formats", [])
-        duration = info.get("duration") or 0
-        title = info.get("title", "Unknown")
-        thumb = info.get("thumbnail")
-
-        return {
-            "url": url,
-            "title": title,
-            "duration": duration,
-            "thumbnail": thumb,
-            "formats": formats,
-        }, formats
-    except Exception as err:
-        LOGGER.warning("yt-dlp extract_info failed for %s: %s", url, err)
-        return None, []
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _get_yt_fallback_info(url: str) -> Optional[dict]:
-    """When yt-dlp is blocked, try to scrape basic info from the page HTML."""
+# ---------------------------------------------------------------------------
+# Cloudscraper: OpenGraph meta-tag extraction (shared by Pinterest / IG / Threads)
+# ---------------------------------------------------------------------------
+
+def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
+               json_fallbacks: tuple = ()) -> Tuple[Optional[str], dict]:
+    """Generic OpenGraph scraper.  *props* are tried in order.
+    Returns (filepath, metadata) or (None, {})."""
+    meta = {}
     try:
         scraper = cloudscraper.create_scraper()
-        # Pass cookies if available
-        _cookiefile = _get_yt_cookiefile()
-        if _cookiefile and os.path.isfile(_cookiefile):
-            try:
-                import http.cookiejar
-                cj = http.cookiejar.MozillaCookieJar(_cookiefile)
-                cj.load(ignore_discard=True, ignore_expires=True)
-                scraper.cookies = cj
-            except Exception:
-                pass
-        resp = scraper.get(url, timeout=15, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        })
+        resp = scraper.get(url, timeout=20, headers={"User-Agent": _UA})
         resp.raise_for_status()
         html = resp.text
-
-        title = None
-        thumb = None
-
-        # og:title
-        m = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)', html)
-        if not m:
-            m = re.search(r'content=["\']([^"\']+)', html)
-        if m:
-            title = m.group(1).strip()
-
-        # og:image (usually the video thumbnail)
-        m = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)', html)
-        if not m:
-            m = re.search(r'<meta\s+content=["\']([^"\']+)', html)
-        if m:
-            thumb = m.group(1).strip()
-
-        # Try extracting from JSON-LD
-        if not title:
-            m = re.search(r'"name"\s*:\s*"([^"]+)"', html)
-            if m:
-                title = m.group(1)
-
-        if not thumb:
-            m = re.search(r'"thumbnailUrl"\s*:\s*\["([^"]+)"', html)
-            if m:
-                thumb = m.group(1)
-
-        if title or thumb:
-            return {"title": title or "YouTube video", "thumbnail": thumb}
-
-        # Last resort: try oEmbed API (works even on blocked IPs sometimes)
-        oembed_url = "https://www.youtube.com/oembed?url={}&format=json".format(urllib.parse.quote(url, safe=""))
-        try:
-            oresp = scraper.get(oembed_url, timeout=10)
-            if oresp.status_code == 200:
-                odata = oresp.json()
-                return {"title": odata.get("title", "YouTube video"), "thumbnail": None}
-        except Exception:
-            pass
     except Exception as err:
-        LOGGER.warning("YouTube fallback scrape failed for %s: %s", url, err)
-    return None
+        LOGGER.warning("%s scrape fetch failed for %s: %s", prefix, url, err)
+        return None, meta
+
+    # Extract metadata from OG tags
+    for tag, key in (("og:title", "title"), ("og:description", "description"),
+                     ("og:site_name", "source")):
+        m = re.search(r'content=["\']([^"\']+)["\']', html.split('property="' + tag + '"')[1] if tag in html else "")
+        if m:
+            meta[key] = m.group(1).strip()
+
+    # Also try twitter:author / profile:username for uploader
+    for pattern in (r'"author"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+                    r'"uploader"\s*:\s*"([^"]+)"',
+                    r'<meta\s+name=["\']twitter:title["\']\s+content=["\']([^"\']+)'):
+        if "title" not in meta:
+            m = re.search(pattern, html)
+            if m:
+                meta["title"] = m.group(1).strip()
+                break
+
+    for prop in props:
+        for m in re.finditer(
+            r'<meta\s+(?:property|name)=["\']' + re.escape(prop) + r'["\']\s+content=["\']([^"\']+)["\']',
+            html,
+        ) or re.finditer(
+            r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']' + re.escape(prop) + r'["\']',
+            html,
+        ):
+            media_url = m.group(1)
+            if media_url.startswith("//"):
+                media_url = "https:" + media_url
+            parsed = urllib.parse.urlparse(media_url)
+            is_video = "video" in prop
+            ext = os.path.splitext(parsed.path)[1] or (".mp4" if is_video else ".jpg")
+            filepath = os.path.join(tmpdir, f"{prefix}_media{ext}")
+            try:
+                dl = scraper.get(media_url, timeout=30, stream=True)
+                dl.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None, meta
+                return filepath, meta
+            except Exception:
+                continue
+
+    for pattern in json_fallbacks:
+        m = re.search(pattern, html)
+        if m:
+            media_url = m.group(1).replace("\\u0026", "&").replace("\\/", "/")
+            if media_url.startswith("//"):
+                media_url = "https:" + media_url
+            parsed = urllib.parse.urlparse(media_url)
+            ext = os.path.splitext(parsed.path)[1] or ".mp4"
+            filepath = os.path.join(tmpdir, f"{prefix}_media{ext}")
+            try:
+                dl = scraper.get(media_url, timeout=30, stream=True)
+                dl.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None, meta
+                return filepath, meta
+            except Exception:
+                continue
+
+    return None, meta
 
 
-def _pick_format(formats: list, target: str) -> str:
-    """Pick a yt-dlp format string from available formats."""
-    if target == "a":
-        # Audio only
-        audio = [f for f in formats if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"]
-        if audio:
-            audio.sort(key=lambda f: f.get("abr", 0) or 0, reverse=True)
-            return audio[0]["format_id"]
-        return "bestaudio"
+# ---------------------------------------------------------------------------
+# yt-dlp: generic download
+# ---------------------------------------------------------------------------
 
-    # Video + audio
-    heights = {"1": 1080, "2": 720, "3": 480}
-    max_h = heights.get(target)
-
-    if max_h:
-        # Filter to formats <= target height that also have audio
-        merged = [f for f in formats if (f.get("height") or 0) <= max_h and f.get("vcodec", "none") != "none"]
-        if merged:
-            merged.sort(key=lambda f: f.get("height", 0) or 0, reverse=True)
-            vid_id = merged[0]["format_id"]
-            # Find matching audio
-            best_audio = [f for f in formats if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"]
-            if best_audio:
-                best_audio.sort(key=lambda f: f.get("abr", 0) or 0, reverse=True)
-                return f"{vid_id}+{best_audio[0]['format_id']}"
-            return vid_id
-        # Fall through to best
-        return "bestvideo+bestaudio/best"
-
-    # target == "b" → best
-    return "bestvideo+bestaudio/best"
-
-
-def _download_yt(url: str, fmt_str: str, tmpdir: str) -> Optional[str]:
-    """Download YouTube video with the given format string. Returns filepath or None."""
-    try:
-        ydl_opts = {
-            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-            "format": fmt_str,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "merge_output_format": "mp4",
-            "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
-        }
-        _cookiefile = _get_yt_cookiefile()
-        if _cookiefile:
-            ydl_opts["cookiefile"] = _cookiefile
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-        if not info:
-            return None
-        filepath = ydl.prepare_filename(info)
-        # yt-dlp may change extension after merge
-        if not os.path.exists(filepath):
-            base, _ = os.path.splitext(filepath)
-            for ext in (".mp4", ".mkv", ".webm", ".opus", ".mp3", ".m4a"):
-                if os.path.exists(base + ext):
-                    return base + ext
-        return filepath if os.path.exists(filepath) else None
-    except Exception as err:
-        LOGGER.exception("yt-dlp download failed: %s", err)
-        return None
-
-
-def _download_generic(url: str, tmpdir: str, platform: str) -> Optional[str]:
-    """Download media from any yt-dlp supported platform. Returns filepath or None."""
+def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str], dict]:
+    """Try yt-dlp.  Returns (filepath, metadata) or (None, {})."""
+    meta = {}
     try:
         ydl_opts = {
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
@@ -372,226 +231,51 @@ def _download_generic(url: str, tmpdir: str, platform: str) -> Optional[str]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
         if not info:
-            return None
+            return None, meta
+
+        # Extract metadata
+        for key in ("title", "uploader", "uploader_url", "description", "duration"):
+            val = info.get(key)
+            if val:
+                meta[key] = val
+        if info.get("thumbnail"):
+            meta["thumbnail"] = info["thumbnail"]
+
         filepath = ydl.prepare_filename(info)
         if not os.path.exists(filepath):
             base, _ = os.path.splitext(filepath)
             for ext in (".mp4", ".mkv", ".webm", ".opus", ".mp3", ".m4a"):
                 if os.path.exists(base + ext):
-                    return base + ext
-        return filepath if os.path.exists(filepath) else None
+                    return base + ext, meta
+        return (filepath, meta) if os.path.exists(filepath) else (None, meta)
     except Exception as err:
-        LOGGER.warning("yt-dlp download failed for %s (%s): %s", url, platform, err)
-        return None
-
-
-def _download_threads(url: str, tmpdir: str) -> Optional[str]:
-    """Scrape Threads (threads.net/threads.com) media via cloudscraper + OpenGraph."""
-    try:
-        scraper = cloudscraper.create_scraper()
-        resp = scraper.get(url, timeout=20)
-        resp.raise_for_status()
-        html = resp.text
-
-        # Try og:video first, then og:image
-        for prop in ("og:video", "og:image"):
-            match = re.search(r'<meta\s+(?:property|name)=["\']' + prop + r'["\']\s+content=["\']([^"\']+)["\']', html)
-            if not match:
-                match = re.search(r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']' + prop + r'["\']', html)
-            if match:
-                media_url = match.group(1)
-                if media_url.startswith("//"):
-                    media_url = "https:" + media_url
-                parsed = urllib.parse.urlparse(media_url)
-                ext = os.path.splitext(parsed.path)[1] or ".mp4"
-                filepath = os.path.join(tmpdir, "threads_media" + ext)
-                dl_resp = scraper.get(media_url, timeout=30, stream=True)
-                dl_resp.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in dl_resp.iter_content(8192):
-                        f.write(chunk)
-                if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                    os.remove(filepath)
-                    return None
-                return filepath
-
-        # Fallback: look for video_url or photo_url in JSON-LD
-        json_match = re.search(r'"video_url"\s*:\s*"([^"]+)"', html)
-        if not json_match:
-            json_match = re.search(r'"display_url"\s*:\s*"([^"]+)"', html)
-        if json_match:
-            media_url = json_match.group(1).replace("\\u0026", "&")
-            parsed = urllib.parse.urlparse(media_url)
-            ext = os.path.splitext(parsed.path)[1] or ".mp4"
-            filepath = os.path.join(tmpdir, "threads_media" + ext)
-            dl_resp = scraper.get(media_url, timeout=30, stream=True)
-            dl_resp.raise_for_status()
-            with open(filepath, "wb") as f:
-                for chunk in dl_resp.iter_content(8192):
-                    f.write(chunk)
-            if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                os.remove(filepath)
-                return None
-            return filepath
-
-    except Exception as err:
-        LOGGER.warning("Threads scrape failed for %s: %s", url, err)
-    return None
-
-
-def _download_pinterest(url: str, tmpdir: str) -> Optional[str]:
-    """Scrape Pinterest media via cloudscraper + OpenGraph/meta tags.
-    Falls back when yt-dlp can't find video formats (image-only pins, etc.)."""
-    try:
-        scraper = cloudscraper.create_scraper()
-        resp = scraper.get(url, timeout=20)
-        resp.raise_for_status()
-        html = resp.text
-
-        # Try og:video first, then og:image
-        for prop in ("og:video", "og:video:secure_url", "og:image"):
-            match = re.search(
-                r'<meta\s+(?:property|name)=["\']' + prop + r'["\']\s+content=["\']([^"\']+)["\']',
-                html,
-            )
-            if not match:
-                match = re.search(
-                    r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']' + prop + r'["\']',
-                    html,
-                )
-            if match:
-                media_url = match.group(1)
-                if media_url.startswith("//"):
-                    media_url = "https:" + media_url
-                parsed = urllib.parse.urlparse(media_url)
-                ext = os.path.splitext(parsed.path)[1] or (".mp4" if "video" in prop else ".jpg")
-                filepath = os.path.join(tmpdir, "pinterest_media" + ext)
-                dl_resp = scraper.get(media_url, timeout=30, stream=True)
-                dl_resp.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in dl_resp.iter_content(8192):
-                        f.write(chunk)
-                if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                    os.remove(filepath)
-                    return None
-                return filepath
-
-        # Fallback: look for embed/description video URL in JSON
-        for pattern in (
-            r'"video_url"\s*:\s*"([^"]+)"',
-            r'"embed_url"\s*:\s*"([^"]+)"',
-            r'"images\s*:\s*\{[^}]*"orig"\s*:\s*\{[^}]*"url"\s*:\s*"([^"]+)"',
-        ):
-            json_match = re.search(pattern, html)
-            if json_match:
-                media_url = json_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
-                if media_url.startswith("//"):
-                    media_url = "https:" + media_url
-                parsed = urllib.parse.urlparse(media_url)
-                ext = os.path.splitext(parsed.path)[1] or ".jpg"
-                filepath = os.path.join(tmpdir, "pinterest_media" + ext)
-                dl_resp = scraper.get(media_url, timeout=30, stream=True)
-                dl_resp.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in dl_resp.iter_content(8192):
-                        f.write(chunk)
-                if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                    os.remove(filepath)
-                    return None
-                return filepath
-
-    except Exception as err:
-        LOGGER.warning("Pinterest scrape failed for %s: %s", url, err)
-    return None
-
-
-def _download_instagram(url: str, tmpdir: str) -> Optional[str]:
-    """Scrape Instagram media via cloudscraper + OpenGraph/meta tags.
-    Falls back when yt-dlp needs authentication."""
-    try:
-        scraper = cloudscraper.create_scraper()
-        resp = scraper.get(url, timeout=20)
-        resp.raise_for_status()
-        html = resp.text
-
-        # Try og:video first (reels/carousel videos), then og:image (photos)
-        for prop in ("og:video", "og:video:secure_url", "og:image"):
-            match = re.search(
-                r'<meta\s+(?:property|name)=["\']' + prop + r'["\']\s+content=["\']([^"\']+)["\']',
-                html,
-            )
-            if not match:
-                match = re.search(
-                    r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']' + prop + r'["\']',
-                    html,
-                )
-            if match:
-                media_url = match.group(1)
-                if media_url.startswith("//"):
-                    media_url = "https:" + media_url
-                parsed = urllib.parse.urlparse(media_url)
-                ext = os.path.splitext(parsed.path)[1] or (".mp4" if "video" in prop else ".jpg")
-                filepath = os.path.join(tmpdir, "instagram_media" + ext)
-                dl_resp = scraper.get(media_url, timeout=30, stream=True)
-                dl_resp.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in dl_resp.iter_content(8192):
-                        f.write(chunk)
-                if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                    os.remove(filepath)
-                    return None
-                return filepath
-
-        # Fallback: look for video URL in page JSON
-        for pattern in (
-            r'"video_url"\s*:\s*"([^"]+)"',
-            r'"display_url"\s*:\s*"([^"]+)"',
-            r'"shortcode_media".*?"video_url"\s*:\s*"([^"]+)"',
-        ):
-            json_match = re.search(pattern, html)
-            if json_match:
-                media_url = json_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
-                if media_url.startswith("//"):
-                    media_url = "https:" + media_url
-                parsed = urllib.parse.urlparse(media_url)
-                ext = os.path.splitext(parsed.path)[1] or ".mp4"
-                filepath = os.path.join(tmpdir, "instagram_media" + ext)
-                dl_resp = scraper.get(media_url, timeout=30, stream=True)
-                dl_resp.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in dl_resp.iter_content(8192):
-                        f.write(chunk)
-                if os.path.getsize(filepath) > 50 * 1024 * 1024:
-                    os.remove(filepath)
-                    return None
-                return filepath
-
-    except Exception as err:
-        LOGGER.warning("Instagram scrape failed for %s: %s", url, err)
-    return None
+        LOGGER.warning("yt-dlp failed for %s (%s): %s", url, platform, err)
+        return None, meta
 
 
 # ---------------------------------------------------------------------------
-# Send helpers
+# Send helper
 # ---------------------------------------------------------------------------
 
 def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: int) -> bool:
-    """Send a media file to Telegram. Returns True on success."""
     size = os.path.getsize(filepath)
     if size > 50 * 1024 * 1024:
         return False
-
     ext = os.path.splitext(filepath)[1].lower()
     try:
         with open(filepath, "rb") as f:
             if ext in (".mp4", ".mkv", ".webm"):
-                bot.send_video(chat_id, f, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to, timeout=60)
+                bot.send_video(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                               reply_to_message_id=reply_to, timeout=60)
             elif ext in (".mp3", ".m4a", ".opus", ".wav"):
-                bot.send_audio(chat_id, f, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to, timeout=60)
+                bot.send_audio(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                               reply_to_message_id=reply_to, timeout=60)
             elif ext in (".gif", ".png", ".jpg", ".jpeg", ".webp"):
-                bot.send_photo(chat_id, f, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to, timeout=60)
+                bot.send_photo(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                               reply_to_message_id=reply_to, timeout=60)
             else:
-                bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to, timeout=60)
+                bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                  reply_to_message_id=reply_to, timeout=60)
         return True
     except Exception as err:
         LOGGER.warning("Failed to send media: %s", err)
@@ -599,194 +283,48 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
 
 
 # ---------------------------------------------------------------------------
-# YouTube quality picker callbacks
+# Platform handlers
 # ---------------------------------------------------------------------------
 
-def _yt_quality_keyboard(sid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Best Quality", callback_data=f"gob:{sid}:b")],
-            [
-                InlineKeyboardButton("1080p", callback_data=f"gob:{sid}:1"),
-                InlineKeyboardButton("720p", callback_data=f"gob:{sid}:2"),
-            ],
-            [
-                InlineKeyboardButton("480p", callback_data=f"gob:{sid}:3"),
-                InlineKeyboardButton("Audio Only", callback_data=f"gob:{sid}:a"),
-            ],
-        ]
-    )
+def _build_caption(bot: Bot, platform: str, meta: dict) -> str:
+    """Build an HTML caption from metadata + bot username."""
+    parts = []
 
+    # Platform header
+    parts.append("<b>{}</b>".format(_escape_html(platform.title())))
 
-@run_async
-def goblin_callback(bot: Bot, update: Update):
-    query = update.callback_query
-    if not query or not query.data:
-        return
+    # Title
+    if meta.get("title"):
+        parts.append(_escape_html(meta["title"][:100]))
 
-    data = query.data
-    if not data.startswith("gob:"):
-        return
+    # Uploader / author
+    if meta.get("uploader"):
+        author = meta["uploader"]
+        if meta.get("uploader_url"):
+            author = '<a href="{}">{}</a>'.format(meta["uploader_url"], _escape_html(author))
+        parts.append("{}".format(author))
 
-    parts = data.split(":")
-    if len(parts) != 3:
-        return
+    # Duration
+    dur = meta.get("duration")
+    if dur:
+        parts.append("{}:{}".format(dur // 60, dur % 60))
 
-    sid = parts[1]
-    quality = parts[2]
+    # Description (truncated)
+    desc = meta.get("description", "")
+    if desc and len(desc) > 200:
+        desc = desc[:200] + "..."
+    if desc:
+        parts.append(_escape_html(desc))
 
-    entry = _pop_pending(sid)
-    if not entry:
-        query.answer("This request expired. Send the link again.", show_alert=True)
-        return
-
-    query.answer("Downloading...")
-    url = entry["url"]
-    chat_id = entry["chat_id"]
-    msg_id = entry["msg_id"]
-    title = entry.get("title", "video")
-    duration = entry.get("duration", 0)
-
-    _set_cooldown(chat_id)
-
-    fmt_str = _pick_format(entry.get("formats", []), quality)
-    tmpdir = tempfile.mkdtemp(prefix="gob_yt_")
+    # Bot username
     try:
-        bot.send_chat_action(chat_id, action="upload_video")
-        filepath = _download_yt(url, fmt_str, tmpdir)
-        if not filepath:
-            query.edit_message_text("Download failed — YouTube may be blocking this server.\nTry a different quality, or the owner can set YT_COOKIES_FILE.")
-            return
+        bot_user = "@{}".format(bot.username)
+    except Exception:
+        bot_user = ""
+    if bot_user:
+        parts.append("{}".format(bot_user))
 
-        fsize = os.path.getsize(filepath)
-        dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else ""
-        caption = "<b>{}</b>{}\n{}".format(
-            _escape_html(title[:80]),
-            f" ({dur_str})" if dur_str else "",
-            _human_size(fsize),
-        )
-
-        query.edit_message_text("Uploading...")
-        if _send_media(bot, chat_id, filepath, caption, msg_id):
-            try:
-                query.delete()
-            except Exception:
-                pass
-        else:
-            query.edit_message_text("File too large for Telegram (>50MB). Try a lower quality.")
-    finally:
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-def _escape_html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-# ---------------------------------------------------------------------------
-# Main link detection handler
-# ---------------------------------------------------------------------------
-
-@run_async
-def goblin_detect(bot: Bot, update: Update):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not message or not chat:
-        return
-
-    # Only groups
-    if chat.type == "private":
-        return
-
-    # Skip commands and bot messages
-    if message.text and message.text.startswith("/"):
-        return
-    if message.from_user and message.from_user.is_bot:
-        return
-
-    # Cooldown
-    if _is_cooldown(chat.id):
-        return
-
-    urls = _extract_urls(message)
-    if not urls:
-        return
-
-    msg_id = message.message_id
-
-    for url in urls:
-        platform = _detect_platform(url)
-        if not platform:
-            continue
-
-        _set_cooldown(chat.id)
-
-        if platform == "youtube":
-            _handle_youtube(bot, message, url, chat.id, msg_id)
-        elif platform == "threads":
-            _handle_threads(bot, message, url, chat.id, msg_id)
-        else:
-            _handle_generic(bot, message, url, chat.id, msg_id, platform)
-        return  # one link per message
-
-
-def _handle_youtube(bot: Bot, message, url: str, chat_id: int, msg_id: int):
-    status = message.reply_text("Extracting video info...")
-    try:
-        info, formats = _get_yt_formats(url)
-
-        # If yt-dlp failed, try the HTML fallback
-        if not info:
-            fb = _get_yt_fallback_info(url)
-            if fb:
-                title = fb.get("title", "YouTube video")[:60]
-                thumb = fb.get("thumbnail")
-                btn = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Watch on YouTube", url=url)]]
-                )
-                caption = "<b>{}</b>".format(_escape_html(title))
-                if thumb:
-                    try:
-                        bot.send_photo(chat_id, thumb, caption=caption,
-                                       parse_mode=ParseMode.HTML,
-                                       reply_markup=btn,
-                                       reply_to_message_id=msg_id)
-                        status.delete()
-                        return
-                    except Exception:
-                        pass
-                status.edit_text(caption, reply_markup=btn, parse_mode=ParseMode.HTML)
-                return
-            status.edit_text("YouTube is unavailable from this server.\n[Watch on YouTube]({})".format(url),
-                             parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            return
-
-        duration = info.get("duration", 0)
-        if duration and duration > 30 * 60:
-            status.edit_text("Video too long (>30 min). Send the link directly instead.")
-            return
-
-        title = info.get("title", "YouTube video")
-        thumb = info.get("thumbnail")
-        sid = _store_pending(info)
-
-        title_short = title[:60] + ("..." if len(title) > 60 else "")
-        dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else ""
-        text = "<b>{}</b>{}\nPick a quality:".format(
-            _escape_html(title_short),
-            f"\nDuration: {dur_str}" if dur_str else "",
-        )
-        status.edit_text(text, reply_markup=_yt_quality_keyboard(sid), parse_mode=ParseMode.HTML)
-
-    except Exception as err:
-        LOGGER.exception("YouTube handler error: %s", err)
-        try:
-            status.edit_text("Something went wrong.")
-        except Exception:
-            pass
+    return "\n".join(parts)
 
 
 def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
@@ -794,13 +332,21 @@ def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
     tmpdir = tempfile.mkdtemp(prefix="gob_threads_")
     try:
         bot.send_chat_action(chat_id, action="upload_video")
-        filepath = _download_threads(url, tmpdir)
+        filepath, meta = _og_scrape(
+            url,
+            props=("og:video", "og:image"),
+            prefix="threads",
+            tmpdir=tmpdir,
+            json_fallbacks=(
+                r'"video_url"\s*:\s*"([^"]+)"',
+                r'"display_url"\s*:\s*"([^"]+)"',
+            ),
+        )
         if not filepath:
             status.edit_text("Could not fetch media from Threads.")
             return
-
-        fsize = os.path.getsize(filepath)
-        caption = "<b>Threads</b>\n{}".format(_human_size(fsize))
+        meta.setdefault("title", "Threads")
+        caption = _build_caption(bot, "threads", meta)
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
@@ -816,27 +362,48 @@ def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
 
 
 def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, platform: str):
+    """Generic handler: try yt-dlp, then custom scraper for known platforms."""
     status = message.reply_text("Downloading from {}...".format(platform.title()))
     tmpdir = tempfile.mkdtemp(prefix="gob_{}_".format(platform))
     try:
         bot.send_chat_action(chat_id, action="upload_video")
-        filepath = _download_generic(url, tmpdir, platform)
-        # Fallback: custom scrapers when yt-dlp fails
-        if not filepath and platform == "pinterest":
-            status.edit_text("Trying Pinterest scraper...")
-            filepath = _download_pinterest(url, tmpdir)
-        if not filepath and platform == "instagram":
-            status.edit_text("Trying Instagram scraper...")
-            filepath = _download_instagram(url, tmpdir)
+        meta = {}
+
+        # 1) yt-dlp
+        filepath, meta = _download_ytdlp(url, tmpdir, platform)
+
+        # 2) Custom scrapers when yt-dlp fails
+        if not filepath:
+            if platform == "pinterest":
+                status.edit_text("Trying Pinterest scraper...")
+                filepath, meta = _og_scrape(
+                    url,
+                    props=("og:video", "og:video:secure_url", "og:image"),
+                    prefix="pinterest",
+                    tmpdir=tmpdir,
+                    json_fallbacks=(
+                        r'"video_url"\s*:\s*"([^"]+)"',
+                        r'"embed_url"\s*:\s*"([^"]+)"',
+                    ),
+                )
+            elif platform == "instagram":
+                status.edit_text("Trying Instagram scraper...")
+                filepath, meta = _og_scrape(
+                    url,
+                    props=("og:video", "og:video:secure_url", "og:image"),
+                    prefix="instagram",
+                    tmpdir=tmpdir,
+                    json_fallbacks=(
+                        r'"video_url"\s*:\s*"([^"]+)"',
+                        r'"display_url"\s*:\s*"([^"]+)"',
+                    ),
+                )
+
         if not filepath:
             status.edit_text("Could not download from {}.".format(platform.title()))
             return
 
-        fsize = os.path.getsize(filepath)
-        caption = "<b>{}</b>\n{}".format(
-            _escape_html(platform.title()),
-            _human_size(fsize),
-        )
+        caption = _build_caption(bot, platform, meta)
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
@@ -852,7 +419,45 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
 
 
 # ---------------------------------------------------------------------------
-# Command handler (manual trigger)
+# Main link detection
+# ---------------------------------------------------------------------------
+
+@run_async
+def goblin_detect(bot: Bot, update: Update):
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+    if chat.type == "private":
+        return
+    if message.text and message.text.startswith("/"):
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+    if _is_cooldown(chat.id):
+        return
+
+    urls = _extract_urls(message)
+    if not urls:
+        return
+
+    msg_id = message.message_id
+    for url in urls:
+        platform = _detect_platform(url)
+        if not platform:
+            continue
+
+        _set_cooldown(chat.id)
+
+        if platform == "threads":
+            _handle_threads(bot, message, url, chat.id, msg_id)
+        else:
+            _handle_generic(bot, message, url, chat.id, msg_id, platform)
+        return  # one link per message
+
+
+# ---------------------------------------------------------------------------
+# /goblin command
 # ---------------------------------------------------------------------------
 
 @run_async
@@ -867,40 +472,24 @@ def goblin_cmd(bot: Bot, update: Update, args):
     if not platform:
         msg.reply_text("Unsupported platform.")
         return
-    if platform == "youtube":
-        _handle_youtube(bot, msg, url, chat.id, msg.message_id)
-    elif platform == "threads":
+    if platform == "threads":
         _handle_threads(bot, msg, url, chat.id, msg.message_id)
     else:
         _handle_generic(bot, msg, url, chat.id, msg.message_id, platform)
 
 
 # ---------------------------------------------------------------------------
-# Handler registration
+# Registration
 # ---------------------------------------------------------------------------
 
-# Passive link detection (group=10 to not interfere with other handlers)
-_link_handler = MessageHandler(
-    Filters.group & (Filters.entity("url") | Filters.entity("text_link")),
-    goblin_detect,
+dispatcher.add_handler(
+    MessageHandler(
+        Filters.group & (Filters.entity("url") | Filters.entity("text_link")),
+        goblin_detect,
+    ),
+    group=10,
 )
-dispatcher.add_handler(_link_handler, group=10)
-
-# Quality picker callback
-dispatcher.add_handler(CallbackQueryHandler(goblin_callback, pattern=r"^gob:"))
-
-# Manual command
-_goblin_cmd = DisableAbleCommandHandler("goblin", goblin_cmd, pass_args=True)
-dispatcher.add_handler(_goblin_cmd)
-
-# Periodic cleanup of expired pending entries
-def _periodic_cleanup():
-    while True:
-        time.sleep(300)
-        _cleanup_pending()
-
-_cleanup_thread = threading.Thread(target=_periodic_cleanup, daemon=True)
-_cleanup_thread.start()
+dispatcher.add_handler(DisableAbleCommandHandler("goblin", goblin_cmd, pass_args=True))
 
 # ---------------------------------------------------------------------------
 # Module metadata
@@ -912,12 +501,11 @@ __help__ = """
 Automatically grabs media from social links posted in groups.
 
 *Supported platforms:*
-YouTube, TikTok, Instagram, X (Twitter), Reddit, Facebook, Twitch Clips, Pinterest, Threads
+TikTok, Instagram, X (Twitter), Reddit, Facebook, Twitch Clips, Pinterest, Threads
 
 *How it works:*
- - Just paste a link — the bot downloads and sends the media automatically.
- - YouTube links show a quality picker (Best / 1080p / 720p / 480p / Audio).
- - Other platforms download the best quality under 50MB.
+ - Just paste a link and the bot grabs the media automatically.
+ - Downloads the best quality under 50MB with title, uploader, and description.
 
 *Manual trigger:*
  - /goblin <url>: Download a specific link on demand.
