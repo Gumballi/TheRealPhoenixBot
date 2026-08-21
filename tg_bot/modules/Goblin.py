@@ -11,6 +11,7 @@ import time
 import logging
 import tempfile
 import shutil
+import subprocess
 import urllib.parse
 from typing import Dict, Optional, Tuple
 
@@ -123,6 +124,38 @@ def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _content_type_rejects(response) -> bool:
+    """Header-based pre-check: True means the response is clearly NOT real
+    media (HTML/JSON error or block page) and shouldn't even be downloaded."""
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if not content_type:
+        return False  # unknown - let the post-download file sniff decide
+    if content_type.startswith(("image/", "video/", "audio/", "application/octet-stream")):
+        return False
+    return any(bad in content_type for bad in ("text/html", "application/json", "text/plain"))
+
+
+def _validate_downloaded_file(filepath: str, min_bytes: int = 256) -> bool:
+    """Guards against saving an HTML error/block/CAPTCHA page as if it were
+    real image/video bytes. This was the direct cause of Telegram's
+    'Image_process_failed' error: a Reddit block page got saved with a
+    .jpeg extension and sent to Telegram as if it were a real photo.
+    Sniffs the actual bytes written to disk rather than trusting the URL,
+    extension, or an absent/misleading Content-Type header."""
+    try:
+        size = os.path.getsize(filepath)
+    except OSError:
+        return False
+    if size < min_bytes:
+        return False
+    with open(filepath, "rb") as f:
+        head = f.read(512)
+    lowered = head.lstrip().lower()
+    if lowered.startswith((b"<!doctype", b"<html", b"<?xml")) or lowered.startswith(b"{"):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Cloudscraper: OpenGraph meta-tag extraction (shared by Pinterest / IG / Threads)
 # ---------------------------------------------------------------------------
@@ -176,12 +209,17 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
             try:
                 dl = scraper.get(media_url, timeout=30, stream=True)
                 dl.raise_for_status()
+                if _content_type_rejects(dl):
+                    continue
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
                 if os.path.getsize(filepath) > 50 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
+                if not _validate_downloaded_file(filepath):
+                    os.remove(filepath)
+                    continue
                 return filepath, meta
             except Exception:
                 continue
@@ -198,12 +236,17 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
             try:
                 dl = scraper.get(media_url, timeout=30, stream=True)
                 dl.raise_for_status()
+                if _content_type_rejects(dl):
+                    continue
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
                 if os.path.getsize(filepath) > 50 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
+                if not _validate_downloaded_file(filepath):
+                    os.remove(filepath)
+                    continue
                 return filepath, meta
             except Exception:
                 continue
@@ -296,7 +339,9 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
             err_str = str(err)
             LOGGER.warning("Send attempt %d/3 failed (%s, %s): %s | %s",
                            attempt + 1, ext, _human_size(size), type(err).__name__, err_str[:200])
-            # If send_video failed with "too large", try send_document as fallback (no retry loop)
+            # If send_video failed with "too large", try send_document as fallback.
+            # If genuinely too large, no amount of retrying changes that - stop here
+            # instead of burning the remaining retry attempts.
             if is_video and "too large" in err_str.lower():
                 try:
                     with open(filepath, "rb") as f:
@@ -304,7 +349,12 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
                                           reply_to_message_id=reply_to, timeout=180)
                     return True
                 except Exception as err2:
-                    LOGGER.warning("Document fallback also failed: %s | %s", type(err2).__name__, err2)
+                    err2_str = str(err2)
+                    LOGGER.warning("Document fallback also failed: %s | %s", type(err2).__name__, err2_str[:200])
+                    if "too large" in err2_str.lower():
+                        # Genuinely oversized (or a transient garbled-response false
+                        # positive, e.g. during a deploy) - retrying send won't help.
+                        return False
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
     return False
@@ -384,10 +434,15 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             filepath = os.path.join(tmpdir, "reddit_video.mp4")
             dl = scraper.get(video_url, timeout=60, headers=headers, stream=True)
             dl.raise_for_status()
+            if _content_type_rejects(dl):
+                return None, meta
             with open(filepath, "wb") as f:
                 for chunk in dl.iter_content(8192):
                     f.write(chunk)
             if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                os.remove(filepath)
+                return None, meta
+            if not _validate_downloaded_file(filepath):
                 os.remove(filepath)
                 return None, meta
             if audio_url:
@@ -399,8 +454,16 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                         for chunk in da.iter_content(8192):
                             f.write(chunk)
                     merged = os.path.join(tmpdir, "reddit_merged.mp4")
-                    os.system('ffmpeg -y -i "{}" -i "{}" -c copy "{}" 2>/dev/null'.format(
-                        filepath, audio_path, merged))
+                    try:
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", filepath, "-i", audio_path, "-c", "copy", merged],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=60,
+                            check=True,
+                        )
+                    except Exception as ffmpeg_err:
+                        LOGGER.warning("ffmpeg merge failed: %s", ffmpeg_err)
                     if os.path.exists(merged) and os.path.getsize(merged) > 0:
                         os.remove(filepath)
                         filepath = merged
@@ -416,10 +479,15 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
         filepath = os.path.join(tmpdir, "reddit_media" + ext)
         dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
         dl.raise_for_status()
+        if _content_type_rejects(dl):
+            return None, meta
         with open(filepath, "wb") as f:
             for chunk in dl.iter_content(8192):
                 f.write(chunk)
         if os.path.getsize(filepath) > 50 * 1024 * 1024:
+            os.remove(filepath)
+            return None, meta
+        if not _validate_downloaded_file(filepath):
             os.remove(filepath)
             return None, meta
         return filepath, meta
@@ -446,12 +514,17 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                 filepath = os.path.join(tmpdir, "reddit_share" + ext)
                 dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
                 dl.raise_for_status()
+                if _content_type_rejects(dl):
+                    continue
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
                 if os.path.getsize(filepath) > 50 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
+                if not _validate_downloaded_file(filepath):
+                    os.remove(filepath)
+                    continue
                 return filepath, meta
 
         # Try JSON-LD or embedded video tags
@@ -470,12 +543,17 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                 filepath = os.path.join(tmpdir, "reddit_share" + ext)
                 dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
                 dl.raise_for_status()
+                if _content_type_rejects(dl):
+                    continue
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
                 if os.path.getsize(filepath) > 50 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
+                if not _validate_downloaded_file(filepath):
+                    os.remove(filepath)
+                    continue
                 return filepath, meta
 
         # Extract title from page
@@ -511,12 +589,17 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                 filepath = os.path.join(tmpdir, "reddit_rss" + ext)
                 dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
                 dl.raise_for_status()
+                if _content_type_rejects(dl):
+                    continue
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
                 if os.path.getsize(filepath) > 50 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
+                if not _validate_downloaded_file(filepath):
+                    os.remove(filepath)
+                    continue
                 return filepath, meta
     except Exception as err:
         LOGGER.warning("Reddit RSS failed: %s", err)
@@ -561,10 +644,15 @@ def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             filepath = os.path.join(tmpdir, "x_video.mp4")
             dl = scraper.get(video_url, timeout=30, headers={"User-Agent": _UA}, stream=True)
             dl.raise_for_status()
+            if _content_type_rejects(dl):
+                return None, meta
             with open(filepath, "wb") as f:
                 for chunk in dl.iter_content(8192):
                     f.write(chunk)
             if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                os.remove(filepath)
+                return None, meta
+            if not _validate_downloaded_file(filepath):
                 os.remove(filepath)
                 return None, meta
             return filepath, meta
@@ -578,9 +666,14 @@ def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             filepath = os.path.join(tmpdir, "x_photo.jpg")
             dl = scraper.get(photo_url, timeout=30, headers={"User-Agent": _UA}, stream=True)
             dl.raise_for_status()
+            if _content_type_rejects(dl):
+                return None, meta
             with open(filepath, "wb") as f:
                 for chunk in dl.iter_content(8192):
                     f.write(chunk)
+            if not _validate_downloaded_file(filepath):
+                os.remove(filepath)
+                return None, meta
             return filepath, meta
 
         return None, meta
