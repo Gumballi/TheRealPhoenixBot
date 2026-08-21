@@ -272,23 +272,25 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
 def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: int) -> bool:
     size = os.path.getsize(filepath)
     ext = os.path.splitext(filepath)[1].lower()
-    try:
-        with open(filepath, "rb") as f:
-            if ext in (".mp3", ".m4a", ".opus", ".wav"):
-                bot.send_audio(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                               reply_to_message_id=reply_to, timeout=120)
-            elif ext in (".gif", ".png", ".jpg", ".jpeg", ".webp"):
-                bot.send_photo(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                               reply_to_message_id=reply_to, timeout=60)
-            else:
-                # Videos as document — avoids send_video 50MB cap + upload quirks
-                bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                                  reply_to_message_id=reply_to, timeout=120)
-        return True
-    except Exception as err:
-        LOGGER.warning("Failed to send media (%s, %s): %s | type: %s",
-                       ext, _human_size(size), err, type(err).__name__)
-        return False
+    for attempt in range(3):
+        try:
+            with open(filepath, "rb") as f:
+                if ext in (".mp3", ".m4a", ".opus", ".wav"):
+                    bot.send_audio(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                   reply_to_message_id=reply_to, timeout=120)
+                elif ext in (".gif", ".png", ".jpg", ".jpeg", ".webp"):
+                    bot.send_photo(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                   reply_to_message_id=reply_to, timeout=60)
+                else:
+                    bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                      reply_to_message_id=reply_to, timeout=120)
+            return True
+        except Exception as err:
+            LOGGER.warning("Send attempt %d/3 failed (%s, %s): %s | %s",
+                           attempt + 1, ext, _human_size(size), type(err).__name__, err)
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -336,34 +338,34 @@ def _build_caption(bot: Bot, platform: str, meta: dict) -> str:
 
 
 def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
-    """Scrape Reddit via JSON API. Returns (filepath, metadata)."""
+    """Scrape Reddit via old.reddit.com or RSS. Returns (filepath, metadata)."""
     meta = {}
     scraper = cloudscraper.create_scraper()
-    headers = {"User-Agent": _UA}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+
+    # Normalize: strip tracking params, convert to old.reddit.com
+    clean = url.split("?")[0]
+    clean = clean.replace("www.reddit.com", "old.reddit.com")
+    if not clean.endswith(".json"):
+        clean = clean.rstrip("/") + ".json"
+
+    # Try JSON API first
     try:
-        # Normalize URL: strip tracking params, ensure .json suffix
-        clean = url.split("?")[0]
-        if not clean.endswith(".json"):
-            clean = clean.rstrip("/") + ".json"
         resp = scraper.get(clean, timeout=15, headers=headers)
         resp.raise_for_status()
         data = resp.json()
-    except Exception as err:
-        LOGGER.warning("Reddit JSON fetch failed: %s", err)
-        return None, meta
-
-    try:
         post = data[0]["data"]["children"][0]["data"]
         meta["title"] = post.get("title", "")
         meta["uploader"] = post.get("author", "")
-        meta["description"] = (post.get("selftext", "") or "")[:200]
 
-        # Video hosting (v.redd.it)
         if post.get("is_video"):
             video_url = post["media"]["reddit_video"]["fallback_url"].split("?")[0]
             audio_url = post["media"]["reddit_video"].get("fallback_audio_url", "")
             filepath = os.path.join(tmpdir, "reddit_video.mp4")
-            dl = scraper.get(video_url, timeout=30, headers=headers, stream=True)
+            dl = scraper.get(video_url, timeout=60, headers=headers, stream=True)
             dl.raise_for_status()
             with open(filepath, "wb") as f:
                 for chunk in dl.iter_content(8192):
@@ -371,11 +373,10 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             if os.path.getsize(filepath) > 50 * 1024 * 1024:
                 os.remove(filepath)
                 return None, meta
-            # Try to merge audio if available
             if audio_url:
                 audio_path = os.path.join(tmpdir, "reddit_audio.mp4")
                 try:
-                    da = scraper.get(audio_url.split("?")[0], timeout=30, headers=headers, stream=True)
+                    da = scraper.get(audio_url.split("?")[0], timeout=60, headers=headers, stream=True)
                     da.raise_for_status()
                     with open(audio_path, "wb") as f:
                         for chunk in da.iter_content(8192):
@@ -390,15 +391,13 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                     pass
             return filepath, meta
 
-        # Image/video post
         media_url = post.get("url_overridden_by_dest") or post.get("url", "")
         if not media_url:
             return None, meta
-
         parsed = urllib.parse.urlparse(media_url)
         ext = os.path.splitext(parsed.path)[1] or ".jpg"
         filepath = os.path.join(tmpdir, "reddit_media" + ext)
-        dl = scraper.get(media_url, timeout=30, headers=headers, stream=True)
+        dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
         dl.raise_for_status()
         with open(filepath, "wb") as f:
             for chunk in dl.iter_content(8192):
@@ -408,8 +407,45 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             return None, meta
         return filepath, meta
     except Exception as err:
-        LOGGER.warning("Reddit scrape failed: %s", err)
-        return None, meta
+        LOGGER.info("Reddit JSON failed, trying RSS: %s", err)
+
+    # Fallback: RSS feed
+    try:
+        rss_url = clean.replace(".json", ".rss")
+        resp = scraper.get(rss_url, timeout=15, headers=headers)
+        resp.raise_for_status()
+        xml_text = resp.text
+
+        # Extract title
+        title_m = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", xml_text)
+        if title_m:
+            meta["title"] = title_m.group(1).strip()
+
+        # Find media:content or enclosure
+        for pattern in (
+            r'<media:content[^>]+url="([^"]+)"',
+            r'<enclosure[^>]+url="([^"]+)"',
+            r'<media:thumbnail[^>]+url="([^"]+)"',
+        ):
+            m = re.search(pattern, xml_text)
+            if m:
+                media_url = m.group(1)
+                parsed = urllib.parse.urlparse(media_url)
+                ext = os.path.splitext(parsed.path)[1] or ".jpg"
+                filepath = os.path.join(tmpdir, "reddit_rss" + ext)
+                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
+                dl.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None, meta
+                return filepath, meta
+    except Exception as err:
+        LOGGER.warning("Reddit RSS failed: %s", err)
+
+    return None, meta
 
 
 def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
