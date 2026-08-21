@@ -13,6 +13,14 @@ import tempfile
 import shutil
 import subprocess
 import urllib.parse
+import uuid
+
+# Unique per-process identifier. If two overlapping instances are both
+# uploading around the same time (e.g. during a Render redeploy where the
+# old instance hasn't fully exited), this shows up as two different
+# _INSTANCE_ID values interleaved in the logs for the same chat/timeframe -
+# confirming instance overlap as the cause rather than a genuine size issue.
+_INSTANCE_ID = uuid.uuid4().hex[:8]
 from typing import Dict, Optional, Tuple
 
 import cloudscraper
@@ -318,6 +326,14 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
     is_video = ext in (".mp4", ".mkv", ".webm")
 
     for attempt in range(3):
+        # Re-check size at send time (not just once, up front) - if this ever
+        # diverges from the value logged below, the file changed under us
+        # between attempts, which points at a race rather than a real size issue.
+        live_size = os.path.getsize(filepath) if os.path.exists(filepath) else -1
+        LOGGER.info(
+            "[goblin:%s] send attempt %d/3 chat=%s file=%s ext=%s size_at_start=%s size_now=%s",
+            _INSTANCE_ID, attempt + 1, chat_id, os.path.basename(filepath), ext, size, live_size,
+        )
         try:
             with open(filepath, "rb") as f:
                 if ext in (".mp3", ".m4a", ".opus", ".wav"):
@@ -337,8 +353,8 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
             return True
         except Exception as err:
             err_str = str(err)
-            LOGGER.warning("Send attempt %d/3 failed (%s, %s): %s | %s",
-                           attempt + 1, ext, _human_size(size), type(err).__name__, err_str[:200])
+            LOGGER.warning("[goblin:%s] Send attempt %d/3 failed (%s, %s): %s | %s",
+                           _INSTANCE_ID, attempt + 1, ext, _human_size(size), type(err).__name__, err_str[:200])
             # If send_video failed with "too large", try send_document as fallback.
             # If genuinely too large, no amount of retrying changes that - stop here
             # instead of burning the remaining retry attempts.
@@ -350,7 +366,8 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
                     return True
                 except Exception as err2:
                     err2_str = str(err2)
-                    LOGGER.warning("Document fallback also failed: %s | %s", type(err2).__name__, err2_str[:200])
+                    LOGGER.warning("[goblin:%s] Document fallback also failed: %s | %s",
+                                   _INSTANCE_ID, type(err2).__name__, err2_str[:200])
                     if "too large" in err2_str.lower():
                         # Genuinely oversized (or a transient garbled-response false
                         # positive, e.g. during a deploy) - retrying send won't help.
@@ -880,3 +897,5 @@ TikTok, Instagram, X (Twitter), Reddit, Facebook, Twitch Clips, Pinterest, Threa
 """
 
 __mod_name__ = "Goblin"
+
+LOGGER.info("[goblin] module loaded, instance_id=%s", _INSTANCE_ID)
