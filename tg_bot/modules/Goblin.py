@@ -38,11 +38,6 @@ from telegram.ext import (
 
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
-from tg_bot.modules.ytdl import (
-    _probe_formats as _yt_probe_formats,
-    _build_quality_keyboard as _yt_build_quality_keyboard,
-    _cache_request as _yt_cache_request,
-)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,9 +69,6 @@ _PIN_PATTERN = re.compile(
 _THREADSSHARE_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:threads\.net|threads\.com)/(?:@\S+/post/\S+|share/\S+)"
 )
-_YOUTUBE_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[a-zA-Z0-9_-]{11}"
-)
 
 PLATFORMS = {
     "tiktok": _TIKTOK_PATTERN,
@@ -87,7 +79,6 @@ PLATFORMS = {
     "twitch": _TWITCH_PATTERN,
     "pinterest": _PIN_PATTERN,
     "threads": _THREADSSHARE_PATTERN,
-    "youtube": _YOUTUBE_PATTERN,
 }
 
 # ---------------------------------------------------------------------------
@@ -748,37 +739,6 @@ def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
     except Exception as err:
         LOGGER.warning("X scrape failed: %s", err)
         return None, meta
-
-
-def _handle_youtube(bot: Bot, message, url: str, chat_id: int):
-    """Unlike every other platform here, YouTube gets a quality picker
-    (like /yt) instead of an auto-grab-and-send - it's the one platform
-    where resolution choice is actually meaningful. Reuses ytdl.py's
-    probe/keyboard/cache logic rather than duplicating it."""
-    status = message.reply_text("Fetching video info...")
-    info = _yt_probe_formats(url)
-    if not info:
-        status.edit_text("Couldn't fetch that video — it may be private, age-restricted, or unavailable.")
-        return
-
-    heights = set()
-    for f in info.get("formats", []) or []:
-        h = f.get("height")
-        if h:
-            heights.add(h)
-
-    request_id = _yt_cache_request(url, chat_id)
-    keyboard = _yt_build_quality_keyboard(request_id, heights)
-
-    title = (info.get("title") or "Video")[:150]
-    duration = info.get("duration")
-    duration_str = f" ({duration // 60}:{duration % 60:02d})" if duration else ""
-
-    status.edit_text(
-        f"<b>{_escape_html(title)}</b>{duration_str}\nChoose a quality:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
-    )
 
 
 def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
