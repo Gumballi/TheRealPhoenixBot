@@ -42,11 +42,11 @@ _TIKTOK_PATTERN = re.compile(
 _IG_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?instagram\.com/(?:reel|p)/[A-Za-z0-9_-]+"
 )
-_X_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/\S+/status/\d+"
-)
 _REDDIT_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:redd\.it/\S+|reddit\.com/(?:r/\S+/comments|link)\S+)"
+)
+_X_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/(?:\S+/status/\d+|i/status/\d+)"
 )
 _FB_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:facebook\.com/\S+/videos|fb\.watch/\S+)"
@@ -57,8 +57,8 @@ _TWITCH_PATTERN = re.compile(
 _PIN_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:pinterest\.com/\S+|pin\.it/\S+)"
 )
-_THREADS_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:threads\.net|threads\.com)/@\S+/post/\S+"
+_THREADSSHARE_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:threads\.net|threads\.com)/(?:@\S+/post/\S+|share/\S+)"
 )
 
 PLATFORMS = {
@@ -69,7 +69,7 @@ PLATFORMS = {
     "facebook": _FB_PATTERN,
     "twitch": _TWITCH_PATTERN,
     "pinterest": _PIN_PATTERN,
-    "threads": _THREADS_PATTERN,
+    "threads": _THREADSSHARE_PATTERN,
 }
 
 # ---------------------------------------------------------------------------
@@ -286,7 +286,8 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
                                   reply_to_message_id=reply_to, timeout=120)
         return True
     except Exception as err:
-        LOGGER.warning("Failed to send media (%s, %s): %s", ext, _human_size(size), err)
+        LOGGER.warning("Failed to send media (%s, %s): %s | type: %s",
+                       ext, _human_size(size), err, type(err).__name__)
         return False
 
 
@@ -332,6 +333,148 @@ def _build_caption(bot: Bot, platform: str, meta: dict) -> str:
     parts.append("@{}".format(bot_user))
 
     return "\n".join(parts)
+
+
+def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
+    """Scrape Reddit via JSON API. Returns (filepath, metadata)."""
+    meta = {}
+    scraper = cloudscraper.create_scraper()
+    headers = {"User-Agent": _UA}
+    try:
+        # Normalize URL: strip tracking params, ensure .json suffix
+        clean = url.split("?")[0]
+        if not clean.endswith(".json"):
+            clean = clean.rstrip("/") + ".json"
+        resp = scraper.get(clean, timeout=15, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as err:
+        LOGGER.warning("Reddit JSON fetch failed: %s", err)
+        return None, meta
+
+    try:
+        post = data[0]["data"]["children"][0]["data"]
+        meta["title"] = post.get("title", "")
+        meta["uploader"] = post.get("author", "")
+        meta["description"] = (post.get("selftext", "") or "")[:200]
+
+        # Video hosting (v.redd.it)
+        if post.get("is_video"):
+            video_url = post["media"]["reddit_video"]["fallback_url"].split("?")[0]
+            audio_url = post["media"]["reddit_video"].get("fallback_audio_url", "")
+            filepath = os.path.join(tmpdir, "reddit_video.mp4")
+            dl = scraper.get(video_url, timeout=30, headers=headers, stream=True)
+            dl.raise_for_status()
+            with open(filepath, "wb") as f:
+                for chunk in dl.iter_content(8192):
+                    f.write(chunk)
+            if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                os.remove(filepath)
+                return None, meta
+            # Try to merge audio if available
+            if audio_url:
+                audio_path = os.path.join(tmpdir, "reddit_audio.mp4")
+                try:
+                    da = scraper.get(audio_url.split("?")[0], timeout=30, headers=headers, stream=True)
+                    da.raise_for_status()
+                    with open(audio_path, "wb") as f:
+                        for chunk in da.iter_content(8192):
+                            f.write(chunk)
+                    merged = os.path.join(tmpdir, "reddit_merged.mp4")
+                    os.system('ffmpeg -y -i "{}" -i "{}" -c copy "{}" 2>/dev/null'.format(
+                        filepath, audio_path, merged))
+                    if os.path.exists(merged) and os.path.getsize(merged) > 0:
+                        os.remove(filepath)
+                        filepath = merged
+                except Exception:
+                    pass
+            return filepath, meta
+
+        # Image/video post
+        media_url = post.get("url_overridden_by_dest") or post.get("url", "")
+        if not media_url:
+            return None, meta
+
+        parsed = urllib.parse.urlparse(media_url)
+        ext = os.path.splitext(parsed.path)[1] or ".jpg"
+        filepath = os.path.join(tmpdir, "reddit_media" + ext)
+        dl = scraper.get(media_url, timeout=30, headers=headers, stream=True)
+        dl.raise_for_status()
+        with open(filepath, "wb") as f:
+            for chunk in dl.iter_content(8192):
+                f.write(chunk)
+        if os.path.getsize(filepath) > 50 * 1024 * 1024:
+            os.remove(filepath)
+            return None, meta
+        return filepath, meta
+    except Exception as err:
+        LOGGER.warning("Reddit scrape failed: %s", err)
+        return None, meta
+
+
+def _x_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
+    """Scrape X/Twitter via syndication API. Returns (filepath, metadata)."""
+    meta = {}
+    try:
+        # Extract tweet ID from URL
+        m = re.search(r"/status/(\d+)", url)
+        if not m:
+            return None, meta
+        tweet_id = m.group(1)
+
+        # fxtwitter / vxtwitter public API
+        scraper = cloudscraper.create_scraper()
+        api_url = "https://api.fxtwitter.com/i/status/{}".format(tweet_id)
+        resp = scraper.get(api_url, timeout=15, headers={"User-Agent": _UA})
+        if resp.status_code != 200:
+            # Try vxtwitter
+            api_url = "https://api.vxtwitter.com/i/status/{}".format(tweet_id)
+            resp = scraper.get(api_url, timeout=15, headers={"User-Agent": _UA})
+
+        if resp.status_code != 200:
+            return None, meta
+
+        data = resp.json()
+        tweet = data.get("tweet", data)
+        meta["title"] = tweet.get("text", "")[:100]
+        meta["uploader"] = tweet.get("author", {}).get("name", "")
+        meta["uploader_url"] = tweet.get("author", {}).get("url", "")
+
+        # Check for video
+        videos = tweet.get("media", {}).get("videos", [])
+        if videos:
+            video_url = videos[0].get("url", "")
+            if not video_url:
+                return None, meta
+            filepath = os.path.join(tmpdir, "x_video.mp4")
+            dl = scraper.get(video_url, timeout=30, headers={"User-Agent": _UA}, stream=True)
+            dl.raise_for_status()
+            with open(filepath, "wb") as f:
+                for chunk in dl.iter_content(8192):
+                    f.write(chunk)
+            if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                os.remove(filepath)
+                return None, meta
+            return filepath, meta
+
+        # Check for photos
+        photos = tweet.get("media", {}).get("photos", [])
+        if photos:
+            photo_url = photos[0].get("url", "")
+            if not photo_url:
+                return None, meta
+            filepath = os.path.join(tmpdir, "x_photo.jpg")
+            dl = scraper.get(photo_url, timeout=30, headers={"User-Agent": _UA}, stream=True)
+            dl.raise_for_status()
+            with open(filepath, "wb") as f:
+                for chunk in dl.iter_content(8192):
+                    f.write(chunk)
+            return filepath, meta
+
+        return None, meta
+    except Exception as err:
+        LOGGER.warning("X scrape failed: %s", err)
+        return None, meta
 
 
 def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
@@ -381,7 +524,10 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
 
         # 2) Custom scrapers when yt-dlp fails
         if not filepath:
-            if platform == "pinterest":
+            if platform == "reddit":
+                status.edit_text("Trying Reddit scraper...")
+                filepath, meta = _reddit_scrape(url, tmpdir)
+            elif platform == "pinterest":
                 status.edit_text("Trying Pinterest scraper...")
                 filepath, meta = _og_scrape(
                     url,
@@ -405,6 +551,9 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                         r'"display_url"\s*:\s*"([^"]+)"',
                     ),
                 )
+            elif platform == "x":
+                status.edit_text("Trying X scraper...")
+                filepath, meta = _x_scrape(url, tmpdir)
 
         if not filepath:
             # TikTok photo posts (slideshows) can't be downloaded as video
