@@ -616,7 +616,13 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
         body_snippet = ""
         if "resp" in locals() and resp is not None:
             try:
-                body_snippet = f" | body_snippet={resp.text[:300]!r} status={resp.status_code}"
+                # loguru interprets literal <...> in log messages as color/style
+                # tags and crashes on anything it doesn't recognize (e.g. raw
+                # HTML like "<title>") - escape angle brackets before logging
+                # so this stays a safe diagnostic string, not a formatter crash.
+                raw_snippet = resp.text[:300]
+                safe_snippet = raw_snippet.replace("<", "[").replace(">", "]")
+                body_snippet = f" | body_snippet={safe_snippet!r} status={resp.status_code}"
             except Exception:
                 pass
         LOGGER.info("Reddit JSON failed, trying RSS: %s%s", err, body_snippet)
