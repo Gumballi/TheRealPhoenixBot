@@ -114,6 +114,14 @@ def _get_proxies() -> Optional[dict]:
 
 
 _PROXIES = _get_proxies()
+if _PROXIES:
+    LOGGER.info(
+        "[goblin] Webshare proxy ACTIVE for scraper requests (host=%s port=%s).",
+        os.environ.get("WEBSHARE_PROXY_HOST", "p.webshare.io"),
+        os.environ.get("WEBSHARE_PROXY_PORT", "80"),
+    )
+else:
+    LOGGER.info("[goblin] No proxy configured - scraper requests go out directly from this host's IP.")
 
 
 def _extract_urls(message) -> list:
@@ -602,7 +610,16 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
             return None, meta
         return filepath, meta
     except Exception as err:
-        LOGGER.info("Reddit JSON failed, trying RSS: %s", err)
+        # resp may or may not be bound depending on where the failure
+        # happened (network error vs. bad JSON vs. missing keys) - only log
+        # the body snippet when we actually have a response to inspect.
+        body_snippet = ""
+        if "resp" in locals() and resp is not None:
+            try:
+                body_snippet = f" | body_snippet={resp.text[:300]!r} status={resp.status_code}"
+            except Exception:
+                pass
+        LOGGER.info("Reddit JSON failed, trying RSS: %s%s", err, body_snippet)
 
     # Fallback: try the share endpoint (works when JSON is blocked)
     try:
