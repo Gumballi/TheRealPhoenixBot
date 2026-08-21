@@ -143,6 +143,39 @@ def _content_type_rejects(response) -> bool:
     return any(bad in content_type for bad in ("text/html", "application/json", "text/plain"))
 
 
+def _sanitize_upload_filename(filepath: str) -> str:
+    """Ensures the on-disk file has an ASCII-safe, reasonably short filename
+    before it's ever handed to the Telegram upload calls. Defense-in-depth
+    against any future source (not just yt-dlp) producing filenames with
+    emoji, non-Latin scripts, decorative Unicode, or excessive length, which
+    risk a malformed/oversized Content-Disposition header and a spurious
+    413 from Telegram's edge - the actual root cause traced behind the
+    'File too large' errors on files confirmed small at send time.
+    Renames the file in place if needed and returns the (possibly new) path."""
+    directory = os.path.dirname(filepath)
+    basename = os.path.basename(filepath)
+    stem, ext = os.path.splitext(basename)
+
+    is_ascii = all(ord(c) < 128 for c in stem)
+    if is_ascii and len(stem) <= 64:
+        return filepath
+
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem.encode("ascii", "ignore").decode("ascii"))
+    safe_stem = safe_stem.strip("_") or uuid.uuid4().hex[:8]
+    safe_stem = safe_stem[:64]
+    new_path = os.path.join(directory, f"{safe_stem}{ext}")
+
+    if os.path.exists(new_path):
+        new_path = os.path.join(directory, f"{safe_stem}_{uuid.uuid4().hex[:6]}{ext}")
+
+    try:
+        os.rename(filepath, new_path)
+        return new_path
+    except OSError as err:
+        LOGGER.warning("Could not sanitize filename for %s: %s", filepath, err)
+        return filepath
+
+
 def _validate_downloaded_file(filepath: str, min_bytes: int = 256) -> bool:
     """Guards against saving an HTML error/block/CAPTCHA page as if it were
     real image/video bytes. This was the direct cause of Telegram's
@@ -271,7 +304,15 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
     meta = {}
     try:
         ydl_opts = {
-            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+            # Use the video ID, not the title, for the on-disk/upload filename.
+            # Titles can contain emoji, non-Latin scripts, decorative Unicode
+            # lookalikes, and be arbitrarily long (e.g. a full sentence) - all
+            # of which risk producing a malformed or oversized
+            # Content-Disposition header on upload. That's the likely real
+            # cause behind sporadic 413 "File too large" responses on files
+            # that were confirmed small and unchanged at send time. The real
+            # title is still captured separately below for the caption.
+            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
             "format": "best[ext=mp4]/best",
             "quiet": True,
             "no_warnings": True,
@@ -321,6 +362,7 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
 # ---------------------------------------------------------------------------
 
 def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: int) -> bool:
+    filepath = _sanitize_upload_filename(filepath)
     size = os.path.getsize(filepath)
     ext = os.path.splitext(filepath)[1].lower()
     is_video = ext in (".mp4", ".mkv", ".webm")
