@@ -302,6 +302,8 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
 def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str], dict]:
     """Try yt-dlp.  Returns (filepath, metadata) or (None, {})."""
     meta = {}
+    if platform == "reddit":
+        url = _resolve_reddit_share_link(url)
     try:
         ydl_opts = {
             # Use the video ID, not the title, for the on-disk/upload filename.
@@ -463,6 +465,30 @@ def _build_caption(bot: Bot, platform: str, meta: dict) -> str:
     return "\n".join(parts)
 
 
+def _resolve_reddit_share_link(url: str) -> str:
+    """/r/SUBREDDIT/s/CODE links are pure redirect stubs, not real post
+    pages - Reddit resolves them server-side to the actual
+    /comments/POSTID/slug/ URL. Neither yt-dlp's extractor matching nor
+    old.reddit.com's .json endpoint understands the /s/ stub directly, so
+    both need the resolved URL up front."""
+    if "/s/" not in url:
+        return url
+    try:
+        scraper = cloudscraper.create_scraper()
+        resp = scraper.get(
+            url, timeout=15,
+            headers={"User-Agent": _UA},
+            allow_redirects=True,
+        )
+        if resp.url and "/s/" not in resp.url:
+            LOGGER.info("Resolved Reddit share link %s -> %s", url, resp.url)
+            return resp.url
+        LOGGER.warning("Reddit share link did not resolve to a real post URL: %s", url)
+    except Exception as err:
+        LOGGER.warning("Failed to resolve Reddit share link %s: %s", url, err)
+    return url
+
+
 def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
     """Scrape Reddit via old.reddit.com or RSS. Returns (filepath, metadata)."""
     meta = {}
@@ -471,6 +497,8 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     }
+
+    url = _resolve_reddit_share_link(url)
 
     # Normalize: strip tracking params, convert to old.reddit.com
     clean = url.split("?")[0]
