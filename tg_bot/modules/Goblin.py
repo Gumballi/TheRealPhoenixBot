@@ -272,22 +272,39 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
 def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: int) -> bool:
     size = os.path.getsize(filepath)
     ext = os.path.splitext(filepath)[1].lower()
+    is_video = ext in (".mp4", ".mkv", ".webm")
+
     for attempt in range(3):
         try:
             with open(filepath, "rb") as f:
                 if ext in (".mp3", ".m4a", ".opus", ".wav"):
                     bot.send_audio(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                                   reply_to_message_id=reply_to, timeout=120)
+                                   reply_to_message_id=reply_to, timeout=180)
                 elif ext in (".gif", ".png", ".jpg", ".jpeg", ".webp"):
                     bot.send_photo(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
                                    reply_to_message_id=reply_to, timeout=60)
+                elif is_video and size <= 50 * 1024 * 1024:
+                    # Try send_video first (shows inline player)
+                    bot.send_video(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                   reply_to_message_id=reply_to, timeout=180)
                 else:
+                    # Large videos or unknown types as document
                     bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                                      reply_to_message_id=reply_to, timeout=120)
+                                      reply_to_message_id=reply_to, timeout=180)
             return True
         except Exception as err:
+            err_str = str(err)
             LOGGER.warning("Send attempt %d/3 failed (%s, %s): %s | %s",
-                           attempt + 1, ext, _human_size(size), type(err).__name__, err)
+                           attempt + 1, ext, _human_size(size), type(err).__name__, err_str[:200])
+            # If send_video failed with "too large", try send_document as fallback (no retry loop)
+            if is_video and "too large" in err_str.lower():
+                try:
+                    with open(filepath, "rb") as f:
+                        bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                          reply_to_message_id=reply_to, timeout=180)
+                    return True
+                except Exception as err2:
+                    LOGGER.warning("Document fallback also failed: %s | %s", type(err2).__name__, err2)
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
     return False
@@ -408,6 +425,65 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
         return filepath, meta
     except Exception as err:
         LOGGER.info("Reddit JSON failed, trying RSS: %s", err)
+
+    # Fallback: try the share endpoint (works when JSON is blocked)
+    try:
+        share_url = clean.replace(".json", "")
+        resp = scraper.get(share_url, timeout=15, headers=headers)
+        resp.raise_for_status()
+        html = resp.text
+
+        # Try to find og:video or og:image in the HTML
+        for prop in ("og:video", "og:video:secure_url", "og:image"):
+            m = re.search(r'property="og:(?:video|image)"[^>]+content="([^"]+)"', html) or \
+                re.search(r'content="([^"]+)"[^>]+property="og:(?:video|image)"', html)
+            if m:
+                media_url = m.group(1)
+                if media_url.startswith("//"):
+                    media_url = "https:" + media_url
+                parsed = urllib.parse.urlparse(media_url)
+                ext = os.path.splitext(parsed.path)[1] or ".jpg"
+                filepath = os.path.join(tmpdir, "reddit_share" + ext)
+                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
+                dl.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None, meta
+                return filepath, meta
+
+        # Try JSON-LD or embedded video tags
+        for pattern in (
+            r'"fallback_url"\s*:\s*"([^"]+)"',
+            r'"contentUrl"\s*:\s*"([^"]+)"',
+            r'<video[^>]+src="([^"]+)"',
+        ):
+            m = re.search(pattern, html)
+            if m:
+                media_url = m.group(1).replace("\\u0026", "&").replace("\\/", "/")
+                if media_url.startswith("//"):
+                    media_url = "https:" + media_url
+                parsed = urllib.parse.urlparse(media_url)
+                ext = os.path.splitext(parsed.path)[1] or ".mp4"
+                filepath = os.path.join(tmpdir, "reddit_share" + ext)
+                dl = scraper.get(media_url, timeout=60, headers=headers, stream=True)
+                dl.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in dl.iter_content(8192):
+                        f.write(chunk)
+                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                    os.remove(filepath)
+                    return None, meta
+                return filepath, meta
+
+        # Extract title from page
+        title_m = re.search(r'<title>([^<]+)</title>', html)
+        if title_m:
+            meta["title"] = title_m.group(1).strip()[:100]
+    except Exception as err:
+        LOGGER.warning("Reddit share page scrape failed: %s", err)
 
     # Fallback: RSS feed
     try:
