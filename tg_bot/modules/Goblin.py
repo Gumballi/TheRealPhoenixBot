@@ -179,7 +179,7 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
-                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                if os.path.getsize(filepath) > 70 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
                 return filepath, meta
@@ -201,7 +201,7 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
                 with open(filepath, "wb") as f:
                     for chunk in dl.iter_content(8192):
                         f.write(chunk)
-                if os.path.getsize(filepath) > 50 * 1024 * 1024:
+                if os.path.getsize(filepath) > 70 * 1024 * 1024:
                     os.remove(filepath)
                     return None, meta
                 return filepath, meta
@@ -221,12 +221,12 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
     try:
         ydl_opts = {
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-            "format": "best[ext=mp4][filesize<50M]/best[filesize<50M]/best",
+            "format": "best[ext=mp4][filesize<70M]/best[filesize<70M]/best",
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
             "merge_output_format": "mp4",
-            "max_filesize": 50 * 1024 * 1024,
+            "max_filesize": 70 * 1024 * 1024,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -259,7 +259,7 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
 
 def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: int) -> bool:
     size = os.path.getsize(filepath)
-    if size > 50 * 1024 * 1024:
+    if size > 70 * 1024 * 1024:
         return False
     ext = os.path.splitext(filepath)[1].lower()
     try:
@@ -350,7 +350,7 @@ def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
-            status.edit_text("File too large for Telegram (>50MB).")
+            status.edit_text("File too large for Telegram (>70MB).")
     except Exception as err:
         LOGGER.exception("Threads handler error: %s", err)
         try:
@@ -407,7 +407,7 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
-            status.edit_text("File too large for Telegram (>50MB).")
+            status.edit_text("File too large for Telegram (>70MB).")
     except Exception as err:
         LOGGER.exception("%s handler error: %s", platform, err)
         try:
@@ -505,7 +505,7 @@ TikTok, Instagram, X (Twitter), Reddit, Facebook, Twitch Clips, Pinterest, Threa
 
 *How it works:*
  - Just paste a link and the bot grabs the media automatically.
- - Downloads the best quality under 50MB with title, uploader, and description.
+ - Downloads the best quality under 70MB with title, uploader, and description.
 
 *Manual trigger:*
  - /goblin <url>: Download a specific link on demand.
