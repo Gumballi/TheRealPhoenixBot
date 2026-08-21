@@ -271,14 +271,17 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
 
 def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: int) -> bool:
     size = os.path.getsize(filepath)
-    if size > 50 * 1024 * 1024:
-        return False
     ext = os.path.splitext(filepath)[1].lower()
     try:
         with open(filepath, "rb") as f:
             if ext in (".mp4", ".mkv", ".webm"):
-                bot.send_video(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                               reply_to_message_id=reply_to, timeout=60)
+                # Videos >50MB must go as document (send_video hard-caps at 50MB)
+                if size > 50 * 1024 * 1024:
+                    bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                      reply_to_message_id=reply_to, timeout=120)
+                else:
+                    bot.send_video(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                   reply_to_message_id=reply_to, timeout=120)
             elif ext in (".mp3", ".m4a", ".opus", ".wav"):
                 bot.send_audio(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
                                reply_to_message_id=reply_to, timeout=60)
@@ -287,10 +290,10 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
                                reply_to_message_id=reply_to, timeout=60)
             else:
                 bot.send_document(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
-                                  reply_to_message_id=reply_to, timeout=60)
+                                  reply_to_message_id=reply_to, timeout=120)
         return True
     except Exception as err:
-        LOGGER.warning("Failed to send media: %s", err)
+        LOGGER.warning("Failed to send media (%s, %s): %s", ext, _human_size(size), err)
         return False
 
 
@@ -361,7 +364,7 @@ def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
-            status.edit_text("File too large for Telegram (>50MB).")
+            status.edit_text("Failed to upload to Telegram — try again later.")
     except Exception as err:
         LOGGER.exception("Threads handler error: %s", err)
         try:
@@ -411,14 +414,18 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                 )
 
         if not filepath:
-            status.edit_text("Could not download from {}.".format(platform.title()))
+            # TikTok photo posts (slideshows) can't be downloaded as video
+            if platform == "tiktok":
+                status.edit_text("This looks like a TikTok photo post — can't download as video.")
+            else:
+                status.edit_text("Could not download from {}.".format(platform.title()))
             return
 
         caption = _build_caption(bot, platform, meta)
         if _send_media(bot, chat_id, filepath, caption, msg_id):
             status.delete()
         else:
-            status.edit_text("File too large for Telegram (>50MB).")
+            status.edit_text("Failed to upload to Telegram — try again later.")
     except Exception as err:
         LOGGER.exception("%s handler error: %s", platform, err)
         try:
