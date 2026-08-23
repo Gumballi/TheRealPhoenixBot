@@ -774,7 +774,7 @@ MENTION_HANDLER = MessageHandler(
     Filters.text & ~Filters.command,
     mention_chatbot,
 )
-dispatcher.add_handler(MENTION_HANDLER, group=10)
+dispatcher.add_handler(MENTION_HANDLER, group=13)
 
 # Multimodal: photos/videos/gifs sent to the bot (or replying to it) are also
 # answered. The same is_pm/is_mentioned/is_reply_to_bot gate inside
@@ -783,7 +783,7 @@ MEDIA_HANDLER = MessageHandler(
     Filters.photo | Filters.video | Filters.animation,
     mention_chatbot,
 )
-dispatcher.add_handler(MEDIA_HANDLER, group=10)
+dispatcher.add_handler(MEDIA_HANDLER, group=13)
 
 AI_STATUS_HANDLER = CommandHandler("aistatus", ai_status)
 dispatcher.add_handler(AI_STATUS_HANDLER)
