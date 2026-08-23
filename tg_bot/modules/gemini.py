@@ -612,6 +612,11 @@ def mention_chatbot(bot: Bot, update: Update):
     if not msg:
         return
 
+    LOGGER.info("[ai] mention_chatbot handler fired: chat=%s user=%s text=%r",
+                update.effective_chat.id,
+                msg.from_user.id if msg.from_user else "?",
+                (msg.text or msg.caption or "")[:80])
+
     is_pm = update.effective_chat.type == "private"
 
     is_reply_to_bot = bool(
