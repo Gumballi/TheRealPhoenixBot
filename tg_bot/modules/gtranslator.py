@@ -1,33 +1,41 @@
-import os
 import requests
 from telegram import ParseMode, Update, Bot
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
-LIBRE_URL = os.environ.get("LIBRETRANSLATE_URL", "https://lt.vern.cc")
+MYMEMORY_API = "https://api.mymemory.translated.net/get"
 
 
 def _detect(text: str) -> str:
     try:
-        r = requests.post(
-            f"{LIBRE_URL}/detect",
-            json={"q": text},
+        r = requests.get(
+            MYMEMORY_API,
+            params={"q": text, "langpair": "autodetect|en"},
             timeout=10,
         )
         r.raise_for_status()
-        return r.json()[0]["language"]
+        data = r.json()
+        if data.get("responseData", {}).get("translatedText"):
+            matches = data.get("matches", [])
+            if matches:
+                return matches[0].get("source", "en").split("-")[0]
     except Exception:
-        return "auto"
+        pass
+    return "en"
 
 
-def _translate(text: str, source: str = "auto", target: str = "en") -> str:
-    r = requests.post(
-        f"{LIBRE_URL}/translate",
-        json={"q": text, "source": source, "target": target},
+def _translate(text: str, source: str = "autodetect", target: str = "en") -> str:
+    r = requests.get(
+        MYMEMORY_API,
+        params={"q": text, "langpair": f"{source}|{target}"},
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()["translatedText"]
+    data = r.json()
+    result = data.get("responseData", {}).get("translatedText", "")
+    if not result:
+        raise ValueError("Empty translation response")
+    return result
 
 
 def translate(bot: Bot, update: Update) -> None:
