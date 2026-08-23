@@ -1,8 +1,11 @@
 import threading
+import logging
 
 from sqlalchemy import Column, String, UnicodeText, Boolean, Integer, distinct, func
 
 from tg_bot.modules.sql import BASE, SESSION
+
+LOGGER = logging.getLogger(__name__)
 
 
 class CustomFilters(BASE):
@@ -190,6 +193,9 @@ def __load_chat_filters():
 
         CHAT_FILTERS = {x: sorted(set(y), key=lambda i: (-len(i), i)) for x, y in CHAT_FILTERS.items()}
 
+    except Exception as e:
+        LOGGER.warning("Failed to load chat filters from DB (will retry on next add): %s", e)
+        CHAT_FILTERS = {}
     finally:
         SESSION.close()
 
