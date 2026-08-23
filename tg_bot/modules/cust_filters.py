@@ -155,14 +155,11 @@ def reply_filter(bot: Bot, update: Update):
         return
 
     chat_filters = sql.get_chat_triggers(chat.id)
-    LOGGER.info("[cust_filters] reply_filter fired: chat=%s to_match=%r triggers=%s", chat.id, to_match, chat_filters)
     for keyword in chat_filters:
         pattern = r"( |^|[^\w])" + re.escape(keyword) + r"( |$|[^\w])"
         if re.search(pattern, to_match, flags=re.IGNORECASE):
-            LOGGER.info("[cust_filters] matched keyword=%r in chat=%s", keyword, chat.id)
             filt = sql.get_filter(chat.id, keyword)
             if filt is None:
-                LOGGER.warning("[cust_filters] get_filter returned None for chat=%s keyword=%r", chat.id, keyword)
                 continue
             try:
                 if filt.is_sticker:
@@ -204,8 +201,8 @@ def reply_filter(bot: Bot, update: Update):
                 else:
                     # LEGACY - all new filters will have has_markdown set to True.
                     message.reply_text(filt.reply)
-            except Exception as e:
-                LOGGER.exception("[cust_filters] Error sending filter response for %r in chat=%s: %s", keyword, chat.id, e)
+            except Exception:
+                pass
             break
 
 
