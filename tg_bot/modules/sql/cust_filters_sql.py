@@ -133,7 +133,21 @@ def remove_filter(chat_id, keyword):
 
 
 def get_chat_triggers(chat_id):
-    return CHAT_FILTERS.get(str(chat_id), set())
+    chat_id = str(chat_id)
+    triggers = CHAT_FILTERS.get(chat_id)
+    if triggers is not None:
+        return triggers
+    # Cache miss — populate from DB so future lookups are fast
+    try:
+        all_filters = SESSION.query(CustomFilters).filter(CustomFilters.chat_id == chat_id).all()
+        keywords = sorted(set(x.keyword for x in all_filters), key=lambda i: (-len(i), i))
+        CHAT_FILTERS[chat_id] = keywords
+        return keywords
+    except Exception as e:
+        LOGGER.warning("DB fallback for get_chat_triggers(%s) failed: %s", chat_id, e)
+        return []
+    finally:
+        SESSION.close()
 
 
 def get_chat_filters(chat_id):
