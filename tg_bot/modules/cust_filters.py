@@ -147,25 +147,9 @@ def stop_filter(bot: Bot, update: Update):
 
 
 @run_async
-def _is_bot_mentioned(bot, message):
-    if not message.entities:
-        return False
-    for ent in message.entities:
-        if ent.type in ("mention", "text_mention"):
-            if ent.type == "mention" and message.text:
-                if message.text[ent.offset:ent.offset + ent.length].lower() == f"@{bot.username}".lower():
-                    return True
-            elif ent.type == "text_mention" and ent.user and ent.user.id == bot.id:
-                return True
-    return False
-
-
 def reply_filter(bot: Bot, update: Update):
     chat = update.effective_chat  # type: Optional[Chat]
     message = update.effective_message  # type: Optional[Message]
-    # Skip if the bot is mentioned — let the AI handler (group 10+) deal with it
-    if _is_bot_mentioned(bot, message):
-        return
     to_match = extract_text(message)
     if not to_match:
         return

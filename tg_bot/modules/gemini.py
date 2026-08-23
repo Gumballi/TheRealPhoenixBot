@@ -779,7 +779,7 @@ MENTION_HANDLER = MessageHandler(
     Filters.text & ~Filters.command,
     mention_chatbot,
 )
-dispatcher.add_handler(MENTION_HANDLER, group=10)
+dispatcher.add_handler(MENTION_HANDLER, group=13)
 
 # Multimodal: photos/videos/gifs sent to the bot (or replying to it) are also
 # answered. The same is_pm/is_mentioned/is_reply_to_bot gate inside
