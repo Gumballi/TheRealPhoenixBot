@@ -36,6 +36,21 @@ CHATS_CNT = {}
 CHATS_TIME = {}
 
 def process_update(self, update):
+    # ── DEBUG: log every update entering the dispatcher ──
+    try:
+        ec = update.effective_chat
+        em = update.effective_message
+        LOGGER.info(
+            "[DBG_UPDATE] chat_id=%s chat_type=%s msg_type=%s has_text=%s",
+            ec.id if ec else "NONE",
+            ec.type if ec else "NONE",
+            type(em).__name__ if em else "NONE",
+            bool(em.text) if em else False,
+        )
+    except Exception:
+        pass
+    # ── END DEBUG ──
+
     if isinstance(update, TelegramError):
         try:
             self.dispatch_error(None, update)
