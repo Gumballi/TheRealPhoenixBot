@@ -1,16 +1,18 @@
+import time
 import requests
 from telegram import ParseMode, Update, Bot
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
 MYMEMORY_API = "https://api.mymemory.translated.net/get"
+MAX_CHARS = 450  # MyMemory free tier limit is ~500 chars per request
 
 
 def _detect(text: str) -> str:
     try:
         r = requests.get(
             MYMEMORY_API,
-            params={"q": text, "langpair": "autodetect|en"},
+            params={"q": text[:MAX_CHARS], "langpair": "autodetect|en"},
             timeout=10,
         )
         r.raise_for_status()
@@ -25,17 +27,23 @@ def _detect(text: str) -> str:
 
 
 def _translate(text: str, source: str = "autodetect", target: str = "en") -> str:
-    r = requests.get(
-        MYMEMORY_API,
-        params={"q": text, "langpair": f"{source}|{target}"},
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-    result = data.get("responseData", {}).get("translatedText", "")
-    if not result:
-        raise ValueError("Empty translation response")
-    return result
+    truncated = text[:MAX_CHARS]
+    for attempt in range(3):
+        r = requests.get(
+            MYMEMORY_API,
+            params={"q": truncated, "langpair": f"{source}|{target}"},
+            timeout=15,
+        )
+        if r.status_code == 429:
+            time.sleep(2 ** attempt)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        result = data.get("responseData", {}).get("translatedText", "")
+        if not result:
+            raise ValueError("Empty translation response")
+        return result
+    raise Exception("Rate limited by MyMemory, try again later")
 
 
 def translate(bot: Bot, update: Update) -> None:
