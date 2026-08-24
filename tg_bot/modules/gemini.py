@@ -621,12 +621,13 @@ def mention_chatbot(bot: Bot, update: Update):
     )
 
     is_mentioned = _is_bot_mentioned(bot, msg)
-    media = _extract_media(bot, msg)
 
     # Bail out immediately if none of these apply - avoids spawning a thread
     # for every single message in a busy group (previous behavior).
-    if not (is_pm or is_mentioned or is_reply_to_bot or media):
+    if not (is_pm or is_mentioned or is_reply_to_bot):
         return
+
+    media = _extract_media(bot, msg)
 
     user_id = msg.from_user.id
     remaining = _on_cooldown(user_id)
