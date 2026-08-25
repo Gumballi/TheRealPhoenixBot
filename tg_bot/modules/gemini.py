@@ -614,17 +614,10 @@ def mention_chatbot(bot: Bot, update: Update):
 
     is_pm = update.effective_chat.type == "private"
 
-    is_reply_to_bot = bool(
-        msg.reply_to_message
-        and msg.reply_to_message.from_user
-        and msg.reply_to_message.from_user.id == bot.id
-    )
-
     is_mentioned = _is_bot_mentioned(bot, msg)
 
-    # Bail out immediately if none of these apply - avoids spawning a thread
-    # for every single message in a busy group (previous behavior).
-    if not (is_pm or is_mentioned or is_reply_to_bot):
+    # Only respond in PM or when the bot is tagged — not on replies.
+    if not (is_pm or is_mentioned):
         return
 
     media = _extract_media(bot, msg)
@@ -638,7 +631,7 @@ def mention_chatbot(bot: Bot, update: Update):
 
     LOGGER.info(
         f"[ai] mention_chatbot triggered by {user_id} in chat {msg.chat_id} "
-        f"(PM: {is_pm}, Mention: {is_mentioned}, ReplyToBot: {is_reply_to_bot}, Media: {bool(media)})"
+        f"(PM: {is_pm}, Mention: {is_mentioned}, Media: {bool(media)})"
     )
 
     query = msg.text or msg.caption or ""
@@ -659,12 +652,6 @@ def mention_chatbot(bot: Bot, update: Update):
     context = _history_context(msg.chat_id)
     if context:
         prompt = f"Recent conversation in this chat:\n{context}\n\n{user_label}: {query}"
-    elif is_reply_to_bot and msg.reply_to_message:
-        previous_text = msg.reply_to_message.caption or msg.reply_to_message.text
-        if previous_text:
-            prompt = f"Previous message context:\n{previous_text.strip()}\n\n{user_label}: {query}"
-        else:
-            prompt = f"{user_label}: {query}"
     else:
         prompt = f"{user_label}: {query}"
 
@@ -770,15 +757,15 @@ dispatcher.add_handler(ASK_HANDLER)
 # NOTE: Filters.reply was intentionally removed from this filter - it matched
 # ANY reply to ANY message, not specifically replies to the bot, causing this
 # handler to fire (and spawn a thread) on every single reply in busy groups.
-# The real reply-to-bot check happens inside mention_chatbot() via is_reply_to_bot.
+# Gemini now only responds in PM or when tagged.
 MENTION_HANDLER = MessageHandler(
     Filters.text & ~Filters.command,
     mention_chatbot,
 )
 dispatcher.add_handler(MENTION_HANDLER, group=13)
 
-# Multimodal: photos/videos/gifs sent to the bot (or replying to it) are also
-# answered. The same is_pm/is_mentioned/is_reply_to_bot gate inside
+# Multimodal: photos/videos/gifs sent to the bot are also
+# answered. The same is_pm/is_mentioned gate inside
 # mention_chatbot() stops this from firing on random media in busy groups.
 MEDIA_HANDLER = MessageHandler(
     Filters.photo | Filters.video | Filters.animation,
