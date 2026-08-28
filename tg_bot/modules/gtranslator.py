@@ -1,49 +1,9 @@
-import time
-import requests
+from gpytranslate import SyncTranslator
 from telegram import ParseMode, Update, Bot
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
-MYMEMORY_API = "https://api.mymemory.translated.net/get"
-MAX_CHARS = 450  # MyMemory free tier limit is ~500 chars per request
-
-
-def _detect(text: str) -> str:
-    try:
-        r = requests.get(
-            MYMEMORY_API,
-            params={"q": text[:MAX_CHARS], "langpair": "autodetect|en"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("responseData", {}).get("translatedText"):
-            matches = data.get("matches", [])
-            if matches:
-                return matches[0].get("source", "en").split("-")[0]
-    except Exception:
-        pass
-    return "en"
-
-
-def _translate(text: str, source: str = "autodetect", target: str = "en") -> str:
-    truncated = text[:MAX_CHARS]
-    for attempt in range(3):
-        r = requests.get(
-            MYMEMORY_API,
-            params={"q": truncated, "langpair": f"{source}|{target}"},
-            timeout=15,
-        )
-        if r.status_code == 429:
-            time.sleep(2 ** attempt)
-            continue
-        r.raise_for_status()
-        data = r.json()
-        result = data.get("responseData", {}).get("translatedText", "")
-        if not result:
-            raise ValueError("Empty translation response")
-        return result
-    raise Exception("Rate limited by MyMemory, try again later")
+trans = SyncTranslator()
 
 
 def translate(bot: Bot, update: Update) -> None:
@@ -56,29 +16,24 @@ def translate(bot: Bot, update: Update) -> None:
         to_translate = reply_msg.caption
     elif reply_msg.text:
         to_translate = reply_msg.text
-    else:
-        message.reply_text("No text found to translate!")
-        return
     try:
         args = message.text.split()[1].lower()
         if "//" in args:
             source = args.split("//")[0]
             dest = args.split("//")[1]
         else:
-            source = _detect(to_translate)
+            source = trans.detect(to_translate)
             dest = args
     except IndexError:
-        source = _detect(to_translate)
+        source = trans.detect(to_translate)
         dest = "en"
-    try:
-        translation = _translate(to_translate, source=source, target=dest)
-    except Exception as e:
-        message.reply_text(f"Translation failed: {e}")
-        return
+    translation = trans(to_translate,
+                        sourcelang=source, targetlang=dest)
     reply = f"<b>Translated from {source} to {dest}</b>:\n" \
-        f"<code>{translation}</code>"
+        f"<code>{translation.text}</code>"
 
     message.reply_text(reply, parse_mode=ParseMode.HTML)
+
 
 
 def languages(bot: Bot, update: Update) -> None:
@@ -104,6 +59,7 @@ eg: `/tl ja`: translates to Japanese.
 eg: `/tl ja//en`: translates from Japanese to English.
 
 • `/langs`: get a list of supported languages for translation."""
+
 
 
 TRANSLATE_HANDLER = DisableAbleCommandHandler(["tl", "tr"], translate)
