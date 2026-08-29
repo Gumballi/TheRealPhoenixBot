@@ -13,6 +13,7 @@ from tg_bot.modules.helper_funcs.chat_status import bot_admin, user_admin, is_us
 from tg_bot.modules.helper_funcs.extraction import extract_user, extract_user_and_text
 from tg_bot.modules.helper_funcs.string_handling import extract_time
 from tg_bot.modules.log_channel import loggable
+from tg_bot.modules.sql import ownerlock_sql as olock
 
 
 @run_async
@@ -33,6 +34,10 @@ def mute(bot: Bot, update: Update, args: List[str]) -> str:
         message.reply_text("I'm not muting myself!")
         return ""
 
+    # Owner-lock: only the owner can mute a user the owner has unmuted/locked.
+    if not olock.can_act(bot, update, user_id, ["mute"]):
+        return ""
+
     member = chat.get_member(int(user_id))
 
     if member:
@@ -41,6 +46,8 @@ def mute(bot: Bot, update: Update, args: List[str]) -> str:
 
         elif member.can_send_messages is None or member.can_send_messages:
             bot.restrict_chat_member(chat.id, user_id, can_send_messages=False)
+            if olock.is_owner(update):
+                olock.owner_action(chat.id, user_id, "mute", "unmute")
             message.reply_text("Muted!")
             return "<b>{}:</b>" \
                    "\n#MUTE" \
@@ -71,6 +78,10 @@ def unmute(bot: Bot, update: Update, args: List[str]) -> str:
         message.reply_text("You'll need to either give me a username to unmute, or reply to someone to be unmuted.")
         return ""
 
+    # Owner-lock: only the owner can unmute a user the owner has muted/locked.
+    if not olock.can_act(bot, update, user_id, ["unmute"]):
+        return ""
+
     member = chat.get_member(int(user_id))
 
     if member:
@@ -89,6 +100,8 @@ def unmute(bot: Bot, update: Update, args: List[str]) -> str:
                                          can_send_media_messages=True,
                                          can_send_other_messages=True,
                                          can_add_web_page_previews=True)
+                if olock.is_owner(update):
+                    olock.owner_action(chat.id, user_id, "unmute", "mute")
                 message.reply_text("Unmuted!")
                 return "<b>{}:</b>" \
                        "\n#UNMUTE" \

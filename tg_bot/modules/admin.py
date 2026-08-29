@@ -15,6 +15,7 @@ from tg_bot.modules.disable import DisableAbleCommandHandler
 from tg_bot.modules.helper_funcs.chat_status import bot_admin, can_promote, user_admin, can_pin
 from tg_bot.modules.helper_funcs.extraction import extract_user, extract_user_and_text
 from tg_bot.modules.log_channel import loggable
+from tg_bot.modules.sql import ownerlock_sql as olock
 
 
 @run_async
@@ -48,6 +49,10 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
     user_id = extract_user(message, clean_args)
     if not user_id:
         message.reply_text("You don't seem to be referring to a user.")
+        return ""
+
+    # Owner-lock: only the owner can promote a user the owner has demoted/locked.
+    if not olock.can_act(bot, update, user_id, ["promote"]):
         return ""
 
     user_member = chat.get_member(user_id)
@@ -109,6 +114,8 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
             can_promote_members=False
         )
 
+    if olock.is_owner(update):
+        olock.owner_action(chat_id, user_id, "promote", "demote")
     message.reply_text(f"Successfully promoted ({promote_type.capitalize()})!")
     return "<b>{}:</b>" \
             "\n#PROMOTED ({})" \
@@ -178,6 +185,10 @@ def demote(bot: Bot, update: Update, args: List[str]) -> str:
         message.reply_text("You don't seem to be referring to a user.")
         return ""
 
+    # Owner-lock: only the owner can demote a user the owner has promoted/locked.
+    if not olock.can_act(bot, update, user_id, ["demote"]):
+        return ""
+
     user_member = chat.get_member(user_id)
     if user_member.status == 'creator':
         message.reply_text("This person CREATED the chat, how would I demote them?")
@@ -201,6 +212,8 @@ def demote(bot: Bot, update: Update, args: List[str]) -> str:
                               can_restrict_members=False,
                               can_pin_messages=False,
                               can_promote_members=False)
+        if olock.is_owner(update):
+            olock.owner_action(chat.id, user_id, "demote", "promote")
         message.reply_text("Successfully demoted!")
         return "<b>{}:</b>" \
                "\n#DEMOTED" \
