@@ -94,19 +94,18 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
             return ""
     else:
         # A genuine "basic" tier: standard day-to-day moderator rights only.
-        # This is intentionally NOT a mirror of the bot's own permissions -
-        # that's what "full" is for. Keeping this a fixed, modest preset also
-        # avoids RIGHT_FORBIDDEN, since these rights are almost always a
-        # subset of what a group-management bot holds.
+        # Each right is only granted if the bot itself holds it in this chat,
+        # otherwise Telegram returns RIGHT_FORBIDDEN (a bot cannot grant a
+        # moderator right it doesn't hold itself).
         bot.promoteChatMember(
             chat_id, user_id,
             can_change_info=False,
             can_post_messages=False,
             can_edit_messages=False,
-            can_delete_messages=True,
-            can_invite_users=True,
-            can_restrict_members=True,
-            can_pin_messages=True,
+            can_delete_messages=bool(getattr(bot_member, "can_delete_messages", False)),
+            can_invite_users=bool(getattr(bot_member, "can_invite_users", False)),
+            can_restrict_members=bool(getattr(bot_member, "can_restrict_members", False)),
+            can_pin_messages=bool(getattr(bot_member, "can_pin_messages", False)),
             can_promote_members=False
         )
 
