@@ -329,9 +329,10 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
 # yt-dlp: generic download
 # ---------------------------------------------------------------------------
 
-def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str], dict]:
-    """Try yt-dlp.  Returns (filepath, metadata) or (None, {})."""
+def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str], dict, str]:
+    """Try yt-dlp.  Returns (filepath, metadata, errmsg).  errmsg is "" on success."""
     meta = {}
+    errmsg = ""
     if platform == "reddit":
         url = _resolve_reddit_share_link(url)
     try:
@@ -358,7 +359,7 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
         if not info:
-            return None, meta
+            return None, meta, errmsg
 
         # Extract metadata
         for key in ("title", "uploader", "uploader_url", "description", "duration"):
@@ -376,17 +377,18 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
                     filepath = base + ext
                     break
         if not os.path.exists(filepath):
-            return None, meta
+            return None, meta, errmsg
 
         # Verify size on disk (Telegram limit is ~50MB for video)
         if os.path.getsize(filepath) > 50 * 1024 * 1024:
             os.remove(filepath)
-            return None, meta
+            return None, meta, "file is too large for Telegram"
 
-        return filepath, meta
+        return filepath, meta, errmsg
     except Exception as err:
         LOGGER.warning("yt-dlp failed for %s (%s): %s", url, platform, err)
-        return None, meta
+        errmsg = str(err)
+        return None, meta, errmsg
 
 
 # ---------------------------------------------------------------------------
@@ -858,7 +860,7 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
         meta = {}
 
         # 1) yt-dlp
-        filepath, meta = _download_ytdlp(url, tmpdir, platform)
+        filepath, meta, ytdlp_err = _download_ytdlp(url, tmpdir, platform)
 
         # 2) Custom scrapers when yt-dlp fails
         if not filepath:
@@ -892,11 +894,30 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
             elif platform == "x":
                 status.edit_text("Trying X scraper...")
                 filepath, meta = _x_scrape(url, tmpdir)
+            elif platform == "tiktok":
+                status.edit_text("Trying TikTok scraper...")
+                filepath, meta = _og_scrape(
+                    url,
+                    props=("og:video", "og:video:secure_url", "og:image"),
+                    prefix="tiktok",
+                    tmpdir=tmpdir,
+                    json_fallbacks=(
+                        r'"video_url"\s*:\s*"([^"]+)"',
+                        r'"playAddr"\s*:\s*"([^"]+)"',
+                        r'"downloadAddr"\s*:\s*"([^"]+)"',
+                    ),
+                )
 
         if not filepath:
-            # TikTok photo posts (slideshows) can't be downloaded as video
+            # Distinguish login-gated sensitive posts from genuine photo posts
             if platform == "tiktok":
-                status.edit_text("This looks like a TikTok photo post — can't download as video.")
+                low = ytdlp_err.lower()
+                if "log in" in low or "cookies" in low or "not comfortable" in low or "sensitive" in low:
+                    status.edit_text(
+                        "This TikTok is marked as sensitive/18+ and requires a logged-in "
+                        "account to view — I can't download it.")
+                else:
+                    status.edit_text("This looks like a TikTok photo post — can't download as video.")
             else:
                 status.edit_text("Could not download from {}.".format(platform.title()))
             return
