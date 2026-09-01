@@ -125,8 +125,8 @@ def _build_post(day_index):
     }
 
     from telegram.utils.helpers import escape_markdown
-    title = escape_markdown(result["title"], version=1)
-    extract = escape_markdown(result["extract"], version=1)
+    title = escape_markdown(result["title"])
+    extract = escape_markdown(result["extract"])
 
     text = (f"*{emoji_headers[result['type']]} — {title}*\n\n"
             f"{extract}\n\n"
