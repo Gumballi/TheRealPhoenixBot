@@ -141,18 +141,73 @@ def _day_counter():
 
 
 def send_daily_wiki(bot: Bot, job):
+    chat_id = job.context
+    if str(chat_id) not in sql.get_all_chats():
+        return
     day_index = _day_counter()
     post = _build_post(day_index)
     if not post:
-        LOGGER.warning("[wiki] no post could be built today, skipping")
+        LOGGER.warning("[wiki] no post could be built for %s, skipping", chat_id)
         return
+    try:
+        bot.send_message(chat_id, post, parse_mode=ParseMode.MARKDOWN,
+                         disable_web_page_preview=False)
+        LOGGER.info("[wiki] posted daily wiki to chat %s", chat_id)
+    except Exception as e:
+        LOGGER.warning("[wiki] failed to send to %s: %s", chat_id, e)
 
-    for chat_id in sql.get_all_chats():
-        try:
-            bot.send_message(chat_id, post, parse_mode=ParseMode.MARKDOWN,
-                             disable_web_page_preview=False)
-        except Exception as e:
-            LOGGER.warning("[wiki] failed to send to %s: %s", chat_id, e)
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+
+def _parse_offset(raw):
+    """Parse '+3', '-05:30', 'UTC+3', '+3:00' → minutes east of UTC. None if bad."""
+    import re
+    s = (raw or "").strip().upper().replace("UTC", "").replace("GMT", "").strip()
+    if not s:
+        return 0
+    sign = 1
+    if s[0] in "+-":
+        if s[0] == "-":
+            sign = -1
+        s = s[1:]
+    if not s or not re.match(r"^\d{1,2}(:\d{2})?$", s):
+        return None
+    parts = s.split(":")
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return None
+    if hours > 23 or minutes > 59:
+        return None
+    return sign * (hours * 60 + minutes)
+
+
+def _format_offset(offset_min):
+    sign = "+" if offset_min >= 0 else "-"
+    m = abs(offset_min)
+    return "UTC{}{:02d}:{:02d}".format(sign, m // 60, m % 60)
+
+
+def _local_to_utc(local_hhmm, offset_min):
+    """Convert a local time-of-day (UTC+offset_min) to a UTC datetime.time."""
+    import datetime
+    hour, minute = (int(x) for x in local_hhmm.split(":"))
+    local = datetime.datetime(2000, 1, 1, hour, minute)
+    utc = local - datetime.timedelta(minutes=offset_min)
+    return utc.time()
+
+
+def _next_utc_datetime(utc_time):
+    """Next datetime.datetime matching *utc_time* (today, or tomorrow if passed)."""
+    import datetime
+    now = datetime.datetime.now()
+    when = datetime.datetime.combine(now.date(), utc_time)
+    if when <= now:
+        when += datetime.timedelta(days=1)
+    return when
 
 
 # ---------------------------------------------------------------------------
@@ -174,25 +229,44 @@ def wiki(bot: Bot, update: Update):
 @run_async
 @user_admin
 def set_wiki(bot: Bot, update: Update):
-    """Set/update the daily wiki schedule for a chat. Usage: /setwiki HH:MM"""
+    """Set/update the daily wiki schedule for a chat. Usage: /setwiki HH:MM [UTC±HH:MM]"""
+    import re
+    import datetime
     chat = update.effective_chat
     message = update.effective_message
     args = message.text.split(None, 1)
 
     time_val = "12:00"
+    offset_raw = "+0"
     if len(args) > 1:
-        time_val = args[1].strip()
-        # basic validation HH:MM or H:MM
-        import re
+        fields = args[1].strip().split()
+        time_val = fields[0]
         if not re.match(r"^\d{1,2}:\d{2}$", time_val):
             message.reply_text("Invalid time. Use 24h format, e.g. `/setwiki 09:30`",
                                parse_mode=ParseMode.MARKDOWN)
             return
+        if len(fields) > 1:
+            offset_raw = fields[1]
 
-    sql.set_chat(chat.id, time_val)
+    offset_min = _parse_offset(offset_raw)
+    if offset_min is None:
+        message.reply_text(
+            "Invalid UTC offset. Use e.g. `/setwiki 09:30 UTC+3` or `/setwiki 09:30 +05:30`.",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+
+    sql.set_chat(chat.id, time_val, str(offset_min))
     _restart_daily_job()
-    message.reply_text(f"Daily wiki post enabled for this chat at `{time_val}`.",
-                       parse_mode=ParseMode.MARKDOWN)
+
+    utc_time = _local_to_utc(time_val, offset_min)
+    next_fire = _next_utc_datetime(utc_time)
+    message.reply_text(
+        "Daily wiki posts enabled for this chat.\n"
+        "• Local time: `{}` ({})\n"
+        "• Next post: `{}` UTC".format(
+            time_val, _format_offset(offset_min),
+            next_fire.strftime("%b %d %H:%M")),
+        parse_mode=ParseMode.MARKDOWN)
 
 
 @run_async
@@ -203,27 +277,32 @@ def stop_wiki(bot: Bot, update: Update):
     message = update.effective_message
     if sql.rem_chat(chat.id):
         _restart_daily_job()
-        message.reply_text("Daily wiki post disabled for this chat.")
+        message.reply_text("Daily wiki posts disabled for this chat.")
     else:
         message.reply_text("Daily wiki isn't enabled here.")
 
 
 def _restart_daily_job():
-    """Recreate the daily job with the earliest configured time."""
-    chat_times = [sql.get_time(cid) for cid in sql.get_all_chats() if sql.get_time(cid)]
-
+    """Rebuild one daily job per chat at that chat's UTC-converted time."""
+    import datetime
     job_queue = updater.job_queue
+
     for existing in list(job_queue.jobs()):
-        if existing.name == "daily_wiki":
+        if existing.name and existing.name.startswith("daily_wiki_"):
             existing.schedule_removal()
 
-    if not chat_times:
-        return
-
-    import datetime
-    earliest = min(chat_times)
-    hour, minute = (int(x) for x in earliest.split(":"))
-    job_queue.run_daily(send_daily_wiki, time=datetime.time(hour, minute), name="daily_wiki")
+    for chat_id in sql.get_all_chats():
+        time_val = sql.get_time(chat_id)
+        if not time_val:
+            continue
+        offset_min = sql.get_offset(chat_id)
+        utc_time = _local_to_utc(time_val, offset_min)
+        job_queue.run_daily(
+            send_daily_wiki,
+            time=utc_time,
+            context=int(chat_id),
+            name="daily_wiki_{}".format(chat_id))
+        LOGGER.info("[wiki] scheduled daily post for chat %s at %s UTC", chat_id, utc_time)
 
 
 WIKI_HANDLER = CommandHandler("wiki", wiki)
@@ -254,6 +333,8 @@ Every day the bot posts an educational or fun Wikipedia article to the group.
 • `/wiki`: manually post a wiki article in this chat.
 
 *Admin only:*
-• `/setwiki HH:MM`: enable daily wiki posts at this time (24h).
+• `/setwiki HH:MM [UTC±HH:MM]`: enable daily wiki posts (24h time). Optionally give your
+  UTC offset, e.g. `/setwiki 09:30 UTC+3` or `/setwiki 09:30 -05:30`. Without an offset the
+  time is treated as UTC (the server timezone).
 • `/stopwiki`: disable daily wiki posts.
 """
