@@ -215,7 +215,7 @@ def _next_utc_datetime(utc_time):
 # ---------------------------------------------------------------------------
 
 @run_async
-def wiki(bot: Bot, update: Update):
+def wiki_today(bot: Bot, update: Update):
     """Manually trigger a wiki post in the current chat."""
     message = update.effective_message
     day_index = _day_counter()
@@ -241,9 +241,16 @@ def set_wiki(bot: Bot, update: Update):
     if len(args) > 1:
         fields = args[1].strip().split()
         time_val = fields[0]
-        if not re.match(r"^\d{1,2}:\d{2}$", time_val):
+        time_match = re.match(r"^(\d{1,2}):(\d{2})$", time_val)
+        if not time_match:
             message.reply_text("Invalid time. Use 24h format, e.g. `/setwiki 09:30`",
                                parse_mode=ParseMode.MARKDOWN)
+            return
+        hour, minute = int(time_match.group(1)), int(time_match.group(2))
+        if hour > 23 or minute > 59:
+            message.reply_text(
+                "Invalid time. Hours must be 00-23 and minutes 00-59, e.g. `/setwiki 09:30`",
+                parse_mode=ParseMode.MARKDOWN)
             return
         if len(fields) > 1:
             offset_raw = fields[1]
@@ -305,7 +312,7 @@ def _restart_daily_job():
         LOGGER.info("[wiki] scheduled daily post for chat %s at %s UTC", chat_id, utc_time)
 
 
-WIKI_HANDLER = CommandHandler("wiki", wiki)
+WIKI_HANDLER = CommandHandler("wikitoday", wiki_today)
 SET_WIKI_HANDLER = CommandHandler("setwiki", set_wiki, filters=None)
 STOP_WIKI_HANDLER = CommandHandler("stopwiki", stop_wiki)
 
@@ -330,7 +337,7 @@ __help__ = """
 Every day the bot posts an educational or fun Wikipedia article to the group.
 
 *Commands:*
-• `/wiki`: manually post a wiki article in this chat.
+• `/wikitoday`: manually post a wiki article in this chat.
 
 *Admin only:*
 • `/setwiki HH:MM [UTC±HH:MM]`: enable daily wiki posts (24h time). Optionally give your
