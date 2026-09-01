@@ -1,8 +1,11 @@
+import logging
 import threading
 
 from sqlalchemy import Column, Integer, String, UnicodeText, inspect, text
 
 from tg_bot.modules.sql import SESSION, BASE
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WikiSettings(BASE):
@@ -21,15 +24,30 @@ WikiSettings.__table__.create(checkfirst=True)
 
 
 def __ensure_offset_column():
-    """Add the ``offset`` column for DBs created before it existed."""
+    """Add the ``offset`` column for DBs created before it existed.
+
+    ``offset`` is a reserved word in Postgres/SQLite, so it must be quoted in
+    raw SQL.  If the column already exists the ALTER will fail on a duplicate
+    column, which is fine -- we verify existence afterwards.
+    """
+    engine = SESSION.bind
     try:
-        insp = inspect(SESSION.bind)
+        with engine.begin() as conn:
+            conn.execute(text(
+                'ALTER TABLE daily_wiki_settings ADD COLUMN "offset" VARCHAR(10) DEFAULT \'0\''
+            ))
+        LOGGER.info("[wiki] added 'offset' column to daily_wiki_settings")
+    except Exception as err:
+        LOGGER.info("[wiki] offset column migrate skipped (%s)", err)
+
+    # Verify the column actually exists now (fresh DBs get it via create()).
+    try:
+        insp = inspect(engine)
         cols = [c["name"] for c in insp.get_columns("daily_wiki_settings")]
         if "offset" not in cols:
-            SESSION.execute(text("ALTER TABLE daily_wiki_settings ADD COLUMN offset VARCHAR(10) DEFAULT '0'"))
-            SESSION.commit()
-    except Exception:
-        SESSION.rollback()
+            LOGGER.error("[wiki] 'offset' column still missing after migration!")
+    except Exception as err:
+        LOGGER.info("[wiki] could not verify offset column (%s)", err)
 
 
 __ensure_offset_column()
@@ -105,6 +123,8 @@ def __load_wiki_chats():
             except (TypeError, ValueError):
                 offset = 0
             WIKI_CHATS[row.chat_id] = (row.time, offset)
+    except Exception as err:
+        LOGGER.error("[wiki] failed to load wiki chats: %s", err)
     finally:
         SESSION.close()
 
