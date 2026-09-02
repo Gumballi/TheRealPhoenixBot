@@ -216,6 +216,64 @@ def rem_chat(bot: Bot, update: Update):
         msg.reply_text("No chats had to be removed from the database!")
 
 
+def _backfill_chat_link(bot, chat):
+    """Fetch fresh chat data and store username / invite link. Returns a reason string."""
+    if chat.type == "private":
+        return "private"
+    chat_name = chat.title or "unnamed"
+    try:
+        if getattr(chat, "username", None):
+            sql.set_chat_link(chat.id, chat_name,
+                              username=chat.username,
+                              invite_link=chat.link)
+            return "public username"
+        if chat.type in (chat.SUPERGROUP, chat.CHANNEL):
+            member = chat.get_member(bot.id)
+            if not member.can_invite_users:
+                return "no invite permission"
+            link = chat.invite_link or bot.export_chat_invite_link(chat.id)
+            if not link:
+                return "no link obtainable"
+            sql.set_chat_link(chat.id, chat_name, username=None, invite_link=link)
+            return "invite link"
+        return "unsupported chat type"
+    except Exception as e:
+        return "error: %s" % e
+
+
+@run_async
+def update_chat_links(bot: Bot, update: Update):
+    """Sudo command: backfill username / invite link for every known chat."""
+    msg = update.effective_message
+    chats = sql.get_all_chats() or []
+    stored = 0
+    failed = 0
+    detail = []
+    for chat in chats:
+        sleep(0.05)
+        try:
+            fresh = bot.get_chat(int(chat.chat_id), timeout=30)
+        except Exception as e:
+            failed += 1
+            detail.append("{}: get_chat error {}".format(chat.chat_id, e))
+            continue
+        reason = _backfill_chat_link(bot, fresh)
+        if reason in ("public username", "invite link"):
+            stored += 1
+            detail.append("{}: {}".format(chat.chat_id, reason))
+        else:
+            failed += 1
+            detail.append("{}: {}".format(chat.chat_id, reason))
+        LOGGER.info("[users] backfill %s -> %s", chat.chat_id, reason)
+
+    summary = "Stored {} chat links. {} not updated.\n".format(stored, failed)
+    msg.reply_text(summary + "\n".join(detail[:30]))
+    if kicked_chats >= 1:
+        msg.reply_text("Done! {} chats were removed from the database!".format(kicked_chats))
+    else:
+        msg.reply_text("No chats had to be removed from the database!")
+
+
 def __user_info__(user_id):
     if user_id == dispatcher.bot.id:
         return """I've seen them in... Wow. Are they stalking me? They're in all the same places I am... oh. It's me."""
@@ -246,9 +304,11 @@ BROADCAST_HANDLER = CommandHandler("broadcast", broadcast, filters=Filters.user(
 USER_HANDLER = MessageHandler(Filters.all & Filters.group, log_user)
 CHATLIST_HANDLER = CommandHandler("chatlist", chats, filters=CustomFilters.sudo_filter)
 DELETE_CHATS_HANDLER = CommandHandler("cleanchats", rem_chat, filters=Filters.user(OWNER_ID))
+UPDATE_LINKS_HANDLER = CommandHandler("updatechatlinks", update_chat_links, filters=CustomFilters.sudo_filter)
 
 # Registering handlers to dispatcher
 dispatcher.add_handler(USER_HANDLER, USERS_GROUP)
 dispatcher.add_handler(BROADCAST_HANDLER)
 dispatcher.add_handler(CHATLIST_HANDLER)
 dispatcher.add_handler(DELETE_CHATS_HANDLER)
+dispatcher.add_handler(UPDATE_LINKS_HANDLER)
