@@ -220,8 +220,15 @@ def get_id(bot: Bot, update: Update, args: List[str]):
                                                 parse_mode=ParseMode.MARKDOWN)
 
         else:
-            update.effective_message.reply_text("This group's id is `{}`.".format(chat.id),
-                                                parse_mode=ParseMode.MARKDOWN)
+            if chat.username:
+                update.effective_message.reply_text(
+                    "This group's id is `{}`.\nUsername: `@{}`\nLink: {}".format(
+                        chat.id, chat.username, chat.link),
+                    parse_mode=ParseMode.MARKDOWN)
+            else:
+                update.effective_message.reply_text(
+                    "This group's id is `{}`.\nNo public username (private chat).".format(chat.id),
+                    parse_mode=ParseMode.MARKDOWN)
 
 
 @run_async
