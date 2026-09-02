@@ -151,6 +151,8 @@ def chats(bot: Bot, update: Update):
     for chat in all_chats:
         if getattr(chat, "username", None):
             chatfile += "{} - (@{}) - https://t.me/{}\n".format(chat.chat_name, chat.username, chat.username)
+        elif getattr(chat, "invite_link", None):
+            chatfile += "{} - {}\n".format(chat.chat_name, chat.invite_link)
         else:
             chatfile += "{} - ({})\n".format(chat.chat_name, chat.chat_id)
 

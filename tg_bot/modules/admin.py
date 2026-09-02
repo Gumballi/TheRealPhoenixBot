@@ -16,6 +16,7 @@ from tg_bot.modules.helper_funcs.chat_status import bot_admin, can_promote, user
 from tg_bot.modules.helper_funcs.extraction import extract_user, extract_user_and_text
 from tg_bot.modules.log_channel import loggable
 from tg_bot.modules.sql import ownerlock_sql as olock
+from tg_bot.modules.sql import users_sql as usql
 
 
 @run_async
@@ -288,7 +289,12 @@ def unpin(bot: Bot, update: Update) -> str:
 @user_admin
 def invite(bot: Bot, update: Update):
     chat = update.effective_chat  # type: Optional[Chat]
+    chat_name = chat.title or "unnamed"
+
     if chat.username:
+        usql.set_chat_link(chat.id, chat_name,
+                           username=chat.username,
+                           invite_link=chat.link)
         update.effective_message.reply_text("@" + chat.username)
     elif chat.type == chat.SUPERGROUP or chat.type == chat.CHANNEL:
         bot_member = chat.get_member(bot.id)
@@ -296,6 +302,10 @@ def invite(bot: Bot, update: Update):
             invitelink = chat.invite_link
             if not invitelink:
                 invitelink = bot.exportChatInviteLink(chat.id)
+            if invitelink:
+                usql.set_chat_link(chat.id, chat_name,
+                                   username=None,
+                                   invite_link=invitelink)
             update.effective_message.reply_text(invitelink)
         else:
             update.effective_message.reply_text("I don't have access to the invite link, try changing my permissions!")

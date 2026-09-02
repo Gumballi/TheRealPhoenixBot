@@ -27,11 +27,13 @@ class Chats(BASE):
     chat_id = Column(String(14), primary_key=True)
     chat_name = Column(UnicodeText, nullable=False)
     username = Column(UnicodeText, default=None)
+    invite_link = Column(UnicodeText, default=None)
 
-    def __init__(self, chat_id, chat_name, username=None):
+    def __init__(self, chat_id, chat_name, username=None, invite_link=None):
         self.chat_id = str(chat_id)
         self.chat_name = chat_name
         self.username = username
+        self.invite_link = invite_link
 
     def __repr__(self):
         return "<Chat {} ({})>".format(self.chat_name, self.chat_id)
@@ -68,7 +70,7 @@ ChatMembers.__table__.create(SESSION.bind, checkfirst=True)
 
 
 def __ensure_chat_username_column():
-    """Add the ``username`` column to the ``chats`` table for existing DBs."""
+    """Add the ``username`` and ``invite_link`` columns to ``chats`` for old DBs."""
     engine = SESSION.bind
     try:
         with engine.begin() as conn:
@@ -80,12 +82,22 @@ def __ensure_chat_username_column():
         LOGGER.info("[users] chats.username migrate skipped (%s)", err)
 
     try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                'ALTER TABLE chats ADD COLUMN invite_link VARCHAR'
+            ))
+        LOGGER.info("[users] added 'invite_link' column to chats table")
+    except Exception as err:
+        LOGGER.info("[users] chats.invite_link migrate skipped (%s)", err)
+
+    try:
         from sqlalchemy import inspect
         cols = [c["name"] for c in inspect(engine).get_columns("chats")]
-        if "username" not in cols:
-            LOGGER.error("[users] 'username' column still missing after migration!")
+        for col in ("username", "invite_link"):
+            if col not in cols:
+                LOGGER.error("[users] '%s' column still missing after migration!", col)
     except Exception as err:
-        LOGGER.info("[users] could not verify username column (%s)", err)
+        LOGGER.info("[users] could not verify columns (%s)", err)
 
 
 __ensure_chat_username_column()
@@ -131,6 +143,23 @@ def update_user(user_id, username, chat_id=None, chat_name=None, chat_username=N
             chat_member = ChatMembers(chat.chat_id, user.user_id)
             SESSION.add(chat_member)
 
+        SESSION.commit()
+
+
+def set_chat_link(chat_id, chat_name, username=None, invite_link=None):
+    """Store/refresh a chat's username and/or invite link. Creates the row if missing."""
+    with INSERTION_LOCK:
+        chat = SESSION.query(Chats).get(str(chat_id))
+        if not chat:
+            chat = Chats(str(chat_id), chat_name, username, invite_link)
+            SESSION.add(chat)
+        else:
+            if chat_name:
+                chat.chat_name = chat_name
+            if username:
+                chat.username = username
+            if invite_link:
+                chat.invite_link = invite_link
         SESSION.commit()
 
 
