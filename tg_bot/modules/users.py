@@ -127,8 +127,18 @@ def broadcast(bot: Bot, update: Update):
 
 
 def _maybe_capture_chat_link(bot, chat, force=False):
-    """Throttled auto-store of a chat's public username / private invite link."""
+    """Throttled auto-store of a chat's public username / private invite link.
+
+    Only runs when the bot has full admin rights in the chat (feature gate).
+    """
     if chat.type == "private":
+        return
+    try:
+        from tg_bot.modules.helper_funcs.chat_status import bot_admin_rights
+        is_admin, _missing = bot_admin_rights(chat, bot.id)
+        if not is_admin:
+            return
+    except Exception:
         return
     chat_id = str(chat.id)
     now = _time.time()
@@ -228,6 +238,10 @@ def _backfill_chat_link(bot, chat):
                               invite_link=chat.link)
             return "public username"
         if chat.type in (chat.SUPERGROUP, chat.CHANNEL):
+            from tg_bot.modules.helper_funcs.chat_status import bot_admin_rights
+            is_admin, _missing = bot_admin_rights(chat, bot.id)
+            if not is_admin:
+                return "no full admin"
             member = chat.get_member(bot.id)
             if not member.can_invite_users:
                 return "no invite permission"

@@ -10,6 +10,40 @@ def can_delete(chat: Chat, bot_id: int) -> bool:
     return chat.get_member(bot_id).can_delete_messages
 
 
+def bot_admin_rights(chat: Chat, bot_id: int):
+    """Return (is_admin, missing_rights) for the bot in *chat*.
+
+    is_admin is True only if the bot is a creator/administrator with full
+    permissions. missing_rights is a list of the human-readable names of any
+    rights that are absent.
+    """
+    required = (
+        ("can_change_info", "Change info"),
+        ("can_delete_messages", "Delete messages"),
+        ("can_invite_users", "Invite users"),
+        ("can_restrict_members", "Restrict members"),
+        ("can_pin_messages", "Pin messages"),
+        ("can_promote_members", "Add new admins"),
+    )
+    try:
+        member = chat.get_member(bot_id)
+    except Exception:
+        return False, ["unreachable"]
+
+    if member.status == "creator":
+        return True, []
+    if member.status != "administrator":
+        return False, ["not-admin"]
+
+    missing = [name for attr, name in required if not getattr(member, attr, False)]
+
+    # channels additionally need permission to post
+    if chat.type == Chat.CHANNEL and not getattr(member, "can_post_messages", False):
+        missing.append("Post messages")
+
+    return (not missing), missing
+
+
 def is_user_ban_protected(chat: Chat, user_id: int, member: ChatMember = None) -> bool:
     if chat.type == 'private' \
             or user_id in SUDO_USERS \

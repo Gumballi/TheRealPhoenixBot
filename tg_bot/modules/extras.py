@@ -21,6 +21,7 @@ from telegram.ext import run_async, MessageHandler, Filters
 
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
+from tg_bot.modules.helper_funcs.chat_status import bot_admin_rights
 from tg_bot.modules.sql import users_sql as usql
 
 LOGGER = logging.getLogger(__name__)
@@ -800,6 +801,14 @@ def cache_all_on_join(bot, update: Update):
     is_bot_added = any(member.id == bot.id for member in new_members)
 
     if is_bot_added:
+        # Require full admin before the bot does anything in a new chat.
+        is_admin, _missing = bot_admin_rights(chat, bot.id)
+        if not is_admin:
+            _send_admin_prompt(update.effective_message.chat_id)
+            LOGGER.info("Bot added to %s but lacks full admin (%s); staying idle",
+                        chat.id, _missing)
+            return
+
         LOGGER.info(f"Caching members for {chat.id}...")
         _capture_chat_link(bot, chat)
         users_to_cache = []
@@ -821,6 +830,54 @@ def cache_all_on_join(bot, update: Update):
         for member in new_members:
             if not member.is_bot:
                 db.add_user(chat.id, member.id, member.first_name, member.username)
+
+
+def _send_admin_prompt(chat_id):
+    """Message an admin that the bot needs full admin rights before it will work."""
+    rights_help = (
+        "• Change group info\n• Delete messages\n• Invite users\n• Restrict members\n"
+        "• Pin messages\n• Add new admins"
+    )
+    text = (
+        "⚠️ *I need Administrator rights to work properly*\n\n"
+        "Please promote me to admin with full permissions:\n\n"
+        "{}\n\n"
+        "Once done, an admin can check with `/checkperms`.".format(rights_help)
+    )
+    try:
+        bot_send(chat_id, text)
+    except Exception as e:
+        LOGGER.warning("Couldn't send admin prompt to %s: %s", chat_id, e)
+
+
+def bot_send(chat_id, text):
+    from telegram import ParseMode
+    bot = dispatcher.bot
+    return bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
+
+
+@run_async
+def check_perms(bot, update: Update):
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat.type == 'private':
+        msg.reply_text("This command only works in groups.")
+        return
+
+    is_admin, missing = bot_admin_rights(chat, bot.id)
+    if is_admin:
+        _capture_chat_link(bot, chat)
+        msg.reply_text("✅ I have full admin rights here. All features are active.")
+    else:
+        if missing == ["not-admin"]:
+            msg.reply_text("⚠️ I'm not an administrator here. Please promote me to admin "
+                           "with full permissions: \n\n"
+                           "• Change group info • Delete messages • Invite users\n"
+                           "• Restrict members • Pin messages • Add new admins")
+        else:
+            msg.reply_text("⚠️ I'm missing these admin rights:\n\n• {}".format(
+                "\n• ".join(missing)))
+
 
 @run_async
 def tag_all(bot, update: Update, args: List[str] = None):
@@ -973,6 +1030,8 @@ TAGALL_REGEX = MessageHandler(Filters.regex(r"(?i)^@all(.*)"), tag_all_regex)
 CANCEL = DisableAbleCommandHandler(["cancelall", "stopall"], cancel_tag)
 CACHE_STATUS = DisableAbleCommandHandler("cachestatus", cache_status)
 
+CHECKPERMS_HANDLER = DisableAbleCommandHandler("checkperms", check_perms)
+
 dispatcher.add_handler(SHRUG_HANDLER)
 dispatcher.add_handler(HUG_HANDLER)
 dispatcher.add_handler(REACT_HANDLER)
@@ -991,6 +1050,7 @@ dispatcher.add_handler(NSFW_HANDLER)
 dispatcher.add_handler(TRACKER, group=12)
 dispatcher.add_handler(JOIN_HANDLER)
 dispatcher.add_handler(TAG_ALL)
+dispatcher.add_handler(CHECKPERMS_HANDLER)
 dispatcher.add_handler(TAGALL_REGEX)
 dispatcher.add_handler(CANCEL)
 dispatcher.add_handler(CACHE_STATUS)
