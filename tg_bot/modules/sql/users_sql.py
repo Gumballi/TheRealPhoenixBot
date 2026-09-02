@@ -1,9 +1,12 @@
+import logging
 import threading
 
-from sqlalchemy import Column, Integer, UnicodeText, String, ForeignKey, UniqueConstraint, BigInteger, func
+from sqlalchemy import Column, Integer, UnicodeText, String, ForeignKey, UniqueConstraint, BigInteger, func, text
 
 from tg_bot import dispatcher
 from tg_bot.modules.sql import BASE, SESSION
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Users(BASE):
@@ -23,10 +26,12 @@ class Chats(BASE):
     __tablename__ = "chats"
     chat_id = Column(String(14), primary_key=True)
     chat_name = Column(UnicodeText, nullable=False)
+    username = Column(UnicodeText, default=None)
 
-    def __init__(self, chat_id, chat_name):
+    def __init__(self, chat_id, chat_name, username=None):
         self.chat_id = str(chat_id)
         self.chat_name = chat_name
+        self.username = username
 
     def __repr__(self):
         return "<Chat {} ({})>".format(self.chat_name, self.chat_id)
@@ -61,6 +66,30 @@ Users.__table__.create(SESSION.bind, checkfirst=True)
 Chats.__table__.create(SESSION.bind, checkfirst=True)
 ChatMembers.__table__.create(SESSION.bind, checkfirst=True)
 
+
+def __ensure_chat_username_column():
+    """Add the ``username`` column to the ``chats`` table for existing DBs."""
+    engine = SESSION.bind
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                'ALTER TABLE chats ADD COLUMN username VARCHAR'
+            ))
+        LOGGER.info("[users] added 'username' column to chats table")
+    except Exception as err:
+        LOGGER.info("[users] chats.username migrate skipped (%s)", err)
+
+    try:
+        from sqlalchemy import inspect
+        cols = [c["name"] for c in inspect(engine).get_columns("chats")]
+        if "username" not in cols:
+            LOGGER.error("[users] 'username' column still missing after migration!")
+    except Exception as err:
+        LOGGER.info("[users] could not verify username column (%s)", err)
+
+
+__ensure_chat_username_column()
+
 INSERTION_LOCK = threading.RLock()
 
 
@@ -71,7 +100,7 @@ def ensure_bot_in_db():
         SESSION.commit()
 
 
-def update_user(user_id, username, chat_id=None, chat_name=None):
+def update_user(user_id, username, chat_id=None, chat_name=None, chat_username=None):
     with INSERTION_LOCK:
         user = SESSION.query(Users).get(user_id)
         if not user:
@@ -87,12 +116,14 @@ def update_user(user_id, username, chat_id=None, chat_name=None):
 
         chat = SESSION.query(Chats).get(str(chat_id))
         if not chat:
-            chat = Chats(str(chat_id), chat_name)
+            chat = Chats(str(chat_id), chat_name, chat_username)
             SESSION.add(chat)
             SESSION.flush()
 
         else:
             chat.chat_name = chat_name
+            if chat_username:
+                chat.username = chat_username
 
         member = SESSION.query(ChatMembers).filter(ChatMembers.chat == chat.chat_id,
                                                    ChatMembers.user == user.user_id).first()

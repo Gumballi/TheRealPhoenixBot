@@ -129,13 +129,15 @@ def log_user(bot: Bot, update: Update):
     sql.update_user(msg.from_user.id,
                     msg.from_user.username,
                     chat.id,
-                    chat.title)
+                    chat.title,
+                    chat.username)
 
     if msg.reply_to_message:
         sql.update_user(msg.reply_to_message.from_user.id,
                         msg.reply_to_message.from_user.username,
                         chat.id,
-                        chat.title)
+                        chat.title,
+                        chat.username)
 
     if msg.forward_from:
         sql.update_user(msg.forward_from.id,
@@ -147,7 +149,10 @@ def chats(bot: Bot, update: Update):
     all_chats = sql.get_all_chats() or []
     chatfile = 'List of chats.\n'
     for chat in all_chats:
-        chatfile += "{} - ({})\n".format(chat.chat_name, chat.chat_id)
+        if getattr(chat, "username", None):
+            chatfile += "{} - (@{}) - https://t.me/{}\n".format(chat.chat_name, chat.username, chat.username)
+        else:
+            chatfile += "{} - ({})\n".format(chat.chat_name, chat.chat_id)
 
     with BytesIO(str.encode(chatfile)) as output:
         output.name = "chatlist.txt"
