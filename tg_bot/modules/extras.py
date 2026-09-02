@@ -21,6 +21,7 @@ from telegram.ext import run_async, MessageHandler, Filters
 
 from tg_bot import dispatcher
 from tg_bot.modules.disable import DisableAbleCommandHandler
+from tg_bot.modules.sql import users_sql as usql
 
 LOGGER = logging.getLogger(__name__)
 
@@ -770,6 +771,25 @@ def track_user(bot, update: Update):
 
     db.add_user(chat.id, user.id, user.first_name, user.username)
 
+def _capture_chat_link(bot, chat):
+    """Auto-store a chat's public username or private invite link into the chats table."""
+    try:
+        chat_name = chat.title or "unnamed"
+        if getattr(chat, "username", None):
+            usql.set_chat_link(chat.id, chat_name,
+                               username=chat.username,
+                               invite_link=chat.link)
+            return
+        if chat.type in (chat.SUPERGROUP, chat.CHANNEL):
+            member = chat.get_member(bot.id)
+            if member.can_invite_users:
+                link = chat.invite_link or bot.export_chat_invite_link(chat.id)
+                if link:
+                    usql.set_chat_link(chat.id, chat_name, username=None, invite_link=link)
+    except Exception as e:
+        LOGGER.warning("Failed to auto-capture link for %s: %s", chat.id, e)
+
+
 @run_async
 def cache_all_on_join(bot, update: Update):
     chat = update.effective_chat
@@ -781,6 +801,7 @@ def cache_all_on_join(bot, update: Update):
 
     if is_bot_added:
         LOGGER.info(f"Caching members for {chat.id}...")
+        _capture_chat_link(bot, chat)
         users_to_cache = []
         try:
             # The Bot API can only enumerate admins — cache them as a head start.

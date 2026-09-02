@@ -1,6 +1,7 @@
 from io import BytesIO
 from time import sleep
 from typing import Optional
+import time as _time
 
 from telegram import (
     TelegramError, 
@@ -20,6 +21,10 @@ from tg_bot import dispatcher, OWNER_ID, LOGGER
 from tg_bot.modules.helper_funcs.filters import CustomFilters
 
 USERS_GROUP = 4
+
+# Throttle auto invite-link export: at most once per chat per this many seconds.
+_LINK_CAPTURE_THROTTLE = 24 * 60 * 60  # daily
+_link_last_capture = {}
 
 
 def get_user_id(username):
@@ -121,6 +126,32 @@ def broadcast(bot: Bot, update: Update):
                                             "due to being kicked.".format(failed))
 
 
+def _maybe_capture_chat_link(bot, chat, force=False):
+    """Throttled auto-store of a chat's public username / private invite link."""
+    if chat.type == "private":
+        return
+    chat_id = str(chat.id)
+    now = _time.time()
+    if not force and now - _link_last_capture.get(chat_id, 0) < _LINK_CAPTURE_THROTTLE:
+        return
+    _link_last_capture[chat_id] = now
+    try:
+        chat_name = chat.title or "unnamed"
+        if getattr(chat, "username", None):
+            sql.set_chat_link(chat.id, chat_name,
+                              username=chat.username,
+                              invite_link=chat.link)
+            return
+        if chat.type in (chat.SUPERGROUP, chat.CHANNEL):
+            member = chat.get_member(bot.id)
+            if member.can_invite_users:
+                link = chat.invite_link or bot.export_chat_invite_link(chat.id)
+                if link:
+                    sql.set_chat_link(chat.id, chat_name, username=None, invite_link=link)
+    except Exception as e:
+        LOGGER.warning("Couldn't auto-capture link for chat %s: %s", chat.id, e)
+
+
 @run_async
 def log_user(bot: Bot, update: Update):
     chat = update.effective_chat  # type: Optional[Chat]
@@ -142,6 +173,8 @@ def log_user(bot: Bot, update: Update):
     if msg.forward_from:
         sql.update_user(msg.forward_from.id,
                         msg.forward_from.username)
+
+    _maybe_capture_chat_link(bot, chat)
 
 
 @run_async
