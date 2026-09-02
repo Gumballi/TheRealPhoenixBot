@@ -153,10 +153,15 @@ def can_restrict(func):
 def bot_admin(func):
     @wraps(func)
     def is_admin(bot: Bot, update: Update, *args, **kwargs):
-        if is_bot_admin(update.effective_chat, bot.id):
+        chat = update.effective_chat
+        if is_bot_admin(chat, bot.id):
             return func(bot, update, *args, **kwargs)
         else:
-            update.effective_message.reply_text("I'm not admin!")
+            update.effective_message.reply_text(
+                "⚠️ I'm not an administrator here. Please promote me to admin with full "
+                "permissions: \n\n"
+                "• Change group info • Delete messages • Invite users\n"
+                "• Restrict members • Pin messages • Add new admins")
 
     return is_admin
 
