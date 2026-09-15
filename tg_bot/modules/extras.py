@@ -26,9 +26,10 @@ from tg_bot.modules.sql import users_sql as usql
 
 LOGGER = logging.getLogger(__name__)
 
-# Fetch API key securely from environment variables
-NIGHT_API_KEY = os.environ.get("NIGHT_API_KEY")
-NIGHT_API_URL = "https://api.night-api.com/images/nsfw"
+# Rule 34 API credentials (optional; needed only for full access)
+R34_API_KEY = os.environ.get("R34_API_KEY")
+R34_USER_ID = os.environ.get("R34_USER_ID")
+R34_API_URL = "https://api.rule34.xxx/index.php"
 
 SHRUGS = (
     "┐(´д｀)┌",
@@ -506,70 +507,88 @@ def weebify(bot: Bot, update: Update, args):
 
 
 @run_async
-def night_api_nsfw(bot: Bot, update: Update, args):
+def rule34_nsfw(bot: Bot, update: Update, args):
     msg = update.effective_message
-    
-    if not NIGHT_API_KEY:
-        msg.reply_text("❌ The bot owner has not configured the `NIGHT_API_KEY`.", parse_mode=ParseMode.MARKDOWN)
-        return
 
     # Default to 'hentai' if the user doesn't provide a specific argument
     category = args[0].lower() if args else "hentai"
-    
-    # Common categories for Night API
-    valid_categories = ["hentai", "boobs", "pussy", "ass", "feet"]
-    
-    if category not in valid_categories:
-        msg.reply_text(f"⚠️ Invalid category! Available options:\n`{', '.join(valid_categories)}`", parse_mode=ParseMode.MARKDOWN)
+
+    # Rule 34 categories get mapped to search tags
+    r34_tags = {
+        "hentai": ["animated", "hentai", "blowjob", "threesome"],
+        "boobs": ["breasts", "breast_grab", "big_breasts"],
+        "pussy": ["pussy", "pussy_spread"],
+        "ass": ["ass", "ass_grab", "big_ass"],
+        "feet": ["feet", "foot_focus"],
+    }
+
+    if category not in r34_tags:
+        valid = ", ".join(sorted(r34_tags.keys()))
+        msg.reply_text(f"⚠️ Invalid category! Available options:\n`{valid}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     # Send a typing action since external API calls can take a second to resolve
     bot.send_chat_action(chat_id=msg.chat_id, action="upload_photo")
 
-    headers = {
-        "Authorization": NIGHT_API_KEY
-    }
-    
+    tag = random.choice(r34_tags[category])
+
     try:
-        response = requests.get(f"{NIGHT_API_URL}/{category}", headers=headers, timeout=10)
-        
-        # Check HTTP network status
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Check internal API status (Night-API sometimes returns HTTP 200 for internal 400 errors)
-            api_status = data.get("status")
-            if api_status == 400:
-                error_msg = data.get("content", "Invalid request")
-                msg.reply_text(f"❌ API Error: {error_msg}")
-                return
-            
-            # Safely extract the image URL based on the data type
-            image_url = None
-            content = data.get("content")
-            
-            if isinstance(content, dict):
-                image_url = content.get("url")
-            elif isinstance(content, str) and content.startswith("http"):
-                image_url = content
+        # Pick a random page so we get a random result (Rule 34 has deep results)
+        random_page = random.randint(0, 100)
+
+        params = {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "tags": f"{tag} rating:explicit",
+            "limit": 100,
+            "pid": random_page,
+        }
+
+        # Optional API credentials if the owner configures them (full access)
+        if R34_API_KEY and R34_USER_ID:
+            params["api_key"] = R34_API_KEY
+            params["user_id"] = R34_USER_ID
+
+        headers = {"User-Agent": "PhoenixBot/1.0"}
+        response = requests.get(R34_API_URL, params=params, headers=headers, timeout=15)
+
+        if response.status_code != 200:
+            msg.reply_text(f"❌ Rule 34 API returned HTTP {response.status_code}.")
+            return
+
+        # Rule 34 returns XML: <posts><post .../></posts>, image URL is file_url attr
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(response.content)
+
+        # Auth is required — flag it clearly if the owner hasn't configured keys yet
+        if root.tag == "error":
+            if root.text:
+                msg.reply_text(
+                    f"❌ Rule 34 API: {root.text.strip()}\n\n"
+                    "The bot owner needs to set the `R34_USER_ID` and `R34_API_KEY` "
+                    "environment variables (from rule34.xxx account settings).",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
             else:
-                image_url = data.get("url") or data.get("message")
-            
-            if image_url:
-                msg.reply_photo(photo=image_url)
-            else:
-                msg.reply_text("❌ API request succeeded, but couldn't parse the image URL from the JSON.")
-                
-        elif response.status_code == 401:
-            msg.reply_text("❌ Unauthorized! The provided Night API key is invalid.")
-        elif response.status_code == 404:
-            msg.reply_text("❌ Endpoint not found. Night API may have renamed this category.")
-        else:
-            msg.reply_text(f"❌ HTTP Error: {response.status_code}")
-            
-    except requests.exceptions.RequestException as e:
-        LOGGER.error(f"[Night-API] Request failed: {e}")
-        msg.reply_text("❌ An error occurred while communicating with the Night API servers.")
+                msg.reply_text("❌ Rule 34 API returned an unknown error.")
+            return
+
+        posts = []
+        for post in root.findall("post"):
+            if post.get("file_url"):
+                posts.append(post.get("file_url"))
+
+        if not posts:
+            msg.reply_text("❌ No results found for that category, try another one.")
+            return
+
+        choose = random.choice(posts)
+        msg.reply_photo(photo=choose)
+
+    except Exception as e:
+        LOGGER.error(f"[Rule34] Request failed: {e}")
+        msg.reply_text("❌ An error occurred while communicating with the Rule 34 servers.")
 
 # ==========================================
 # ADVANCED TAG ALL DATABASE (Thread-Safe)
@@ -994,7 +1013,7 @@ __help__ = """
  - /wiki <term>: do a search on Wikipedia.
  - /judge: as a reply to someone, checks if they're lying or not!
  - /weebify: as a reply to a message, "weebifies" the message.
- - /nsfw <category>: Fetch a random NSFW image (defaults to hentai). Categories: hentai, boobs, pussy, ass, feet.
+ - /nsfw <category>: Fetch a random NSFW image from Rule 34 (defaults to hentai). Categories: hentai, boobs, pussy, ass, feet.
  
  *📢 Tag All Commands (Admins Only):*
  - `@all <message>` or `/all <message>`: Tag all cached users.
@@ -1020,7 +1039,7 @@ KISS_HANDLER = DisableAbleCommandHandler("kiss", kiss)
 WIKI_HANDLER = DisableAbleCommandHandler("wiki", wiki)
 JUDGE_HANDLER = DisableAbleCommandHandler("judge", judge)
 WEEBIFY_HANDLER = DisableAbleCommandHandler("weebify", weebify, pass_args=True)
-NSFW_HANDLER = DisableAbleCommandHandler("nsfw", night_api_nsfw, pass_args=True)
+NSFW_HANDLER = DisableAbleCommandHandler("nsfw", rule34_nsfw, pass_args=True)
 
 # Tag All Handlers
 TRACKER = MessageHandler(Filters.all & Filters.group, track_user)
