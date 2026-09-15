@@ -520,6 +520,19 @@ def rule34_nsfw(bot: Bot, update: Update, args):
         "pussy": ["pussy", "pussy_spread"],
         "ass": ["ass", "ass_grab", "big_ass"],
         "feet": ["feet", "foot_focus"],
+        "yaoi": ["yaoi", "male_male", "gay"],
+        "yuri": ["yuri", "female_female", "lesbian"],
+        "biceps": ["biceps", "muscular_female", "flexing", "muscle_growth"],
+        "femboy": ["femboy", "crossdressing", "trap"],
+        "futanari": ["futanari", "dickgirl"],
+        "tentacle": ["tentacle", "tentacle_sex", "slime"],
+        "maid": ["maid", "maid_outfit", "cleavage"],
+        "latex": ["latex", "latex_clothing", "bodysuit"],
+        "gothic": ["gothic", "goth_girl", "eyeliner"],
+        "milf": ["milf", "mature_female", "mommy"],
+        "anal": ["anal", "anal_penetration", "doggystyle"],
+        "stockings": ["stockings", "thighhighs", "pantyhose"],
+        "bondage": ["bondage", "shibari", "rope"],
     }
 
     if category not in r34_tags:
@@ -1013,7 +1026,7 @@ __help__ = """
  - /wiki <term>: do a search on Wikipedia.
  - /judge: as a reply to someone, checks if they're lying or not!
  - /weebify: as a reply to a message, "weebifies" the message.
- - /nsfw <category>: Fetch a random NSFW image from Rule 34 (defaults to hentai). Categories: hentai, boobs, pussy, ass, feet.
+ - /nsfw <category>: Fetch a random NSFW image from Rule 34 (defaults to hentai). Categories: hentai, boobs, pussy, ass, feet, yaoi, yuri, biceps, femboy, futanari, tentacle, maid, latex, gothic, milf, anal, stockings, bondage.
  
  *📢 Tag All Commands (Admins Only):*
  - `@all <message>` or `/all <message>`: Tag all cached users.
