@@ -120,6 +120,15 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+# llama-3.3-70b-versatile is tier-gated on some accounts (404). Walk this list
+# of broadly available models if the configured one fails, same as /ai does.
+GROQ_FALLBACK_MODELS = [
+    "llama-3.1-8b-instant",
+    "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
+    "moonshotai/kimi-k2-instruct",
+]
+
 if GROQ_API_KEY:
     LOGGER.info("[ai] Groq provider enabled (model: %s).", GROQ_MODEL)
 else:
@@ -329,30 +338,32 @@ def _call_mistral(prompt: str, media=None) -> str:
 def _call_groq_chat(prompt: str, media=None) -> str:
     if media:
         raise RuntimeError("Groq provider does not support images/videos - use Gemini.")
-    response = requests.post(
-        GROQ_API_URL,
-        headers={
-            "Authorization": "Bearer {}".format(GROQ_API_KEY),
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-        },
-        timeout=40,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(
-            "API error occurred: Status {}. Body: {}".format(
-                response.status_code, response.text)
+    models = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
+    last_error = ""
+    for model in models:
+        response = requests.post(
+            GROQ_API_URL,
+            headers={
+                "Authorization": "Bearer {}".format(GROQ_API_KEY),
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            timeout=40,
         )
-    choices = response.json().get("choices") or []
-    if not choices:
-        raise RuntimeError("Empty Groq response")
-    return choices[0]["message"]["content"].strip()
+        if response.status_code == 200:
+            choices = response.json().get("choices") or []
+            if not choices:
+                raise RuntimeError("Empty Groq response")
+            return choices[0]["message"]["content"].strip()
+        last_error = "Groq {} for model {}: {}".format(
+            response.status_code, model, response.text[:200])
+    raise RuntimeError(last_error)
 
 PROVIDERS = {
     "gemini": (lambda: gemini_client is not None, _call_gemini, True),

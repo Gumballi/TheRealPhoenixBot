@@ -27,6 +27,16 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 AI_MODEL = os.environ.get("AI_CONTROL_MODEL", "llama-3.3-70b-versatile")
 
+# Some models (llama-3.3-70b-versatile) are gated by account tier and return
+# 404 for free keys. If the configured model fails, walk this list of broadly
+# available models until one answers.
+GROQ_FALLBACK_MODELS = [
+    "llama-3.1-8b-instant",
+    "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
+    "moonshotai/kimi-k2-instruct",
+]
+
 _PENDING_TTL = 300          # confirmation token lifetime (seconds)
 _CONFIRM_COOLDOWN = 3       # seconds between owner commands
 
@@ -208,19 +218,28 @@ def _parse_duration(text):
         return None
 
 
-def _call_groq(messages, tool_choice="auto"):
-    response = requests.post(
+def _openai_send(model, messages, tool_choice):
+    return requests.post(
         GROQ_URL,
         headers={"Authorization": "Bearer {}".format(GROQ_API_KEY), "Content-Type": "application/json"},
-        json={"model": AI_MODEL, "messages": messages, "tools": AI_TOOLS, "tool_choice": tool_choice},
+        json={"model": model, "messages": messages, "tools": AI_TOOLS, "tool_choice": tool_choice},
         timeout=40,
     )
-    if response.status_code != 200:
-        raise RuntimeError("Groq HTTP {}".format(response.status_code))
-    choices = response.json().get("choices") or []
-    if not choices:
-        raise RuntimeError("Empty Groq response")
-    return choices[0].get("message", {})
+
+
+def _call_groq(messages, tool_choice="auto"):
+    models = [AI_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != AI_MODEL]
+    last_error = ""
+    for model in models:
+        response = _openai_send(model, messages, tool_choice)
+        if response.status_code == 200:
+            choices = response.json().get("choices") or []
+            if not choices:
+                raise RuntimeError("Empty Groq response")
+            return choices[0].get("message", {})
+        last_error = "Groq {} for model {}: {}".format(
+            response.status_code, model, response.text[:200])
+    raise RuntimeError(last_error)
 
 
 def _get_admin_actions_text(chat, bot_id):
