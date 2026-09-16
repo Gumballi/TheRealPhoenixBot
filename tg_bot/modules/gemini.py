@@ -78,7 +78,10 @@ except ImportError:
 if not MISTRAL_API_KEY:
     MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 
-MISTRAL_MODEL = "mistral-large-latest"
+# Default to a model available on Mistral's free tier. mistral-large-latest
+# requires a paid subscription (403 tier_not_allowed on free keys), which is
+# what caused every Mistral fallback to fail before. Override via env.
+MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
 mistral_client = None
 mistral_supports_chat_complete = False
 
