@@ -45,8 +45,8 @@ _pending = {}               # (chat_id, user_id) -> {"token", "tool_call", "expi
 _last_command = {}          # (chat_id, user_id) -> timestamp
 
 _OWNER_ONLY_MSG = (
-    "⚠️ Only the group owner can use this.\n"
-    "Please promote me to admin and tell the owner to run /ai."
+    "⚠️ Only admins can use this.\n"
+    "Please promote me to admin and have an admin run /ai."
 )
 
 # Actions that need a second "yes" from the owner before executing.
@@ -167,17 +167,18 @@ AI_TOOLS = [
 ]
 
 _SYSTEM_PROMPT = (
-    "You are PhoenixBot's admin assistant. You act only for the group creator "
-    "and only by calling the provided tools. Never call a tool unless the owner "
-    "explicitly asked for that admin action. A 'target' must be exactly the "
-    "@username or numeric user id given; if it is unclear, ask instead of guessing. "
-    "If no tool applies, answer in short, friendly text. Never invent actions."
+    "You are PhoenixBot's admin assistant. You act only for the group creator or "
+    "an administrator, and only by calling the provided tools. Never call a tool "
+    "unless an admin explicitly asked for that admin action. A 'target' must be "
+    "exactly the @username or numeric user id given; if it is unclear, ask instead "
+    "of guessing. If no tool applies, answer in short, friendly text. Never invent "
+    "actions."
 )
 
 
-def _is_creator(chat, user_id):
+def _is_admin(chat, user_id):
     try:
-        return chat.get_member(user_id).status == "creator"
+        return chat.get_member(user_id).status in ("creator", "administrator")
     except Exception:
         return False
 
@@ -408,7 +409,7 @@ def ai_admin(bot: Bot, update: Update, args: List[str]):
         msg.reply_text("This works only inside a group.")
         return
 
-    if not _is_creator(chat, user.id):
+    if not _is_admin(chat, user.id):
         msg.reply_text(_OWNER_ONLY_MSG)
         return
 
@@ -503,7 +504,7 @@ def _confirm(bot, chat, user, token, execute):
         _pending.pop(key, None)
         return
 
-    if not _is_creator(chat, user.id):
+    if not _is_admin(chat, user.id):
         return
 
     _pending.pop(key, None)
