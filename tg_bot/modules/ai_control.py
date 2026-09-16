@@ -182,7 +182,7 @@ def _is_creator(chat, user_id):
         return False
 
 
-def _resolve_member(chat, target):
+def _resolve_member(chat, target, mention_map=None):
     target = (target or "").strip()
     if not target:
         return None
@@ -190,8 +190,14 @@ def _resolve_member(chat, target):
         return None  # resolved by caller with the owner id
     if target.startswith("@"):
         target = target[1:]
+    if not target:
+        return None
     if target.isdigit():
         return int(target)
+    if mention_map:
+        user_id = mention_map.get(target.lower())
+        if user_id is not None:
+            return user_id
     try:
         for admin in chat.get_administrators():
             user = admin.user
@@ -274,7 +280,9 @@ def _execute_tool(bot, chat, user, tool_call):
         return True, _get_admin_actions_text(chat, bot.id)
 
     target = args.get("target", "").strip()
-    if target.lower() == "me":
+    if args.get("target_id") is not None:
+        target = int(args["target_id"])
+    elif target.lower() == "me":
         target = user.id
     else:
         target_id = _resolve_member(chat, target)
@@ -446,6 +454,26 @@ def ai_admin(bot: Bot, update: Update, args: List[str]):
         return
 
     tool_call = tool_calls[0].get("function", {})
+
+    # Pre-resolve @mentions from the message. Telegram attaches the full User
+    # (id + username) to mention entities, so we can resolve non-admin members
+    # whose username isn't in the admin list.
+    mention_map = {}
+    for entity in (msg.entities or []):
+        if entity.type == "mention" and entity.user and entity.user.username:
+            mention_map[entity.user.username.lower()] = entity.user.id
+    if mention_map:
+        try:
+            tool_args = json.loads(tool_call.get("arguments") or "{}")
+        except Exception:
+            tool_args = {}
+        target = tool_args.get("target", "").strip()
+        if target and target.lower() != "me":
+            resolved = _resolve_member(chat, target, mention_map)
+            if resolved:
+                tool_args["target_id"] = resolved
+                tool_call = dict(tool_call)
+                tool_call["arguments"] = json.dumps(tool_args)
 
     if tool_call.get("name") not in _DESTRUCTIVE:
         ok, result = _execute_tool(bot, chat, user, tool_call)
