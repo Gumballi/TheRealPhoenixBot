@@ -17,6 +17,7 @@ import requests
 from telegram import Bot, Update, ParseMode
 from telegram.ext import Filters
 from telegram.ext.dispatcher import run_async
+from telegram.utils.helpers import escape_markdown
 from typing import List
 
 from tg_bot import dispatcher, TOKEN
@@ -485,7 +486,11 @@ def _confirm(bot, chat, user, token, execute):
 
     ok, result = _execute_tool(bot, chat, user, tool_call)
     summary = _summarize(bot, chat, user, tool_call.get("name"), ok, result)
-    bot.send_message(chat.id, summary, parse_mode=ParseMode.MARKDOWN)
+    bot.send_message(
+        chat.id,
+        escape_markdown(summary, version=1),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 AI_HANDLER = DisableAbleCommandHandler("ai", ai_admin, pass_args=True, filters=Filters.group)
