@@ -18,38 +18,6 @@ from tg_bot.modules.log_channel import loggable
 from tg_bot.modules.sql import ownerlock_sql as olock
 from tg_bot.modules.sql import users_sql as usql
 
-ADMIN_PERMISSION_FIELDS = (
-    "can_manage_chat", "can_post_messages", "can_edit_messages",
-    "can_change_info", "can_delete_messages", "can_restrict_members",
-    "can_invite_users", "can_pin_messages", "can_promote_members",
-    "can_manage_video_chats", "can_manage_topics", "can_post_stories",
-    "can_edit_stories", "can_delete_stories", "can_manage_tags",
-    "can_send_welcome_messages",
-)
-
-
-def _get_bot_permissions(bot_member, chat_id):
-    permissions = {
-        field: bool(getattr(bot_member, field, False))
-        for field in ADMIN_PERMISSION_FIELDS
-    }
-    try:
-        response = requests.get(
-            "https://api.telegram.org/bot{}/getChatMember".format(TOKEN),
-            params={"chat_id": chat_id, "user_id": bot_member.user.id},
-            timeout=10,
-        )
-        data = response.json()
-        raw_member = data.get("result", {}) if isinstance(data, dict) else {}
-        raw_permissions = raw_member.get("permissions", {})
-        if isinstance(raw_permissions, dict):
-            for field in ADMIN_PERMISSION_FIELDS:
-                if field in raw_permissions:
-                    permissions[field] = bool(raw_permissions[field])
-    except Exception:
-        pass
-    return permissions
-
 
 @run_async
 @bot_admin
@@ -58,13 +26,17 @@ def _get_bot_permissions(bot_member, chat_id):
 @loggable
 def promote(bot: Bot, update: Update, args: List[str]) -> str:
     chat_id = update.effective_chat.id
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
+    message = update.effective_message  # type: Optional[Message]
+    chat = update.effective_chat  # type: Optional[Chat]
+    user = update.effective_user  # type: Optional[User]
+    
     promoter = chat.get_member(user.id)
-    if not (promoter.can_promote_members or promoter.status == "creator") and user.id not in SUDO_USERS:
+    
+    if not (promoter.can_promote_members or promoter.status == "creator") and not user.id in SUDO_USERS:
         message.reply_text("You don't have the necessary rights to do that!")
         return ""
+
+    # Determine promotion type (basic vs full)
     promote_type = "basic"
     clean_args = []
     for arg in args:
@@ -74,44 +46,85 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
             promote_type = "basic"
         else:
             clean_args.append(arg)
+
     user_id = extract_user(message, clean_args)
     if not user_id:
         message.reply_text("You don't seem to be referring to a user.")
         return ""
+
+    # Owner-lock: only the owner can promote a user the owner has demoted/locked.
     if not olock.can_act(bot, update, user_id, ["promote"]):
         return ""
+
     user_member = chat.get_member(user_id)
-    if user_member.status in ('administrator', 'creator'):
+    if user_member.status == 'administrator' or user_member.status == 'creator':
         message.reply_text("How am I meant to promote someone that's already an admin?")
         return ""
+
     if user_id == bot.id:
         message.reply_text("I can't promote myself! Get an admin to do it for me.")
         return ""
+
     bot_member = chat.get_member(bot.id)
+
     if promote_type == "full":
-        url = "https://api.telegram.org/bot{}/promoteChatMember".format(TOKEN)
-        payload = {"chat_id": chat_id, "user_id": user_id, "is_anonymous": False}
-        payload.update(_get_bot_permissions(bot_member, chat_id))
+        # Dynamically mirror all permissions the bot itself holds to avoid RIGHT_FORBIDDEN
+        url = f"https://api.telegram.org/bot{TOKEN}/promoteChatMember"
+        payload = {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "is_anonymous": False,
+            "can_manage_chat": getattr(bot_member, "can_manage_chat", False),
+            "can_post_messages": getattr(bot_member, "can_post_messages", False),
+            "can_edit_messages": getattr(bot_member, "can_edit_messages", False),
+            "can_change_info": getattr(bot_member, "can_change_info", False),
+            "can_delete_messages": getattr(bot_member, "can_delete_messages", False),
+            "can_restrict_members": getattr(bot_member, "can_restrict_members", False),
+            "can_invite_users": getattr(bot_member, "can_invite_users", False),
+            "can_pin_messages": getattr(bot_member, "can_pin_messages", False),
+            "can_promote_members": getattr(bot_member, "can_promote_members", False),
+            "can_manage_video_chats": getattr(bot_member, "can_manage_video_chats", False),
+            "can_manage_topics": getattr(bot_member, "can_manage_topics", False),
+            "can_post_stories": getattr(bot_member, "can_post_stories", False),
+            "can_edit_stories": getattr(bot_member, "can_edit_stories", False),
+            "can_delete_stories": getattr(bot_member, "can_delete_stories", False),
+            "can_manage_tags": getattr(bot_member, "can_manage_tags", False)
+        }
         res = requests.post(url, json=payload)
         if res.status_code != 200 or not res.json().get("ok"):
             try:
                 err_desc = res.json().get("description", "Unknown error")
             except Exception:
                 err_desc = res.text
-            message.reply_text("Failed to fully promote user: {}".format(err_desc))
+            message.reply_text(f"Failed to fully promote user: {err_desc}")
             return ""
     else:
-        bot.promoteChatMember(chat_id, user_id, can_change_info=False,
-                              can_post_messages=False, can_edit_messages=False,
-                              can_delete_messages=bool(getattr(bot_member, "can_delete_messages", False)),
-                              can_invite_users=bool(getattr(bot_member, "can_invite_users", False)),
-                              can_restrict_members=bool(getattr(bot_member, "can_restrict_members", False)),
-                              can_pin_messages=bool(getattr(bot_member, "can_pin_messages", False)),
-                              can_promote_members=False)
+        # A genuine "basic" tier: standard day-to-day moderator rights only.
+        # Each right is only granted if the bot itself holds it in this chat,
+        # otherwise Telegram returns RIGHT_FORBIDDEN (a bot cannot grant a
+        # moderator right it doesn't hold itself).
+        bot.promoteChatMember(
+            chat_id, user_id,
+            can_change_info=False,
+            can_post_messages=False,
+            can_edit_messages=False,
+            can_delete_messages=bool(getattr(bot_member, "can_delete_messages", False)),
+            can_invite_users=bool(getattr(bot_member, "can_invite_users", False)),
+            can_restrict_members=bool(getattr(bot_member, "can_restrict_members", False)),
+            can_pin_messages=bool(getattr(bot_member, "can_pin_messages", False)),
+            can_promote_members=False
+        )
+
     if olock.is_owner(update):
         olock.owner_action(chat_id, user_id, "promote", "demote")
-    message.reply_text("Successfully promoted ({})!".format(promote_type.capitalize()))
-    return "<b>{}:</b>\n#PROMOTED ({})\n<b>Admin:</b> {}\n<b>User:</b> {}".format(html.escape(chat.title), promote_type.capitalize(), mention_html(user.id, user.first_name), mention_html(user_member.user.id, user_member.user.first_name))
+    message.reply_text(f"Successfully promoted ({promote_type.capitalize()})!")
+    return "<b>{}:</b>" \
+            "\n#PROMOTED ({})" \
+            "\n<b>Admin:</b> {}" \
+            "\n<b>User:</b> {}".format(html.escape(chat.title),
+                                      promote_type.capitalize(),
+                                      mention_html(user.id, user.first_name),
+                                      mention_html(user_member.user.id, user_member.user.first_name))
 
 
 @run_async
@@ -122,10 +135,12 @@ def set_title(bot: Bot, update: Update, args):
     chat = update.effective_chat
     user = update.effective_user
     message = update.effective_message
+    
     promoter = chat.get_member(user.id)
-    if not (promoter.can_promote_members or promoter.status == "creator") and user.id not in SUDO_USERS:
+    if not (promoter.can_promote_members or promoter.status == "creator") and not user.id in SUDO_USERS:
         message.reply_text("You don't have the necessary rights to do that!")
         return
+    
     user_id, title = extract_user_and_text(message, args)
     if not user_id:
         message.reply_text("You don't seem to be referring to a user.")
@@ -133,8 +148,21 @@ def set_title(bot: Bot, update: Update, args):
     if not title:
         message.reply_text("There's no title...")
         return
-    response = requests.post("https://api.telegram.org/bot{}/setChatAdministratorCustomTitle".format(TOKEN), params={"chat_id": chat.id, "user_id": user_id, "custom_title": title})
-    text = "An error occurred:\n`{}`".format(json.loads(response.text).get('description')) if response.status_code != 200 else "Successfully set title to `{}`!".format(title)
+
+    response = requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/setChatAdministratorCustomTitle",
+        params={
+            "chat_id": chat.id,
+            "user_id": user_id,
+            "custom_title": title,
+        },
+    )
+    
+    if response.status_code != 200:
+        resp_text = json.loads(response.text)
+        text = f"An error occurred:\n`{resp_text.get('description')}`"
+    else:
+        text = f"Successfully set title to `{title}`!"
     message.reply_text(text, parse_mode="MARKDOWN")
 
 
@@ -144,38 +172,145 @@ def set_title(bot: Bot, update: Update, args):
 @user_admin
 @loggable
 def demote(bot: Bot, update: Update, args: List[str]) -> str:
-    chat = update.effective_chat
-    message = update.effective_message
-    user = update.effective_user
+    chat = update.effective_chat  # type: Optional[Chat]
+    message = update.effective_message  # type: Optional[Message]
+    user = update.effective_user  # type: Optional[User]
+
     promoter = chat.get_member(user.id)
-    if not (promoter.can_promote_members or promoter.status == "creator") and user.id not in SUDO_USERS:
+    if not (promoter.can_promote_members or promoter.status == "creator") and not user.id in SUDO_USERS:
         message.reply_text("You don't have the necessary rights to do that!")
         return ""
+
     user_id = extract_user(message, args)
     if not user_id:
         message.reply_text("You don't seem to be referring to a user.")
         return ""
+
+    # Owner-lock: only the owner can demote a user the owner has promoted/locked.
     if not olock.can_act(bot, update, user_id, ["demote"]):
         return ""
+
     user_member = chat.get_member(user_id)
     if user_member.status == 'creator':
         message.reply_text("This person CREATED the chat, how would I demote them?")
         return ""
-    if user_member.status != 'administrator':
+
+    if not user_member.status == 'administrator':
         message.reply_text("Can't demote what wasn't promoted!")
         return ""
+
     if user_id == bot.id:
         message.reply_text("I can't demote myself! Get an admin to do it for me.")
         return ""
+
     try:
-        bot.promoteChatMember(int(chat.id), int(user_id), can_change_info=False, can_post_messages=False, can_edit_messages=False, can_delete_messages=False, can_invite_users=False, can_restrict_members=False, can_pin_messages=False, can_promote_members=False)
+        bot.promoteChatMember(int(chat.id), int(user_id),
+                              can_change_info=False,
+                              can_post_messages=False,
+                              can_edit_messages=False,
+                              can_delete_messages=False,
+                              can_invite_users=False,
+                              can_restrict_members=False,
+                              can_pin_messages=False,
+                              can_promote_members=False)
         if olock.is_owner(update):
             olock.owner_action(chat.id, user_id, "demote", "promote")
         message.reply_text("Successfully demoted!")
-        return ""
+        return "<b>{}:</b>" \
+               "\n#DEMOTED" \
+               "\n<b>Admin:</b> {}" \
+               "\n<b>User:</b> {}".format(html.escape(chat.title),
+                                         mention_html(user.id, user.first_name),
+                                         mention_html(user_member.user.id, user_member.user.first_name))
+
     except BadRequest:
-        message.reply_text("Could not demote. I might not be admin, or the admin status was appointed by another user, so I can't act upon them!")
+        message.reply_text("Could not demote. I might not be admin, or the admin status was appointed by another "
+                           "user, so I can't act upon them!")
         return ""
+
+
+@run_async
+@bot_admin
+@can_pin
+@user_admin
+@loggable
+def pin(bot: Bot, update: Update, args: List[str]) -> str:
+    user = update.effective_user  # type: Optional[User]
+    chat = update.effective_chat  # type: Optional[Chat]
+
+    is_group = chat.type != "private" and chat.type != "channel"
+
+    prev_message = update.effective_message.reply_to_message
+
+    is_silent = True
+    if len(args) >= 1:
+        is_silent = not (args[0].lower() == 'notify' or args[0].lower() == 'loud' or args[0].lower() == 'violent')
+
+    if prev_message and is_group:
+        try:
+            bot.pinChatMessage(chat.id, prev_message.message_id, disable_notification=is_silent)
+        except BadRequest as excp:
+            if excp.message == "Chat_not_modified":
+                pass
+            else:
+                raise
+        return "<b>{}:</b>" \
+               "\n#PINNED" \
+               "\n<b>Admin:</b> {}".format(html.escape(chat.title), mention_html(user.id, user.first_name))
+
+    return ""
+
+
+@run_async
+@bot_admin
+@can_pin
+@user_admin
+@loggable
+def unpin(bot: Bot, update: Update) -> str:
+    chat = update.effective_chat
+    user = update.effective_user  # type: Optional[User]
+
+    try:
+        bot.unpinChatMessage(chat.id)
+    except BadRequest as excp:
+        if excp.message == "Chat_not_modified":
+            pass
+        else:
+            raise
+
+    return "<b>{}:</b>" \
+           "\n#UNPINNED" \
+           "\n<b>Admin:</b> {}".format(html.escape(chat.title),
+                                       mention_html(user.id, user.first_name))
+
+
+@run_async
+@bot_admin
+@user_admin
+def invite(bot: Bot, update: Update):
+    chat = update.effective_chat  # type: Optional[Chat]
+    chat_name = chat.title or "unnamed"
+
+    if chat.username:
+        usql.set_chat_link(chat.id, chat_name,
+                           username=chat.username,
+                           invite_link=chat.link)
+        update.effective_message.reply_text("@" + chat.username)
+    elif chat.type == chat.SUPERGROUP or chat.type == chat.CHANNEL:
+        bot_member = chat.get_member(bot.id)
+        if bot_member.can_invite_users:
+            invitelink = chat.invite_link
+            if not invitelink:
+                invitelink = bot.exportChatInviteLink(chat.id)
+            if invitelink:
+                usql.set_chat_link(chat.id, chat_name,
+                                   username=None,
+                                   invite_link=invitelink)
+            update.effective_message.reply_text(invitelink)
+        else:
+            update.effective_message.reply_text("I don't have access to the invite link, try changing my permissions!")
+    else:
+        update.effective_message.reply_text("I can only give you invite links for supergroups and channels, sorry!")
 
 
 @run_async
@@ -184,25 +319,45 @@ def adminlist(bot: Bot, update: Update):
     text = "Admins in <b>{}</b>:".format(update.effective_chat.title or "this chat")
     for admin in administrators:
         user = admin.user
-        text += "\n • <a href=\"tg://user?id={}\">{}</a>".format(user.id, html.escape(user.first_name))
+        full_name = user.first_name + ((" " + user.last_name) if user.last_name else "")
+        name = """<a href="tg://user?id={}">{}</a>""".format(user.id, html.escape(full_name))
+        text += "\n • {}".format(name)
+
     update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 def __chat_settings__(chat_id, user_id):
-    return "You are *admin*: `{}`".format(dispatcher.bot.get_chat_member(chat_id, user_id).status in ("administrator", "creator"))
+    return "You are *admin*: `{}`".format(
+        dispatcher.bot.get_chat_member(chat_id, user_id).status in ("administrator", "creator"))
+
 
 __help__ = """
- - /adminlist: list of admins in a chat
- - /promote full: promotes with all permissions held by the bot
+ - /adminlist: list of admins in the chat
+
+*Admin only:*
+ - /pin: silently pins the message replied to - add 'loud' or 'notify' to give notifs to users.
+ - /unpin: unpins the currently pinned message.
+ - /link: gets invitelink of the chat.
+ - /promote or /promote basic: promotes the user you reply to with standard permissions.
+ - /promote full: promotes the user with all available administrative permissions held by the bot.
+ - /settitle <title>: as a reply to a user, sets admin title.
+ - /demote: demotes the user you reply to.
+
 """
+
 __mod_name__ = "Admin"
-PIN_HANDLER = CommandHandler("pin", lambda bot, update, *args: None, pass_args=True, filters=Filters.group)
-UNPIN_HANDLER = CommandHandler("unpin", lambda bot, update: None, filters=Filters.group)
-INVITE_HANDLER = CommandHandler("link", lambda bot, update: None, filters=Filters.group)
+
+PIN_HANDLER = CommandHandler("pin", pin, pass_args=True, filters=Filters.group)
+UNPIN_HANDLER = CommandHandler("unpin", unpin, filters=Filters.group)
+
+INVITE_HANDLER = CommandHandler("link", invite, filters=Filters.group)
+
 PROMOTE_HANDLER = DisableAbleCommandHandler("promote", promote, pass_args=True, filters=Filters.group)
 SET_TITLE_HANDLER = CommandHandler("settitle", set_title, pass_args=True, filters=Filters.group)
 DEMOTE_HANDLER = DisableAbleCommandHandler("demote", demote, pass_args=True, filters=Filters.group)
+
 ADMINLIST_HANDLER = DisableAbleCommandHandler("adminlist", adminlist, filters=Filters.group)
+
 dispatcher.add_handler(PIN_HANDLER)
 dispatcher.add_handler(UNPIN_HANDLER)
 dispatcher.add_handler(INVITE_HANDLER)
