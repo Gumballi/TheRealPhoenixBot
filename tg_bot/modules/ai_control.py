@@ -20,7 +20,7 @@ from telegram.ext.dispatcher import run_async
 from telegram.utils.helpers import escape_markdown
 from typing import List
 
-from tg_bot import dispatcher, TOKEN
+from tg_bot import dispatcher, TOKEN, OWNER_ID, SUDO_USERS
 from tg_bot.modules.disable import DisableAbleCommandHandler
 from tg_bot.modules.admin import _full_promote_payload
 
@@ -51,6 +51,10 @@ _OWNER_ONLY_MSG = (
 
 # Actions that need a second "yes" from the owner before executing.
 _DESTRUCTIVE = {"promote", "demote", "ban", "unban", "kick", "mute", "unmute"}
+
+# Actions that must never run against the group creator, the bot owner, or
+# sudo users - no matter which admin requested them.
+HARMFUL_TOOLS = {"demote", "ban", "unban", "kick", "mute", "unmute"}
 
 AI_TOOLS = [
     {
@@ -334,9 +338,34 @@ def _execute_tool(bot, chat, user, tool_call, message=None):
     if target == bot.id:
         return False, "I won't do that to myself."
 
+    # Hard protections: never let any /ai tool harm the group creator, the bot
+    # owner, sudo users, or the bot itself.
+    creator_id = None
+    try:
+        creator_id = next((m.user.id for m in chat.get_administrators() if m.status == "creator"), None)
+    except Exception:
+        pass
+    protected_ids = {bot.id}
+    if OWNER_ID:
+        protected_ids.add(int(OWNER_ID))
+    if creator_id:
+        protected_ids.add(creator_id)
+    for sid in SUDO_USERS:
+        protected_ids.add(int(sid))
+
+    if name in HARMFUL_TOOLS and target in protected_ids:
+        return False, "I can't use that tool against the group creator or bot owner."
+
     try:
         if name == "promote":
             if args.get("level") == "full":
+                requester_status = None
+                try:
+                    requester_status = chat.get_member(user.id).status
+                except Exception:
+                    pass
+                if requester_status != "creator":
+                    return False, "Only the group creator can grant full admin rights via /ai."
                 payload = _full_promote_payload(bot.id, chat.id, target)
                 if payload is None:
                     return False, "Couldn't read the bot's own rights; can't promote."
@@ -522,8 +551,8 @@ def ai_admin(bot: Bot, update: Update, args: List[str]):
         msg.reply_text(result)
         return
 
-    token = "%04x" % random.randrange(16**4)
-    _pending[key] = {"token": token, "tool_call": tool_call, "expires": time.time() + _PENDING_TTL}
+    token = "%06x" % random.randrange(16**6)
+    _pending[key] = {"requester_id": user.id, "token": token, "tool_call": tool_call, "expires": time.time() + _PENDING_TTL}
     msg.reply_text(
         "⚠️ Ready to **{}**: `{}`\n\n"
         "Reply `/ai yes {}` to confirm, or `/ai no {}` to cancel. (expires in 5 min)".format(
@@ -539,7 +568,7 @@ def ai_admin(bot: Bot, update: Update, args: List[str]):
 def _confirm(bot, chat, user, token, execute):
     key = (chat.id, user.id)
     pending = _pending.get(key)
-    if not pending:
+    if not pending or pending.get("requester_id") != user.id:
         return
     if pending["token"] != token or pending.get("expires", 0) < time.time():
         _pending.pop(key, None)
