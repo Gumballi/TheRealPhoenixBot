@@ -112,10 +112,25 @@ if MISTRAL_API_KEY:
 else:
     LOGGER.warning("[ai] MISTRAL_API_KEY not set - Mistral fallback disabled.")
 
-# Order providers are tried in. Override via env if you want Mistral tried first
+# ---------------------------------------------------------------------------
+# Groq setup (free tier is far more generous than Mistral's). Reuses the same
+# GROQ_API_KEY as the /ai owner-control module.
+# ---------------------------------------------------------------------------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+if GROQ_API_KEY:
+    LOGGER.info("[ai] Groq provider enabled (model: %s).", GROQ_MODEL)
+else:
+    LOGGER.warning("[ai] GROQ_API_KEY not set - Groq provider disabled.")
+
+# Order providers are tried in. Override via env if you want a different order.
+# Cloud-hosted open models (Groq) are tried first since they're the most reliable
+# free option; Gemini and Mistral act as fallbacks.
 PROVIDER_ORDER = [
     p.strip().lower()
-    for p in os.environ.get("AI_PROVIDER_ORDER", "gemini,mistral").split(",")
+    for p in os.environ.get("AI_PROVIDER_ORDER", "groq,gemini,mistral").split(",")
     if p.strip()
 ]
 
@@ -311,9 +326,38 @@ def _call_mistral(prompt: str, media=None) -> str:
     )
     return response.choices[0].message.content.strip()
 
+def _call_groq_chat(prompt: str, media=None) -> str:
+    if media:
+        raise RuntimeError("Groq provider does not support images/videos - use Gemini.")
+    response = requests.post(
+        GROQ_API_URL,
+        headers={
+            "Authorization": "Bearer {}".format(GROQ_API_KEY),
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        },
+        timeout=40,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "API error occurred: Status {}. Body: {}".format(
+                response.status_code, response.text)
+        )
+    choices = response.json().get("choices") or []
+    if not choices:
+        raise RuntimeError("Empty Groq response")
+    return choices[0]["message"]["content"].strip()
+
 PROVIDERS = {
     "gemini": (lambda: gemini_client is not None, _call_gemini, True),
     "mistral": (lambda: mistral_client is not None and mistral_supports_chat_complete, _call_mistral, False),
+    "groq": (lambda: bool(GROQ_API_KEY), _call_groq_chat, False),
 }
 
 def generate_ai_response(prompt: str, media=None, preferred=None) -> str:
