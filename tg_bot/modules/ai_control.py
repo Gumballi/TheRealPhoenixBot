@@ -488,7 +488,7 @@ def _confirm(bot, chat, user, token, execute):
     summary = _summarize(bot, chat, user, tool_call.get("name"), ok, result)
     bot.send_message(
         chat.id,
-        escape_markdown(summary, version=1),
+        escape_markdown(summary),
         parse_mode=ParseMode.MARKDOWN,
     )
 
