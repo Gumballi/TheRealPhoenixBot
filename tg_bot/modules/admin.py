@@ -18,6 +18,42 @@ from tg_bot.modules.log_channel import loggable
 from tg_bot.modules.sql import ownerlock_sql as olock
 from tg_bot.modules.sql import users_sql as usql
 
+# The Telegram API exposes more admin permission fields than python-telegram-bot
+# 11.x can represent (newer fields are swallowed by **kwargs in ChatMember).
+# For a "full" promote we must mirror the bot's own raw rights so the result
+# is actually full — and never try to grant a right the bot doesn't hold,
+# otherwise Telegram returns RIGHT_FORBIDDEN.
+_FULL_PROMOTE_FIELDS = (
+    "can_manage_chat", "can_post_messages", "can_edit_messages",
+    "can_change_info", "can_delete_messages", "can_restrict_members",
+    "can_invite_users", "can_pin_messages", "can_promote_members",
+    "can_manage_video_chats", "can_manage_topics", "can_post_stories",
+    "can_edit_stories", "can_delete_stories", "can_manage_tags",
+    "can_send_welcome_messages",
+)
+
+
+def _full_promote_payload(bot_id, chat_id, user_id):
+    """Build a promoteChatMember payload mirroring the bot's own admin rights.
+
+    Permission booleans are read flat from getChatMember (the raw Telegram API),
+    which is the only reliable source for the modern fields PTB 11.x misses.
+    Fields absent from the response default to False. Returns None on failure.
+    """
+    payload = {"chat_id": chat_id, "user_id": user_id, "is_anonymous": False}
+    try:
+        res = requests.get(
+            "https://api.telegram.org/bot{}/getChatMember".format(TOKEN),
+            params={"chat_id": chat_id, "user_id": bot_id},
+            timeout=15,
+        )
+        raw = res.json().get("result", {}) if res.status_code == 200 else {}
+        for field in _FULL_PROMOTE_FIELDS:
+            payload[field] = bool(raw.get(field, False))
+    except Exception:
+        return None
+    return payload
+
 
 @run_async
 @bot_admin
@@ -68,29 +104,15 @@ def promote(bot: Bot, update: Update, args: List[str]) -> str:
     bot_member = chat.get_member(bot.id)
 
     if promote_type == "full":
-        # Dynamically mirror all permissions the bot itself holds to avoid RIGHT_FORBIDDEN
-        url = f"https://api.telegram.org/bot{TOKEN}/promoteChatMember"
-        payload = {
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "is_anonymous": False,
-            "can_manage_chat": getattr(bot_member, "can_manage_chat", False),
-            "can_post_messages": getattr(bot_member, "can_post_messages", False),
-            "can_edit_messages": getattr(bot_member, "can_edit_messages", False),
-            "can_change_info": getattr(bot_member, "can_change_info", False),
-            "can_delete_messages": getattr(bot_member, "can_delete_messages", False),
-            "can_restrict_members": getattr(bot_member, "can_restrict_members", False),
-            "can_invite_users": getattr(bot_member, "can_invite_users", False),
-            "can_pin_messages": getattr(bot_member, "can_pin_messages", False),
-            "can_promote_members": getattr(bot_member, "can_promote_members", False),
-            "can_manage_video_chats": getattr(bot_member, "can_manage_video_chats", False),
-            "can_manage_topics": getattr(bot_member, "can_manage_topics", False),
-            "can_post_stories": getattr(bot_member, "can_post_stories", False),
-            "can_edit_stories": getattr(bot_member, "can_edit_stories", False),
-            "can_delete_stories": getattr(bot_member, "can_delete_stories", False),
-            "can_manage_tags": getattr(bot_member, "can_manage_tags", False)
-        }
-        res = requests.post(url, json=payload)
+        payload = _full_promote_payload(bot.id, chat_id, user_id)
+        if payload is None:
+            message.reply_text("Failed to read the bot's own admin rights; cannot promote.")
+            return ""
+        res = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/promoteChatMember",
+            json=payload,
+            timeout=15,
+        )
         if res.status_code != 200 or not res.json().get("ok"):
             try:
                 err_desc = res.json().get("description", "Unknown error")
