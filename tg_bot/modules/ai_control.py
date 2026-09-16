@@ -159,6 +159,30 @@ AI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "pin",
+            "description": "Pin a message in the group. The admin must reply to the message they want pinned.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unpin",
+            "description": "Unpin the current pinned message in the group.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "chat_status",
             "description": "Report current bot rights and member counts for this chat. Safe, instant.",
             "parameters": {"type": "object", "properties": {}},
@@ -269,7 +293,7 @@ def _get_admin_actions_text(chat, bot_id):
         return "error: {}".format(e)
 
 
-def _execute_tool(bot, chat, user, tool_call):
+def _execute_tool(bot, chat, user, tool_call, message=None):
     """Run one whitelisted tool call. Returns (ok, reply_text)."""
     name = tool_call.get("name")
     try:
@@ -279,6 +303,22 @@ def _execute_tool(bot, chat, user, tool_call):
 
     if name == "chat_status":
         return True, _get_admin_actions_text(chat, bot.id)
+
+    if name == "pin":
+        if message is None or not message.reply_to_message:
+            return False, "Reply to the message you want me to pin, then run /ai pin."
+        try:
+            bot.pin_chat_message(chat.id, message.reply_to_message.message_id)
+            return True, "Pinned. 📌"
+        except Exception as e:
+            return False, "Pin failed: {}".format(e)
+
+    if name == "unpin":
+        try:
+            bot.unpin_chat_message(chat.id)
+            return True, "Unpinned. ✅"
+        except Exception as e:
+            return False, "Unpin failed: {}".format(e)
 
     target = args.get("target", "").strip()
     if args.get("target_id") is not None:
@@ -432,7 +472,8 @@ def ai_admin(bot: Bot, update: Update, args: List[str]):
     instruction = " ".join(args)
     if not instruction:
         msg.reply_text(
-            "Tell me what to do, e.g. `/ai mute @bob for 1h`, `/ai promote @sam full`, `/ai ban @spammer`.",
+            "Tell me what to do, e.g. `/ai mute @bob for 1h`, `/ai promote @sam full`, `/ai ban @spammer`, "
+            "`/ai pin` (reply to a message first).",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -477,7 +518,7 @@ def ai_admin(bot: Bot, update: Update, args: List[str]):
                 tool_call["arguments"] = json.dumps(tool_args)
 
     if tool_call.get("name") not in _DESTRUCTIVE:
-        ok, result = _execute_tool(bot, chat, user, tool_call)
+        ok, result = _execute_tool(bot, chat, user, tool_call, message=msg)
         msg.reply_text(result)
         return
 
