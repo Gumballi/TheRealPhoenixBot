@@ -354,10 +354,38 @@ _GALLERY_EXTENSIONS = (
     ".mp4", ".mkv", ".webm", ".mp3", ".m4a", ".opus", ".wav",
 )
 
-# Optional Netscape-format cookies file (GALLERY_COOKIES env) passed through to
-# gallery-dl/yt-dlp. Required for platforms that are login-walled server-side
-# (Instagram especially) and useful for age-gated feeds on other sites.
-_COOKIES_FILE = os.environ.get("GALLERY_COOKIES", "").strip() or None
+# Optional Instagram-session cookies (GALLERY_COOKIES env) passed through to
+# gallery-dl/yt-dlp as a Netscape cookies file. The env var may be a *path* to
+# a cookies.txt on the host OR the raw cookies-file contents pasted inline
+# (handy on hosts like Render where uploading a file is awkward) - contents are
+# materialised to a temp file once per process.
+_COOKIES_RAW = os.environ.get("GALLERY_COOKIES", "").strip() or None
+_COOKIES_TMP_PATH = None
+
+
+def _cookies_file_path():
+    """Resolve GALLERY_COOKIES to a real file path, materialising inline
+    contents to a 0600 temp file when the env var is not a path."""
+    global _COOKIES_TMP_PATH
+    if not _COOKIES_RAW:
+        return None
+    if _COOKIES_TMP_PATH:
+        return _COOKIES_TMP_PATH
+    if os.path.isfile(_COOKIES_RAW):
+        return _COOKIES_RAW
+    if "\n" not in _COOKIES_RAW and not _COOKIES_RAW.startswith("#"):
+        LOGGER.warning("[goblin] GALLERY_COOKIES does not look like a path or a "
+                       "Netscape cookie payload, ignoring it.")
+        return None
+    try:
+        _COOKIES_TMP_PATH = os.path.join(tempfile.gettempdir(), "gob_gallery_cookies.txt")
+        with open(_COOKIES_TMP_PATH, "w", encoding="utf-8") as f:
+            f.write(_COOKIES_RAW)
+        os.chmod(_COOKIES_TMP_PATH, 0o600)
+        return _COOKIES_TMP_PATH
+    except Exception as err:
+        LOGGER.warning("[goblin] could not materialise GALLERY_COOKIES content: %s", err)
+        return None
 
 # Optional Instagram session export (INSTALOADER_SESSION env) used by the
 # instaloader-based scraper for Instagram. Create one on a workstation with:
@@ -401,8 +429,9 @@ def _download_gallery(url: str, tmpdir: str, platform: str) -> Tuple[list, dict]
         cmd = ["gallery-dl"]
         if _PROXIES and _PROXIES.get("https"):
             cmd += ["-o", "proxy={}".format(_PROXIES["https"])]
-        if _COOKIES_FILE:
-            cmd += ["--cookies", _COOKIES_FILE]
+        cookies_path = _cookies_file_path()
+        if cookies_path:
+            cmd += ["--cookies", cookies_path]
 
         # Metadata pass (-j prints the extractor result JSON without downloading).
         try:
@@ -692,8 +721,9 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
             "merge_output_format": "mp4",
             "extractor_args": {},
         }
-        if _COOKIES_FILE:
-            ydl_opts["cookiefile"] = _COOKIES_FILE
+        cookies_path = _cookies_file_path()
+        if cookies_path:
+            ydl_opts["cookiefile"] = cookies_path
         # TikTok needs specific client on datacenter IPs
         if platform == "tiktok":
             ydl_opts["extractor_args"]["tiktok"] = {"player_client": ["web"]}
@@ -1417,7 +1447,7 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                         "account to view — I can't download it.")
                 else:
                     status.edit_text("This looks like a TikTok photo post — can't download as video.")
-            elif platform == "instagram" and not _INSTALOADER_SESSION and not _COOKIES_FILE \
+            elif platform == "instagram" and not _INSTALOADER_SESSION and not _COOKIES_RAW \
                     and "log in" not in ytdlp_err.lower():
                 status.edit_text(
                     "Instagram requires a logged-in session to fetch media from a server. "
