@@ -359,6 +359,41 @@ _GALLERY_EXTENSIONS = (
 # (Instagram especially) and useful for age-gated feeds on other sites.
 _COOKIES_FILE = os.environ.get("GALLERY_COOKIES", "").strip() or None
 
+# Optional Instagram session export (INSTALOADER_SESSION env) used by the
+# instaloader-based scraper for Instagram. Create one on a workstation with:
+#   instaloader --login <username>   # writes ~/.config/instaloader/session-<username>
+# and point INSTALOADER_SESSION at that file. Username is optional too via
+# INSTALOADER_USERNAME, otherwise it's inferred from the file name.
+_INSTALOADER_SESSION = os.environ.get("INSTALOADER_SESSION", "").strip() or None
+_INSTALOADER_USERNAME = os.environ.get("INSTALOADER_USERNAME", "").strip() or None
+
+_instaloader_state = {"loader": None, "failed": False}
+
+
+def _instaloader_instance():
+    """Lazily build an Instaloader bound to the exported IG session file.
+    Returns None (permanently, on failure) when not configured."""
+    if _instaloader_state["loader"] is not None:
+        return _instaloader_state["loader"]
+    if _instaloader_state["failed"] or not _INSTALOADER_SESSION:
+        return None
+    try:
+        import instaloader as _il
+        loader = _il.Instaloader()
+        username = _INSTALOADER_USERNAME
+        if not username:
+            m = re.match(r"session-?(.+)", os.path.basename(_INSTALOADER_SESSION))
+            username = m.group(1) if m else None
+        loader.load_session_from_file(username, _INSTALOADER_SESSION)
+        _instaloader_state["loader"] = loader
+        LOGGER.info("[goblin] Instaloader session ready (%s)", username or "?")
+        return loader
+    except Exception as err:
+        LOGGER.warning("[goblin] Instaloader session load failed (ensure INSTALOADER_SESSION "
+                       "points at a valid session export): %s", err)
+        _instaloader_state["failed"] = True
+        return None
+
 
 def _download_gallery(url: str, tmpdir: str, platform: str) -> Tuple[list, dict]:
     meta = {}
@@ -437,6 +472,85 @@ def _download_gallery(url: str, tmpdir: str, platform: str) -> Tuple[list, dict]
     except Exception as err:
         LOGGER.warning("[goblin] gallery-dl failed for %s (%s): %s", url, platform, err)
         return [], meta
+
+
+# ---------------------------------------------------------------------------
+# Instagram: session-based fetch via instaloader
+# ---------------------------------------------------------------------------
+
+def _instagram_session_scrape(url: str, tmpdir: str) -> Tuple[list, dict]:
+    """Fetch an Instagram post/carousel via instaloader + an exported IG session
+    (INSTALOADER_SESSION).  Anonymous scraping is login-walled, so this is the
+    reliable route for IG - reels, carousels and single media all come back as
+    media files for _send_media_set.  Returns (filepaths, meta); empty list
+    when no session is configured or the fetch fails."""
+    loader = _instaloader_instance()
+    if loader is None:
+        return [], {}
+    m = re.search(r"instagram\.com/(?:reel|p|tv)?/?([A-Za-z0-9_-]+)", url)
+    if not m:
+        return [], {}
+    shortcode = m.group(1)
+    try:
+        import instaloader as _il
+        post = _il.Post.from_shortcode(loader.context, shortcode)
+    except Exception as err:
+        LOGGER.warning("[goblin] Instaloader metadata failed (%s): %s", shortcode, err)
+        return [], {}
+    if not post:
+        return [], {}
+
+    meta = {}
+    if post.caption:
+        meta["title"] = str(post.caption)
+    if post.owner_username:
+        meta["uploader"] = str(post.owner_username)
+        meta["uploader_url"] = "https://www.instagram.com/{0}".format(post.owner_username)
+
+    try:
+        nodes = list(post.get_sidecar_nodes())
+    except Exception as err:
+        LOGGER.warning("[goblin] Instaloader sidecar failed (%s): %s", shortcode, err)
+        return [], meta
+    if not nodes:
+        return [], meta
+
+    headers = {"User-Agent": _UA, "Referer": "https://www.instagram.com/"}
+    scraper = cloudscraper.create_scraper()
+    filepaths = []
+    for idx, node in enumerate(nodes):
+        if idx >= _MAX_GALLERY_ITEMS:
+            break
+        if getattr(node, "is_video", False) and getattr(node, "video_url", None):
+            media_url = node.video_url
+            ext = ".mp4"
+        elif getattr(node, "display_url", None):
+            media_url = node.display_url
+            ext = os.path.splitext(urllib.parse.urlparse(media_url).path)[1] or ".jpg"
+        else:
+            continue
+        fp = os.path.join(tmpdir, "instagram_media_{:02d}{}".format(idx, ext))
+        try:
+            dl = scraper.get(media_url, timeout=60, headers=headers,
+                             stream=True, proxies=_PROXIES)
+            dl.raise_for_status()
+            if _content_type_rejects(dl):
+                LOGGER.warning("[goblin] IG media %s rejected content-type", media_url)
+                continue
+            with open(fp, "wb") as f:
+                for chunk in dl.iter_content(8192):
+                    f.write(chunk)
+            if not _validate_downloaded_file(fp):
+                os.remove(fp)
+                continue
+            filepaths.append(fp)
+        except Exception as err:
+            LOGGER.warning("[goblin] IG media download failed (%s): %s", media_url, err)
+            continue
+
+    if filepaths:
+        LOGGER.info("[goblin] Instaloader: %d media item(s) for %s", len(filepaths), shortcode)
+    return filepaths, meta
 
 
 # ---------------------------------------------------------------------------
@@ -1178,7 +1292,8 @@ def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
             ),
         )
         if not filepath:
-            status.edit_text("Could not fetch media from Threads.")
+            status.edit_text("Could not fetch media from Threads (it requires a logged-in "
+                             "session and no supported extractor has one).")
             return
         meta.setdefault("title", "Threads")
         caption = _build_caption(bot, "threads", meta)
@@ -1207,15 +1322,23 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
         meta = {}
         media_files = []
 
-        # 1) gallery-dl: multi-image carousels/galleries for image platforms
-        if platform in _GALLERY_PLATFORMS:
+        # 1) instaloader: session-based fetch for Instagram (login-walled)
+        if not media_files and platform == "instagram" and _INSTALOADER_SESSION:
+            status.edit_text("Fetching via IG session...")
+            sess_files, sess_meta = _instagram_session_scrape(url, tmpdir)
+            if sess_files:
+                media_files = sess_files
+                meta = sess_meta or {}
+
+        # 2) gallery-dl: multi-image carousels/galleries for image platforms
+        if not media_files and platform in _GALLERY_PLATFORMS:
             status.edit_text("Extracting via gallery-dl...")
             gallery_files, gallery_meta = _download_gallery(url, tmpdir, platform)
             if gallery_files:
                 media_files = gallery_files
                 meta = gallery_meta or {}
 
-        # 2) yt-dlp
+        # 3) yt-dlp
         filepath, ytdlp_meta, ytdlp_err = (None, {}, "")
         if not media_files:
             filepath, ytdlp_meta, ytdlp_err = _download_ytdlp(url, tmpdir, platform)
@@ -1223,7 +1346,7 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                 media_files = [filepath]
                 meta = ytdlp_meta or {}
 
-        # 3) Custom scrapers when both above fail
+        # 4) Custom scrapers when all the above fail
         if not media_files:
             if platform == "reddit":
                 status.edit_text("Trying Reddit scraper...")
@@ -1294,11 +1417,13 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                         "account to view — I can't download it.")
                 else:
                     status.edit_text("This looks like a TikTok photo post — can't download as video.")
-            elif platform == "instagram" and not _COOKIES_FILE and "log in" not in ytdlp_err.lower():
+            elif platform == "instagram" and not _INSTALOADER_SESSION and not _COOKIES_FILE \
+                    and "log in" not in ytdlp_err.lower():
                 status.edit_text(
                     "Instagram requires a logged-in session to fetch media from a server. "
-                    "Set GALLERY_COOKIES (a Netscape-format cookies file) on the bot host so "
-                    "I can download IG posts.")
+                    "Set INSTALOADER_SESSION (an exported instaloader session) or "
+                    "GALLERY_COOKIES (Netscape cookies file) on the bot host so I can "
+                    "download IG posts.")
             else:
                 status.edit_text("Could not download from {}.".format(platform.title()))
             return
