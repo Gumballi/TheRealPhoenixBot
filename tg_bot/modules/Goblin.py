@@ -16,6 +16,7 @@ import subprocess
 import urllib.parse
 import uuid
 import mimetypes
+from html import unescape as _html_unescape
 import requests
 
 # Unique per-process identifier. If two overlapping instances are both
@@ -353,6 +354,11 @@ _GALLERY_EXTENSIONS = (
     ".mp4", ".mkv", ".webm", ".mp3", ".m4a", ".opus", ".wav",
 )
 
+# Optional Netscape-format cookies file (GALLERY_COOKIES env) passed through to
+# gallery-dl/yt-dlp. Required for platforms that are login-walled server-side
+# (Instagram especially) and useful for age-gated feeds on other sites.
+_COOKIES_FILE = os.environ.get("GALLERY_COOKIES", "").strip() or None
+
 
 def _download_gallery(url: str, tmpdir: str, platform: str) -> Tuple[list, dict]:
     meta = {}
@@ -360,6 +366,8 @@ def _download_gallery(url: str, tmpdir: str, platform: str) -> Tuple[list, dict]
         cmd = ["gallery-dl"]
         if _PROXIES and _PROXIES.get("https"):
             cmd += ["-o", "proxy={}".format(_PROXIES["https"])]
+        if _COOKIES_FILE:
+            cmd += ["--cookies", _COOKIES_FILE]
 
         # Metadata pass (-j prints the extractor result JSON without downloading).
         try:
@@ -432,6 +440,117 @@ def _download_gallery(url: str, tmpdir: str, platform: str) -> Tuple[list, dict]
 
 
 # ---------------------------------------------------------------------------
+# TikTok: photo posts / carousels
+# ---------------------------------------------------------------------------
+
+def _tiktok_scrape_carousel(url: str, tmpdir: str) -> Tuple[list, dict]:
+    """Download TikTok photo slideshow posts.  TikTok's public APIs and SSR
+    rehydration state now require its JS client signature (X-Bogus) and a
+    verified fingerprint, and yt-dlp/gallery-dl have no photo-mode extractor,
+    so the only standing entry point for a bare HTTP client is the *embed*
+    page (https://www.tiktok.com/embed/v2/<id>), which third-party sites
+    hotlink - it still embeds the full-resolution ~tplv-photomode-image URLs
+    in canonical order.  Returns (filepaths, metadata) with up to
+    _MAX_GALLERY_ITEMS files."""
+    meta = {}
+    headers = {"User-Agent": _UA}
+    scraper = cloudscraper.create_scraper()
+
+    try:
+        resp = scraper.get(url, timeout=20, headers=headers,
+                           allow_redirects=True, proxies=_PROXIES)
+        resp.raise_for_status()
+        final_url = resp.url or url
+    except Exception as err:
+        LOGGER.warning("[goblin] TikTok page fetch failed (%s): %s", url, err)
+        return [], meta
+
+    aweme_id = ""
+    m = re.search(r"/(?:video|photo)/(\d+)", final_url)
+    if m:
+        aweme_id = m.group(1)
+    else:
+        m = re.search(r"(\d{15,20})", final_url)
+        if m:
+            aweme_id = m.group(1)
+    if not aweme_id:
+        LOGGER.info("[goblin] No aweme id found for %s", url)
+        return [], meta
+
+    embed_html = ""
+    for embed_url in ("https://www.tiktok.com/embed/v2/{}".format(aweme_id),
+                      "https://www.tiktok.com/embed/{}".format(aweme_id)):
+        try:
+            eresp = scraper.get(embed_url, timeout=20, headers=headers, proxies=_PROXIES)
+            eresp.raise_for_status()
+            if eresp.text:
+                embed_html = eresp.text
+                break
+        except Exception as err:
+            LOGGER.warning("[goblin] TikTok embed fetch failed (%s): %s", embed_url, err)
+    if not embed_html:
+        return [], meta
+
+    unique = None
+    m = re.search(r'"uniqueId":"([^"]+)"', embed_html)
+    if m:
+        unique = _html_unescape(m.group(1))
+        meta["uploader"] = unique
+        meta["uploader_url"] = "https://www.tiktok.com/@{}".format(unique)
+    m = re.search(r'"nickName":"(.*?)"', embed_html)
+    if m and not meta.get("uploader"):
+        meta["uploader"] = _html_unescape(m.group(1))
+
+    # Full-resolution slide images, in document order, deduplicated by base
+    # URL.  The embed mixes signed p16 URLs (which download fine) with
+    # signature-less p19 duplicates that always 403 over plain HTTP, so only
+    # keep signed ones.
+    seen = set()
+    slides = []
+    for u in re.findall(r"https://[^\"\s\\<]+?\.(?:webp|jpe?g|png|avif)(?:\?[^\"\s\\<]*)?", embed_html):
+        if "photomode" not in u or "~tplv-photomode-image." not in u or "x-signature" not in u:
+            continue
+        urls = _html_unescape(u).split("?")[0]
+        if urls in seen:
+            continue
+        seen.add(urls)
+        slides.append(urls)
+        if len(slides) >= _MAX_GALLERY_ITEMS:
+            break
+    if not slides:
+        LOGGER.info("[goblin] No photomode slides in TikTok embed for %s", url)
+        return [], meta
+
+    filepaths = []
+    for idx, img_url in enumerate(slides):
+        ext = os.path.splitext(urllib.parse.urlparse(img_url).path)[1] or ".jpeg"
+        fp = os.path.join(tmpdir, "tiktok_photo_{:02d}{}".format(idx, ext))
+        try:
+            dl = scraper.get(img_url, timeout=60, headers={
+                "User-Agent": _UA,
+                "Referer": "https://www.tiktok.com/",
+            }, stream=True, proxies=_PROXIES)
+            dl.raise_for_status()
+            if _content_type_rejects(dl):
+                LOGGER.warning("[goblin] TikTok image %s rejected content-type", img_url)
+                continue
+            with open(fp, "wb") as f:
+                for chunk in dl.iter_content(8192):
+                    f.write(chunk)
+            if not _validate_downloaded_file(fp):
+                os.remove(fp)
+                continue
+            filepaths.append(fp)
+        except Exception as err:
+            LOGGER.warning("[goblin] TikTok image download failed (%s): %s", img_url, err)
+            continue
+
+    if filepaths:
+        LOGGER.info("[goblin] TikTok carousel: %d image(s) for %s", len(filepaths), url)
+    return filepaths, meta
+
+
+# ---------------------------------------------------------------------------
 # yt-dlp: generic download
 # ---------------------------------------------------------------------------
 
@@ -459,6 +578,8 @@ def _download_ytdlp(url: str, tmpdir: str, platform: str) -> Tuple[Optional[str]
             "merge_output_format": "mp4",
             "extractor_args": {},
         }
+        if _COOKIES_FILE:
+            ydl_opts["cookiefile"] = _COOKIES_FILE
         # TikTok needs specific client on datacenter IPs
         if platform == "tiktok":
             ydl_opts["extractor_args"]["tiktok"] = {"player_client": ["web"]}
@@ -1144,19 +1265,24 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                     media_files = [filepath]
             elif platform == "tiktok":
                 status.edit_text("Trying TikTok scraper...")
-                filepath, meta = _og_scrape(
-                    url,
-                    props=("og:video", "og:video:secure_url", "og:image"),
-                    prefix="tiktok",
-                    tmpdir=tmpdir,
-                    json_fallbacks=(
-                        r'"video_url"\s*:\s*"([^"]+)"',
-                        r'"playAddr"\s*:\s*"([^"]+)"',
-                        r'"downloadAddr"\s*:\s*"([^"]+)"',
-                    ),
-                )
-                if filepath:
-                    media_files = [filepath]
+                carousel_files, carousel_meta = _tiktok_scrape_carousel(url, tmpdir)
+                if carousel_files:
+                    media_files = carousel_files
+                    meta = carousel_meta or {}
+                else:
+                    filepath, meta = _og_scrape(
+                        url,
+                        props=("og:video", "og:video:secure_url", "og:image"),
+                        prefix="tiktok",
+                        tmpdir=tmpdir,
+                        json_fallbacks=(
+                            r'"video_url"\s*:\s*"([^"]+)"',
+                            r'"playAddr"\s*:\s*"([^"]+)"',
+                            r'"downloadAddr"\s*:\s*"([^"]+)"',
+                        ),
+                    )
+                    if filepath:
+                        media_files = [filepath]
 
         if not media_files:
             # Distinguish login-gated sensitive posts from genuine photo posts
@@ -1168,6 +1294,11 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                         "account to view — I can't download it.")
                 else:
                     status.edit_text("This looks like a TikTok photo post — can't download as video.")
+            elif platform == "instagram" and not _COOKIES_FILE and "log in" not in ytdlp_err.lower():
+                status.edit_text(
+                    "Instagram requires a logged-in session to fetch media from a server. "
+                    "Set GALLERY_COOKIES (a Netscape-format cookies file) on the bot host so "
+                    "I can download IG posts.")
             else:
                 status.edit_text("Could not download from {}.".format(platform.title()))
             return
