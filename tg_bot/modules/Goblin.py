@@ -7,6 +7,7 @@ cloudscraper scrapers for Pinterest / Instagram / Threads.
 """
 import os
 import re
+import json
 import time
 import logging
 import tempfile
@@ -14,6 +15,8 @@ import shutil
 import subprocess
 import urllib.parse
 import uuid
+import mimetypes
+import requests
 
 # Unique per-process identifier. If two overlapping instances are both
 # uploading around the same time (e.g. during a Render redeploy where the
@@ -36,7 +39,7 @@ from telegram.ext import (
     Filters,
 )
 
-from tg_bot import dispatcher
+from tg_bot import dispatcher, TOKEN
 from tg_bot.modules.disable import DisableAbleCommandHandler
 
 LOGGER = logging.getLogger(__name__)
@@ -80,6 +83,18 @@ PLATFORMS = {
     "pinterest": _PIN_PATTERN,
     "threads": _THREADSSHARE_PATTERN,
 }
+
+# Platforms with photo carousels/galleries that yt-dlp routinely misses or
+# truncates to the first slide. gallery-dl is the first extractor tried for
+# these; everything else keeps the proven yt-dlp-first pipeline.
+_GALLERY_PLATFORMS = ("instagram", "x", "reddit", "pinterest")
+
+# Telegram album limits: 2..10 items per send_media_group, one caption on the
+# first item, photos upload up to 10MB (videos up to 50MB, same cap as the
+# rest of the pipeline).
+_ALBUM_LIMIT = 10
+_ALBUM_PHOTO_MAX = 10 * 1024 * 1024
+_MAX_GALLERY_ITEMS = 20
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -326,6 +341,97 @@ def _og_scrape(url: str, props: tuple, prefix: str, tmpdir: str,
 
 
 # ---------------------------------------------------------------------------
+# gallery-dl: multi-image carousels/galleries (IG carousels, X photo posts,
+# Reddit galleries, Pinterest boards). Returns a LIST of filepaths, unlike the
+# single-path extractors above. Tried before yt-dlp for _GALLERY_PLATFORMS;
+# if the binary is missing or nothing useful comes back, callers fall through
+# to the existing yt-dlp -> custom scraper pipeline unchanged.
+# ---------------------------------------------------------------------------
+
+_GALLERY_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp",
+    ".mp4", ".mkv", ".webm", ".mp3", ".m4a", ".opus", ".wav",
+)
+
+
+def _download_gallery(url: str, tmpdir: str, platform: str) -> Tuple[list, dict]:
+    meta = {}
+    try:
+        cmd = ["gallery-dl"]
+        if _PROXIES and _PROXIES.get("https"):
+            cmd += ["-o", "proxy={}".format(_PROXIES["https"])]
+
+        # Metadata pass (-j prints the extractor result JSON without downloading).
+        try:
+            meta_run = subprocess.run(
+                cmd + ["-j", "--no-download", url],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            raw = (meta_run.stdout or "").strip()
+            if raw:
+                first_line = raw.splitlines()[0]
+                info = json.loads(first_line)
+                for key in ("title", "description"):
+                    if info.get(key):
+                        meta[key] = str(info[key])
+                uploader = (info.get("uploader")
+                            or info.get("username")
+                            or info.get("author")
+                            or (info.get("user") or {}).get("name"))
+                if uploader:
+                    meta["uploader"] = str(uploader)
+                if info.get("uploader_url") or info.get("user") and (info.get("user") or {}).get("url"):
+                    meta["uploader_url"] = info["uploader_url"] if info.get("uploader_url") else info["user"]["url"]
+        except Exception as err:
+            LOGGER.warning("[goblin] gallery-dl metadata pass failed (%s): %s", platform, err)
+
+        # Download pass.
+        dl = subprocess.run(
+            cmd + ["--directory", tmpdir, url],
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+        if dl.returncode != 0:
+            LOGGER.info("[goblin] gallery-dl returned %s for %s: %s",
+                        dl.returncode, platform, (dl.stderr or "").strip()[:200])
+            return [], meta
+
+        candidates = []
+        for fname in os.listdir(tmpdir):
+            fpath = os.path.join(tmpdir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            if os.path.splitext(fname)[1].lower() not in _GALLERY_EXTENSIONS:
+                continue
+            if os.path.getsize(fpath) > 50 * 1024 * 1024:
+                LOGGER.info("[goblin] gallery item too large, skipping: %s (%s)",
+                            fname, _human_size(os.path.getsize(fpath)))
+                os.remove(fpath)
+                continue
+            if not _validate_downloaded_file(fpath):
+                os.remove(fpath)
+                continue
+            candidates.append(fpath)
+        # Preserve carousel order (gallery-dl writes numbered files, so mtime
+        # reliably reflects page order for a single run).
+        candidates.sort(key=lambda p: os.path.getmtime(p))
+        if candidates:
+            LOGGER.info("[goblin:%s] gallery-dl extracted %d item(s) for %s", platform, len(candidates), platform)
+            return candidates[:_MAX_GALLERY_ITEMS], meta
+        LOGGER.info("[goblin] gallery-dl found no valid media for %s (%s)", platform, url)
+        return [], meta
+    except FileNotFoundError:
+        LOGGER.warning("[goblin] gallery-dl is not installed on this host - falling back to yt-dlp pipeline.")
+        return [], meta
+    except Exception as err:
+        LOGGER.warning("[goblin] gallery-dl failed for %s (%s): %s", url, platform, err)
+        return [], meta
+
+
+# ---------------------------------------------------------------------------
 # yt-dlp: generic download
 # ---------------------------------------------------------------------------
 
@@ -451,6 +557,124 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
     return False
+
+
+# ---------------------------------------------------------------------------
+# Multi-file dispatch: send_media_group albums (2..10) when possible, with a
+# per-file fallback to _send_media for anything that can't go in an album.
+# This ptb build has no InputMedia/send_media_group wrapper, so albums go
+# through a direct sendMediaGroup call (same pattern as promoteChatMember).
+# ---------------------------------------------------------------------------
+
+_PHOTO_MIMES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+_VIDEO_MIMES = {
+    ".mp4": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+}
+
+
+def _send_album(bot: Bot, chat_id: int, kind: str, chunk: list, caption: str, reply_to: int) -> bool:
+    """Send one 2..10-item album via the raw Bot API. Returns True if Telegram
+    accepted the whole group."""
+    media_arr = []
+    files = {}
+    try:
+        for i, fp in enumerate(chunk):
+            fp = _sanitize_upload_filename(fp)
+            attach = "file{}".format(i)
+            entry = {
+                "type": "photo" if kind == "photo" else "video",
+                "media": "attach://" + attach,
+            }
+            if caption and i == 0:
+                entry["caption"] = caption
+                entry["parse_mode"] = "HTML"
+            media_arr.append(entry)
+            ext = os.path.splitext(fp)[1].lower()
+            mime = (_PHOTO_MIMES if kind == "photo" else _VIDEO_MIMES).get(ext) \
+                or mimetypes.guess_type(fp)[0] or "application/octet-stream"
+            files[attach] = (os.path.basename(fp), open(fp, "rb"), mime)
+
+        data = {
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to,
+            "media": json.dumps(media_arr),
+        }
+        res = requests.post(
+            "https://api.telegram.org/bot{}/sendMediaGroup".format(TOKEN),
+            data=data,
+            files=files,
+            timeout=180,
+        )
+        payload = res.json()
+        if res.status_code != 200 or not payload.get("ok"):
+            LOGGER.warning("[goblin:%s] Album (%d %s) rejected: %s | %s",
+                           _INSTANCE_ID, len(chunk), kind, res.status_code,
+                           payload.get("description", "?")[:200])
+            return False
+        return True
+    except Exception as err:
+        LOGGER.warning("[goblin:%s] Album send failed: %s | %s",
+                       _INSTANCE_ID, type(err).__name__, str(err)[:200])
+        return False
+    finally:
+        for fh in (f[1] for f in files.values()):
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _send_media_set(bot: Bot, chat_id: int, filepaths: list, caption: str, reply_to: int) -> bool:
+    if len(filepaths) <= 1:
+        return _send_media(bot, chat_id, filepaths[0], caption, reply_to) if filepaths else False
+
+    album_groups = {"photo": [], "video": []}
+    singles = []
+    for fp in filepaths:
+        ext = os.path.splitext(fp)[1].lower()
+        size = os.path.getsize(fp) if os.path.exists(fp) else -1
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp") and 0 < size <= _ALBUM_PHOTO_MAX:
+            album_groups["photo"].append(fp)
+        elif ext in (".mp4", ".mkv", ".webm") and 0 < size <= 50 * 1024 * 1024:
+            album_groups["video"].append(fp)
+        else:
+            if ext in (".mp4", ".mkv", ".webm") and size > 50 * 1024 * 1024:
+                LOGGER.warning("[goblin] album video %s too large (%s), skipping.", fp, _human_size(size))
+                continue
+            singles.append(fp)
+
+    sent_any = False
+    for kind, group in album_groups.items():
+        for i in range(0, len(group), _ALBUM_LIMIT):
+            chunk = group[i:i + _ALBUM_LIMIT]
+            if len(chunk) < 2:
+                for fp in chunk:
+                    if _send_media(bot, chat_id, fp, "", reply_to):
+                        sent_any = True
+                continue
+            cap = caption if i == 0 else None
+            if _send_album(bot, chat_id, kind, chunk, cap, reply_to):
+                sent_any = True
+                continue
+            # Fallback: push each item of the failed album individually.
+            for fp in chunk:
+                if _send_media(bot, chat_id, fp, "", reply_to):
+                    sent_any = True
+
+    for fp in singles:
+        if _send_media(bot, chat_id, fp, "", reply_to):
+            sent_any = True
+
+    return sent_any
 
 
 # ---------------------------------------------------------------------------
@@ -852,21 +1076,39 @@ def _handle_threads(bot: Bot, message, url: str, chat_id: int, msg_id: int):
 
 
 def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, platform: str):
-    """Generic handler: try yt-dlp, then custom scraper for known platforms."""
+    """Generic handler: gallery-dl for image carousels, then yt-dlp, then the
+    custom scraper for known platforms. Coordinates MULTI-file posts and sends
+    them as Telegram albums."""
     status = message.reply_text("Downloading from {}...".format(platform.title()))
     tmpdir = tempfile.mkdtemp(prefix="gob_{}_".format(platform))
     try:
         bot.send_chat_action(chat_id, action="upload_video")
         meta = {}
+        media_files = []
 
-        # 1) yt-dlp
-        filepath, meta, ytdlp_err = _download_ytdlp(url, tmpdir, platform)
+        # 1) gallery-dl: multi-image carousels/galleries for image platforms
+        if platform in _GALLERY_PLATFORMS:
+            status.edit_text("Extracting via gallery-dl...")
+            gallery_files, gallery_meta = _download_gallery(url, tmpdir, platform)
+            if gallery_files:
+                media_files = gallery_files
+                meta = gallery_meta or {}
 
-        # 2) Custom scrapers when yt-dlp fails
-        if not filepath:
+        # 2) yt-dlp
+        filepath, ytdlp_meta, ytdlp_err = (None, {}, "")
+        if not media_files:
+            filepath, ytdlp_meta, ytdlp_err = _download_ytdlp(url, tmpdir, platform)
+            if filepath:
+                media_files = [filepath]
+                meta = ytdlp_meta or {}
+
+        # 3) Custom scrapers when both above fail
+        if not media_files:
             if platform == "reddit":
                 status.edit_text("Trying Reddit scraper...")
                 filepath, meta = _reddit_scrape(url, tmpdir)
+                if filepath:
+                    media_files = [filepath]
             elif platform == "pinterest":
                 status.edit_text("Trying Pinterest scraper...")
                 filepath, meta = _og_scrape(
@@ -879,6 +1121,8 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                         r'"embed_url"\s*:\s*"([^"]+)"',
                     ),
                 )
+                if filepath:
+                    media_files = [filepath]
             elif platform == "instagram":
                 status.edit_text("Trying Instagram scraper...")
                 filepath, meta = _og_scrape(
@@ -891,9 +1135,13 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                         r'"display_url"\s*:\s*"([^"]+)"',
                     ),
                 )
+                if filepath:
+                    media_files = [filepath]
             elif platform == "x":
                 status.edit_text("Trying X scraper...")
                 filepath, meta = _x_scrape(url, tmpdir)
+                if filepath:
+                    media_files = [filepath]
             elif platform == "tiktok":
                 status.edit_text("Trying TikTok scraper...")
                 filepath, meta = _og_scrape(
@@ -907,8 +1155,10 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
                         r'"downloadAddr"\s*:\s*"([^"]+)"',
                     ),
                 )
+                if filepath:
+                    media_files = [filepath]
 
-        if not filepath:
+        if not media_files:
             # Distinguish login-gated sensitive posts from genuine photo posts
             if platform == "tiktok":
                 low = ytdlp_err.lower()
@@ -923,7 +1173,7 @@ def _handle_generic(bot: Bot, message, url: str, chat_id: int, msg_id: int, plat
             return
 
         caption = _build_caption(bot, platform, meta)
-        if _send_media(bot, chat_id, filepath, caption, msg_id):
+        if _send_media_set(bot, chat_id, media_files, caption, msg_id):
             status.delete()
         else:
             status.edit_text("Failed to upload to Telegram — try again later.")
