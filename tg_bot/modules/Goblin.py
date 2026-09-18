@@ -645,19 +645,21 @@ def _tiktok_scrape_carousel(url: str, tmpdir: str) -> Tuple[list, dict]:
         meta["uploader"] = _html_unescape(m.group(1))
 
     # Full-resolution slide images, in document order, deduplicated by base
-    # URL.  The embed mixes signed p16 URLs (which download fine) with
-    # signature-less p19 duplicates that always 403 over plain HTTP, so only
-    # keep signed ones.
+    # URL.  The `~tplv-photomode-image.*?x-signature=...` URLs are self-signing:
+    # the signature (and x-expires) live in the *query string*, so the full
+    # URL must be kept for download and only the base stripped for dedup -
+    # otherwise TikTok 403s the signature-less base.
     seen = set()
     slides = []
     for u in re.findall(r"https://[^\"\s\\<]+?\.(?:webp|jpe?g|png|avif)(?:\?[^\"\s\\<]*)?", embed_html):
         if "photomode" not in u or "~tplv-photomode-image." not in u or "x-signature" not in u:
             continue
-        urls = _html_unescape(u).split("?")[0]
-        if urls in seen:
+        signed = _html_unescape(u)
+        base = signed.split("?")[0]
+        if base in seen:
             continue
-        seen.add(urls)
-        slides.append(urls)
+        seen.add(base)
+        slides.append(signed)
         if len(slides) >= _MAX_GALLERY_ITEMS:
             break
     if not slides:
