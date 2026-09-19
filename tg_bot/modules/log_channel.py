@@ -8,7 +8,7 @@ FILENAME = __name__.rsplit(".", 1)[-1]
 if is_module_loaded(FILENAME):
     from telegram import Bot, Update, ParseMode, Message, Chat
     from telegram.error import BadRequest, Unauthorized
-    from telegram.ext import CommandHandler, run_async
+    from telegram.ext import CommandHandler, MessageHandler, Filters, run_async
     from telegram.utils.helpers import escape_markdown
 
     from tg_bot import dispatcher, LOGGER
@@ -160,9 +160,22 @@ Setting the log channel is done by:
     SET_LOG_HANDLER = CommandHandler("setlog", setlog)
     UNSET_LOG_HANDLER = CommandHandler("unsetlog", unsetlog)
 
+    # A /setlog typed in a channel arrives as update.channel_post, which
+    # CommandHandler.check_update never matches (it only looks at update.message
+    # / update.edited_message).  A MessageHandler with channel_post_updates=True
+    # sidesteps that: catch /setlog channel posts here so the callback actually
+    # runs, then let setlog() answer with its channel instructions, and let
+    # user_admin -> is_user_admin's channel short-circuit stop the roast.
+    SET_LOG_CHANNEL_HANDLER = MessageHandler(
+        Filters.regex(r"^/setlog(?:@\w+)?(?:\s|$)"),
+        setlog,
+        channel_post_updates=True,
+        message_updates=False)
+
     dispatcher.add_handler(LOG_HANDLER)
     dispatcher.add_handler(SET_LOG_HANDLER)
     dispatcher.add_handler(UNSET_LOG_HANDLER)
+    dispatcher.add_handler(SET_LOG_CHANNEL_HANDLER)
 
 else:
     # run anyway if module not loaded
