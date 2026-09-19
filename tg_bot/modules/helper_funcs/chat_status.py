@@ -57,9 +57,16 @@ def is_user_ban_protected(chat: Chat, user_id: int, member: ChatMember = None) -
 
 
 def is_user_admin(chat: Chat, user_id: int, member: ChatMember = None) -> bool:
+    # Channels have no member roster for a bot to query unless it is admin in
+    # the channel itself, so the status call below (chat.get_member(user_id))
+    # raises CHAT_ADMIN_REQUIRED there - then /setlog roasts the owner with
+    # "Who dis non-admin telling me what to do?"  For channels, anyone who can
+    # post is effectively an admin, so short-circuit the lookup.
+    if chat.type == Chat.CHANNEL:
+        return True
+
     if chat.type == 'private' \
             or user_id in SUDO_USERS \
-            or user_id == 7179117035 \
             or chat.all_members_are_administrators:
         return True
 
