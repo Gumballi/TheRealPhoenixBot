@@ -792,8 +792,13 @@ def _send_media(bot: Bot, chat_id: int, filepath: str, caption: str, reply_to: i
                     bot.send_photo(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
                                    reply_to_message_id=reply_to, timeout=60)
                 elif is_video and size <= 50 * 1024 * 1024:
-                    # Try send_video first (shows inline player)
+                    # send_video with supports_streaming=True lets the inline
+                    # player start progressive streaming.  Without it the client
+                    # shows the raw file bubble with a manual download button,
+                    # even for mp4s that would stream fine.  (Motions are kept
+                    # at the front by the ffmpeg +faststart merge below.)
                     bot.send_video(chat_id, f, caption=caption, parse_mode=ParseMode.HTML,
+                                   supports_streaming=True,
                                    reply_to_message_id=reply_to, timeout=180)
                 else:
                     # Large videos or unknown types as document
@@ -1067,7 +1072,14 @@ def _reddit_scrape(url: str, tmpdir: str) -> Tuple[Optional[str], dict]:
                     merged = os.path.join(tmpdir, "reddit_merged.mp4")
                     try:
                         subprocess.run(
-                            ["ffmpeg", "-y", "-i", filepath, "-i", audio_path, "-c", "copy", merged],
+                            # +faststart moves the moov atom to the front of the
+                            # merged mp4 so the Telegram client can stream it
+                            # (inline player) instead of showing a raw file
+                            # bubble with a manual download button.  yt-dlp's
+                            # own merger does this automatically; our hand-rolled
+                            # audio merge must ask for it explicitly.
+                            ["ffmpeg", "-y", "-i", filepath, "-i", audio_path,
+                             "-c", "copy", "-movflags", "+faststart", merged],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             timeout=60,
