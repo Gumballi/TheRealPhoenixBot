@@ -11,4 +11,4 @@ cmds = [
 ]
 
 [start]
-cmd = "python3 -m tg_bot.main"
+cmd = "python3 -m tg_bot"
