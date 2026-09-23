@@ -5,4 +5,4 @@ pkgs = ["python37", "ffmpeg"]
 cmds = ["python3 -m venv /opt/venv", ". /opt/venv/bin/activate && pip install -r requirements.txt"]
 
 [start]
-cmd = "python3 -m tg_bot"
+cmd = "/opt/venv/bin/python3 -m tg_bot"
