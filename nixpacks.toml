@@ -1,8 +1,11 @@
+[variables]
+PYTHON_VERSION = '3.7'
+
 [setup]
 pkgs = ["python37", "ffmpeg"]
 
 [phases.install]
-cmds = ["python3 -m venv /opt/venv", ". /opt/venv/bin/activate && pip install -r requirements.txt"]
+cmds = ["/usr/bin/python3.7 -m venv /opt/venv", ". /opt/venv/bin/activate && pip install -r requirements.txt"]
 
 [start]
-cmd = "/opt/venv/bin/python3 -m tg_bot"
+cmd = "/usr/bin/python3.7 -m tg_bot"
