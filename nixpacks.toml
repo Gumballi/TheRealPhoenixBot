@@ -1,5 +1,6 @@
 [phases.setup]
 nixPkgs = ["python311", "ffmpeg"]
+PYTHONPATH = "."
 
 [phases.install]
 cmds = [
