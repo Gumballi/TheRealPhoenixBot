@@ -1,5 +1,6 @@
 [phases.setup]
 nixPkgs = ["python311", "ffmpeg"]
+PYTHONPATH = "."
 
 [phases.install]
 cmds = [
@@ -10,4 +11,4 @@ cmds = [
 ]
 
 [start]
-cmd = "python3 -m tg_bot.main"
+cmd = "python3 -m tg_bot"
