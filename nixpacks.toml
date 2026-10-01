@@ -1,8 +1,5 @@
-[setup]
-pkgs = ["python311", "ffmpeg"]
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11"
 
-[phases.install]
-cmds = ["python3 -m venv /opt/venv", ". /opt/venv/bin/activate && pip install -r requirements.txt"]
-
-[start]
-cmd = "python3 -m tg_bot"
+[phases.setup]
+nixPkgs = ["ffmpeg"]
