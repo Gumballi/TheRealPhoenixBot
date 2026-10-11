@@ -50,6 +50,7 @@ Phoenix ships with a rich, plug-and-play module set for full group moderation an
 | **Moderation** | Admin, Bans, Muting, Warns, Blacklist, Global Bans (Federations), Antiflood, Locks, Reporting, Message Deleting |
 | **Chat Tools** | Welcome, Notes, Rules, Custom Filters, Disable Commands, AFK, Chatbot (AI), Sed, Secret |
 | **Utilities** | Translator, Gemini AI, Urban Dictionary, Dictionary, Lyrics, Last.fm, MyAnimeList, Simkl, RSS, Wallpaper, Subtitles |
+| **AI** | Owner AI Control (`/ai`), Multi-provider Chatbot (`/ask`, `/model`), YouTube transcript summaries |
 | **Power** | Eval, Shell, Web Server, Backups, Log Channel, Connection, Blacklist Chats, User Info |
 
 ---
@@ -83,7 +84,17 @@ A quick cheat-sheet of the most useful commands. Type `/help` in any chat for th
 | **Chat Setup** | `/setwelcome`, `/welcome`, `/setgoodbye`, `/goodbye`, `/setrules`, `/rules`, `/setflood`, `/flood`, `/lock`, `/locks`, `/unlock` |
 | **Notes & Filters** | `/save`, `/notes`, `/get`, `/clear`, `/filter`, `/filters`, `/stop`, `/del` |
 | **Federations** | `/newfed`, `/joinfed`, `/chatfed`, `/fedinfo`, `/fban`, `/unfban`, `/fbanlist` |
+| **AI** | `/ai`, `/ask`, `/model` |
 | **Extras** | `/afk`, `/ud`, `/define`, `/wiki`, `/lyrics`, `/lastfm`, `/anime`, `/tv`, `/rss`, `/wall`, `/stickerid`, `/steal`, `/shout`, `/weebify`, `/hug`, `/kiss`, `/slap` |
+
+### 🤖 AI Features
+
+- **Owner AI Control (`/ai`)**: The group creator can give admin instructions in plain language, for example `/ai mute @bob for 1h`, `/ai promote @sam full`, `/ai ban @spammer`, or `/ai pin` (reply to a message first). An open-source model on Groq turns the instruction into a whitelisted action. Destructive actions (promote, demote, ban, unban, kick, mute, unmute) require confirmation with `/ai yes <token>` or are cancelled with `/ai no <token>`; the token expires after 5 minutes. Only the group creator can use `/ai`. Actions can never target the group creator, the bot owner, sudo users, or the bot itself. Full admin promotion is restricted to the group creator.
+- **Chatbot**: The bot replies when a message says `phoenix` or when someone replies to one of its messages. It keeps short per-chat conversation history so it can follow group discussions, and it has a per-user cooldown to protect API quota.
+- **`/ask`**: Ask the AI a question directly.
+- **`/model`**: Opens an inline keyboard to choose your preferred AI provider (Groq, Gemini, Mistral, or auto). If the chosen provider is unavailable, the bot falls back to the next provider in order.
+- **YouTube summaries**: When a message contains a YouTube link, the bot fetches the video title, channel, and transcript so the AI can answer questions about the video. It tries several transcript sources in turn.
+- **Owner-only dev commands**: `/addchat` and `/rmchat` enable or disable the chatbot in a chat, and `/listaichats` lists AI-enabled chats. These are restricted to developers.
 
 ---
 
@@ -92,7 +103,8 @@ A quick cheat-sheet of the most useful commands. Type `/help` in any chat for th
 - **Language:** Python 3.11+
 - **Framework:** [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) `11.1.0`
 - **Database:** [SQLAlchemy](https://www.sqlalchemy.org/) `<2.0` with PostgreSQL (via `psycopg2`)
-- **Extras:** Pillow, aiohttp, feedparser, google-genai, mistralai, and more
+- **AI Providers:** [Groq](https://groq.com/) (OpenAI-compatible API), [Google Gemini](https://ai.google.dev/) (google-genai), and [Mistral](https://mistral.ai/) (mistralai)
+- **Extras:** Pillow, aiohttp, feedparser, google-genai, mistralai, yt-dlp, youtube-transcript-api, and more
 
 ---
 
@@ -115,6 +127,20 @@ The bot can be configured via environment variables or by editing `tg_bot/config
 | `STRICT_GBAN` | Enforce gbans across new and existing groups |
 | `BL_CHATS` | Space-separated list of chat IDs to auto-leave |
 | `WEBHOOK` / `URL` / `PORT` | Webhook-based hosting settings |
+
+### 🤖 AI Environment Variables
+
+| Variable | Description |
+| :--- | :--- |
+| `GROQ_API_KEY` | Groq API key. Enables `/ai` owner control and the Groq chat provider |
+| `AI_CONTROL_MODEL` | Groq model used by `/ai` (default `llama-3.3-70b-versatile`) |
+| `GROQ_MODEL` | Groq model used for chat (default `llama-3.3-70b-versatile`) |
+| `AI_API_KEY` / `GEMINI_API_KEY` | Google Gemini API key. Enables the Gemini chat provider |
+| `GEMINI_MODEL` | Gemini model used for chat (default `gemini-3.5-flash`) |
+| `MISTRAL_API_KEY` | Mistral API key. Enables the Mistral chat provider |
+| `MISTRAL_MODEL` | Mistral model used for chat (default `mistral-small-latest`) |
+| `AI_PROVIDER_ORDER` | Comma-separated provider order for chat (default `groq,gemini,mistral`) |
+| `AI_COOLDOWN_SECONDS` | Per-user cooldown between chatbot requests (default `8`) |
 
 > **Security:** Never hardcode secrets into `config.py`. Prefer environment variables or a `.env` file.
 
