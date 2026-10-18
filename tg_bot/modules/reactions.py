@@ -24,6 +24,8 @@ NIGHT_RE = re.compile(r"\b(good\s*night|goodnight|gnite|gnight|gn)\b", re.IGNORE
 
 SET_REACTION_URL = "https://api.telegram.org/bot{}/setMessageReaction"
 
+LOGGER.info("[REACTIONS_DBG] Reactions module file imported (module level)")
+
 
 def _matches_greeting(text: str) -> bool:
     return bool(MORNING_RE.search(text) or NIGHT_RE.search(text))
@@ -31,16 +33,26 @@ def _matches_greeting(text: str) -> bool:
 
 @run_async
 def greeting_reaction(bot: Bot, update: Update):
-    message = update.effective_message
-    chat = update.effective_chat
-    if not message or not chat or not message.text:
-        return
-
-    if not _matches_greeting(message.text):
-        return
-
-    chosen_emoji = random.choice(REACTION_EMOJIS)
     try:
+        LOGGER.info("[REACTIONS_DBG] callback entered")
+        message = update.effective_message
+        chat = update.effective_chat
+        LOGGER.info(
+            "[REACTIONS_DBG] chat_id=%s has_message=%s text=%r",
+            chat.id if chat else None,
+            bool(message),
+            message.text if message else None,
+        )
+        if not message or not chat or not message.text:
+            LOGGER.info("[REACTIONS_DBG] skipped: missing message, chat, or text")
+            return
+
+        if not _matches_greeting(message.text):
+            LOGGER.info("[REACTIONS_DBG] skipped: text did not match greeting regex")
+            return
+
+        chosen_emoji = random.choice(REACTION_EMOJIS)
+        LOGGER.info("[REACTIONS_DBG] matched; sending reaction %s to message %s", chosen_emoji, message.message_id)
         response = requests.post(
             SET_REACTION_URL.format(TOKEN),
             json={
@@ -50,15 +62,16 @@ def greeting_reaction(bot: Bot, update: Update):
             },
             timeout=5,
         )
+        LOGGER.info("[REACTIONS_DBG] setMessageReaction HTTP %s: %s", response.status_code, response.text)
         if not response.ok:
             LOGGER.warning(
                 "setMessageReaction failed in chat %s (HTTP %s): %s",
                 chat.id, response.status_code, response.text,
             )
     except requests.RequestException as e:
-        LOGGER.error("setMessageReaction request error in chat %s: %s", chat.id, e)
-    except Exception as e:
-        LOGGER.error("Unexpected error in greeting_reaction for chat %s: %s", chat.id, e)
+        LOGGER.error("setMessageReaction request error: %s", e)
+    except Exception:
+        LOGGER.exception("[REACTIONS_DBG] unexpected error in greeting_reaction")
 
 
 # Group 30 keeps this handler from blocking or being blocked by the default
@@ -66,3 +79,4 @@ def greeting_reaction(bot: Bot, update: Update):
 REACTION_HANDLER = MessageHandler(Filters.text, greeting_reaction)
 
 dispatcher.add_handler(REACTION_HANDLER, group=30)
+LOGGER.info("[REACTIONS_DBG] handler registered on group 30")
